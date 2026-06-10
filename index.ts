@@ -113,6 +113,16 @@ const DEFAULT_INVALID_COOLDOWN_MS = 365 * 24 * 60 * 60 * 1000; // effectively "u
 // until the machine swaps itself to death.
 const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account we just left
 const MIN_AUTOCONTINUE_INTERVAL_MS = 15 * 1000; // floor between auto-continuations (CPU/network guard)
+// A 401 on an OAuth account usually just means "access token expired, refresh it" — Pi refreshes
+// on the next call. So a single 401 must NOT permanently kill a refreshable account (that was the
+// "it dropped me off an account that still had tokens" bug). Only kill it after this many 401s in a
+// row with no successful response in between. Non-refreshable (API-key) 401 is fatal immediately.
+// Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
+// which version Pi actually loaded (a running Pi keeps the version it started with — /login and
+// /reload do NOT reload extension code; only a full restart does).
+const VERSION = "1.4.0";
+const MAX_CONSECUTIVE_AUTH_FAILURES = 3;
+const TRANSIENT_AUTH_COOLDOWN_MS = 60 * 1000; // brief skip after a 401 so the next call can refresh
 
 const ANTHROPIC_BASE = "anthropic";
 const CODEX_BASE = "openai-codex";
@@ -800,6 +810,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	const exhaustedUntilByProvider = new Map<string, number>(Object.entries(persistedState.exhaustedUntilByProvider ?? {}));
 	const invalidatedByProvider = new Map<string, InvalidationRecord>(Object.entries(persistedState.invalidatedByProvider ?? {}));
+	// Consecutive 401s per provider (in-memory, reset on any success). Used so a transient 401 on a
+	// refreshable OAuth account doesn't permanently kill it.
+	const consecutiveAuthFailures = new Map<string, number>();
 
 	// Discovered, authed, deduped provider ids in rotation order.
 	let rotation: string[] = [];
@@ -900,6 +913,43 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function isInvalidated(provider: string) {
 		return invalidatedByProvider.has(provider);
+	}
+
+	/** True if this account can self-heal a 401 by refreshing its OAuth token. */
+	function isRefreshable(provider: string): boolean {
+		const entry = readAuthFile()[provider];
+		return !!entry && typeof entry.refresh === "string" && entry.refresh.length > 0;
+	}
+
+	/** A successful response → this account's auth is fine; clear its 401 streak. */
+	function noteAuthSuccess(provider: string) {
+		if (consecutiveAuthFailures.delete(provider)) {
+			/* had a streak, now cleared */
+		}
+	}
+
+	/**
+	 * Handle a 401/auth failure WITHOUT nuking an account that just needs a token refresh.
+	 * Refreshable (OAuth) account: first failures → short cooldown only, so the next attempt can
+	 * refresh; only after MAX_CONSECUTIVE_AUTH_FAILURES in a row do we mark it dead-until-relogin.
+	 * Non-refreshable (API key): a 401 is genuinely fatal, mark invalid at once.
+	 * Returns true if the account was permanently invalidated.
+	 */
+	function markAuthFailure(provider: string, reason: string): boolean {
+		if (!isRefreshable(provider)) {
+			markInvalid(provider, reason);
+			return true;
+		}
+		const n = (consecutiveAuthFailures.get(provider) ?? 0) + 1;
+		consecutiveAuthFailures.set(provider, n);
+		if (n >= MAX_CONSECUTIVE_AUTH_FAILURES) {
+			consecutiveAuthFailures.delete(provider);
+			markInvalid(provider, `${reason} (after ${n} consecutive 401s)`);
+			return true;
+		}
+		// Transient: brief cooldown so selection skips it for a moment; Pi refreshes on next use.
+		markExhausted(provider, TRANSIENT_AUTH_COOLDOWN_MS);
+		return false;
 	}
 
 	// ----- cooldowns --------------------------------------------------------
@@ -1269,6 +1319,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			autoContinuesThisPrompt = 0;
 			userAbortedChain = false;
 			userSelectedProvider = undefined;
+			consecutiveAuthFailures.clear();
 			if (pendingWakeTimer) {
 				clearTimeout(pendingWakeTimer);
 				pendingWakeTimer = undefined;
@@ -1299,7 +1350,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const invalids = [...invalidatedByProvider.entries()].map(([p, r]) => `${p} (${r.reason.slice(0, 40)})`);
 		ctx.ui.notify(
 			[
-				`pi-multi-account: ${config.enabled ? "enabled" : "disabled"}${config.autoDiscover ? " · auto-discover ON" : " · auto-discover OFF"}`,
+				`pi-multi-account v${VERSION}: ${config.enabled ? "enabled" : "disabled"}${config.autoDiscover ? " · auto-discover ON" : " · auto-discover OFF"}`,
 				`Current: ${current}`,
 				`Rotation (${rotation.length}): ${rotation.join(" → ") || "none — log in to an account"}`,
 				`Registered login slots: ${[...registeredSlots].join(", ") || "(base accounts only)"}`,
@@ -1344,7 +1395,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		expectingSelfContinuation = false;
 		lastSentContinuationPrompt = "";
 		ctx.ui.notify(
-			`pi-multi-account loaded (${config.enabled ? "enabled" : "disabled"}). ${rotation.length} account(s) in rotation. Config: ${CONFIG_PATH}`,
+			`pi-multi-account v${VERSION} loaded (${config.enabled ? "enabled" : "disabled"}). ${rotation.length} account(s) in rotation. Config: ${CONFIG_PATH}`,
 			"info",
 		);
 	});
@@ -1410,11 +1461,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!config.enabled) return;
 		if (userAbortedChain || ctx.signal?.aborted) return; // user is cancelling — don't fail over
 		const status = (event as any).status;
-		// The user's manually-picked model just worked → resume normal auto-failover for it.
-		if (status < 400 && ctx.model && ctx.model.provider === userSelectedProvider) userSelectedProvider = undefined;
+		// A successful response proves this account's auth is fine → clear its 401 streak, and
+		// release a manual pin so normal auto-failover resumes for the user's chosen model.
+		if (status < 400 && ctx.model) {
+			noteAuthSuccess(ctx.model.provider);
+			if (ctx.model.provider === userSelectedProvider) userSelectedProvider = undefined;
+		}
 		if (status === 401) {
-			// Authorization is dead → drop this account, then move on.
-			if (ctx.model) markInvalid(ctx.model.provider, `HTTP 401`);
+			// A 401 on an OAuth account usually just needs a token refresh — do NOT kill it on the
+			// first one. markAuthFailure only invalidates after repeated 401s; otherwise it's a
+			// brief cooldown so Pi can refresh and we retry the SAME account, not abandon it.
+			if (ctx.model) {
+				const killed = markAuthFailure(ctx.model.provider, "HTTP 401");
+				if (!killed) {
+					ctx.ui.notify(`Provider failover: ${ctx.model.provider} got a 401 — will refresh and retry (not dropping it).`, "info");
+					return; // give the same account a chance to refresh on the next call
+				}
+			}
 			await switchToFallback(ctx, "HTTP 401 (auth invalid)");
 			return;
 		}
@@ -1432,7 +1495,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		lastErrorText = errorText;
 		if (currentPromptSwitch) return;
 		if (isAuthError(errorText)) {
-			if (ctx.model) markInvalid(ctx.model.provider, errorText.slice(0, 60));
+			if (ctx.model) {
+				const killed = markAuthFailure(ctx.model.provider, errorText.slice(0, 60));
+				if (!killed) {
+					ctx.ui.notify(`Provider failover: ${ctx.model.provider} hit a transient auth error — will refresh and retry (not dropping it).`, "info");
+					return; // refreshable account: let it refresh and retry rather than abandoning it
+				}
+			}
 			await switchToFallback(ctx, `auth invalid: ${errorText.slice(0, 100)}`);
 			return;
 		}
@@ -1462,7 +1531,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (userAbortedChain) return;
 
 		const errorText = lastErrorText || getAssistantErrorText((event as any).messages ?? []);
-		if (isAuthError(errorText) && ctx.model) markInvalid(ctx.model.provider, errorText.slice(0, 60));
+		if (isAuthError(errorText) && ctx.model) markAuthFailure(ctx.model.provider, errorText.slice(0, 60));
 		if (!isLimitError(errorText) && !isAuthError(errorText)) return;
 
 		// Task-level cap. Because this counter is no longer reset by our own re-prompts,

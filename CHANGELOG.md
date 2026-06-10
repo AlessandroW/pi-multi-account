@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-06-10
+
+### Fixed
+
+- **A single 401 no longer drops an account that still has valid tokens.** A 401 on
+  an OAuth account usually just means the access token needs a refresh (Pi refreshes
+  on the next call). Previously the first 401 permanently invalidated the account
+  (≈1-year cooldown until re-login) and yanked you onto another — often broken —
+  account. Now a refreshable account is given a brief cooldown and retried; it is
+  only marked dead after 3 consecutive 401s with no success in between. A
+  non-refreshable (API-key) 401 is still treated as immediately fatal.
+- Any successful response clears that account's 401 streak.
+
+### Added
+
+- Tests for transient-401 tolerance, the consecutive-401 kill threshold, and
+  success-resets-streak (suite now 17 tests).
+
 ## [1.3.0] - 2026-06-10
 
 ### Fixed

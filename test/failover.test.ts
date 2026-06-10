@@ -125,12 +125,34 @@ test("when every account is rate-limited it STOPS (no churn, no resurrection)", 
 	);
 });
 
-test("401 marks the account invalid (dead auth) and fails over", async () => {
+test("a single 401 on a REFRESHABLE account does NOT drop it (lets it refresh & retry)", async () => {
+	// anthropic has a refresh token → one 401 must not kill it or switch away.
 	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
 	await t.fire("after_provider_response", { status: 401, headers: {} });
-	assert.equal(t.rec.setModels.length, 1, "should switch off the dead account");
+	assert.equal(t.rec.setModels.length, 0, "must NOT switch off a refreshable account on one 401");
 	const st = t.readState();
-	assert.ok(st.invalidatedByProvider?.anthropic, "anthropic should be marked invalid in state");
+	assert.ok(!st.invalidatedByProvider?.anthropic, "must NOT be marked invalid after a single 401");
+	assert.ok(t.rec.notifies.some((m) => /refresh and retry|not dropping/i.test(m)), "should say it will retry");
+});
+
+test("repeated 401s eventually invalidate a refreshable account and fail over", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await t.fire("after_provider_response", { status: 401, headers: {} }); // 1 — tolerated
+	await t.fire("after_provider_response", { status: 401, headers: {} }); // 2 — tolerated
+	await t.fire("after_provider_response", { status: 401, headers: {} }); // 3 — now fatal
+	const st = t.readState();
+	assert.ok(st.invalidatedByProvider?.anthropic, "after 3 consecutive 401s it should be invalidated");
+	assert.ok(t.rec.setModels.length >= 1, "should fail over once it is truly dead");
+});
+
+test("a success between 401s resets the streak (no premature kill)", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await t.fire("after_provider_response", { status: 401, headers: {} }); // 1
+	await t.fire("after_provider_response", { status: 200, headers: {} }); // success → reset
+	await t.fire("after_provider_response", { status: 401, headers: {} }); // 1 again
+	await t.fire("after_provider_response", { status: 401, headers: {} }); // 2
+	const st = t.readState();
+	assert.ok(!st.invalidatedByProvider?.anthropic, "streak reset by success → not invalidated yet");
 });
 
 test("a non-limit error (context overflow) does NOT trigger failover", async () => {
