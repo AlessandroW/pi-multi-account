@@ -1,0 +1,48 @@
+name: Claude Code version check
+
+# Keeps CLAUDE_CODE_VERSION (used for the Anthropic OAuth billing header) in sync
+# with the latest Claude Code release, so nobody has to track it by hand. When it
+# drifts, this opens a PR bumping the constant — review and merge, then cut a release.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # weekly, Mondays 09:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open PR if CLAUDE_CODE_VERSION drifted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest="$(npm view @anthropic-ai/claude-code version)"
+          current="$(grep -oE 'CLAUDE_CODE_VERSION = "[^"]+"' index.ts | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "latest=$latest current=$current"
+          if [ "$latest" = "$current" ]; then
+            echo "Up to date — nothing to do."
+            exit 0
+          fi
+          branch="chore/claude-code-version-$latest"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "Branch $branch already exists — PR likely open."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          sed -i -E "s/CLAUDE_CODE_VERSION = \"[^\"]+\"/CLAUDE_CODE_VERSION = \"$latest\"/" index.ts
+          git add index.ts
+          git commit -m "chore: bump CLAUDE_CODE_VERSION to $latest"
+          git push origin "$branch"
+          gh pr create \
+            --base main --head "$branch" \
+            --title "Bump CLAUDE_CODE_VERSION to $latest" \
+            --body "Automated check: Claude Code released \`$latest\` (current constant: \`$current\`). This keeps the Anthropic OAuth billing header in sync so requests keep being accepted/counted correctly. Review, merge, then publish a new release."
