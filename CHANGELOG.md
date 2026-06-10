@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-06-10
+
+### Fixed
+
+- **Manual model/account selection is now respected.** Picking a model (e.g. Opus
+  on another account) no longer gets auto-yanked onto a different provider on the
+  next rate limit — the failover stays put and tells you, until you switch with
+  `/model` or `/multi-account next`. The pin auto-releases after a successful
+  response on that provider.
+- **No more self-resurrecting work.** All background resume timers were removed:
+  continuation now happens only synchronously inside an active turn, so Esc and
+  quitting always stop it. When every account is rate-limited the failover STOPS
+  and asks you to retry, instead of churning between exhausted accounts.
+- **No more "Agent is already processing" / "Cannot continue from message role:
+  assistant".** Continuations are sent only when the agent is idle and not aborting.
+
+### Added
+
+- Test suite (`npm test`) covering the failover edge cases: limit/401 failover,
+  all-accounts-exhausted stop, Esc/abort, manual-selection pinning, idle gating,
+  Anthropic OAuth shaping idempotency, and session shutdown. Wired into CI.
+
 ## [1.2.0] - 2026-06-10
 
 ### Added
@@ -76,6 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Plaintext-free credential handling (SHA-256 fingerprints only); `0600`
   config/state files.
 
+[1.3.0]: https://github.com/Sarrius/pi-multi-account/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Sarrius/pi-multi-account/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Sarrius/pi-multi-account/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Sarrius/pi-multi-account/releases/tag/v1.0.0

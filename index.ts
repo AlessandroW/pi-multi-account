@@ -824,6 +824,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let autoContinueTimer: ReturnType<typeof setTimeout> | undefined; // pending spaced continuation
 	let lastLeftProvider: string | undefined; // account we just failed away from (anti-ping-pong)
 	let lastLeftAt = 0;
+	// When the USER manually picks a model/account, we respect it: auto-failover will not yank
+	// them off it (that's the "I selected opus and it flipped to chatgpt" bug). selfModelSwitch
+	// marks our OWN setModel calls so the model_select event isn't mistaken for a manual pick.
+	let userSelectedProvider: string | undefined;
+	let selfModelSwitch = false;
 	// The thinking level the user intended for this turn. pi.setModel() re-clamps and
 	// persists the thinking level on every model switch, so without this it drifts
 	// downward across failovers ("thinking level keeps dropping"). We capture it before
@@ -1099,10 +1104,21 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return pool.sort((a, b) => a.remaining - b.remaining || a.rotIndex - b.rotIndex).map((s) => s.model);
 	}
 
-	async function switchToFallback(ctx: any, reason: string, cooldownMs = config.cooldownMs) {
+	async function switchToFallback(ctx: any, reason: string, cooldownMs = config.cooldownMs, manual = false) {
 		if (!config.enabled) return false;
 		const currentModel = ctx.model;
 		if (!currentModel) return false;
+
+		// Respect a manual model choice: if the user just picked this provider, do NOT auto-yank
+		// them onto another one — show the error and let them decide. Manual /multi-account next
+		// bypasses this (manual=true).
+		if (!manual && userSelectedProvider && currentModel.provider === userSelectedProvider) {
+			ctx.ui.notify(
+				`Provider failover: you selected ${currentModel.provider}/${currentModel.id} manually — staying on it (${reason.slice(0, 90)}). Use /model or /multi-account next to switch.`,
+				"warning",
+			);
+			return false;
+		}
 
 		markExhausted(currentModel.provider, cooldownMs);
 		lastLeftProvider = currentModel.provider;
@@ -1127,7 +1143,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const from = ref(currentModel.provider, currentModel.id);
 		for (const fallback of candidates) {
 			const to = ref(fallback.provider, fallback.id);
+			selfModelSwitch = true; // our own switch — not a manual user pick
 			const ok = await pi.setModel(fallback);
+			selfModelSwitch = false;
 			if (!ok) {
 				// setModel failed → the account has no usable auth right now.
 				ctx.ui.notify(`Provider failover: ${to} has no usable auth, dropping from rotation`, "warning");
@@ -1152,35 +1170,31 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return config.continuationPrompt.replaceAll("{from}", record.from).replaceAll("{to}", record.to).replaceAll("{reason}", record.reason);
 	}
 
-	/** Mark that the next agent run is our own failover continuation, then send it. */
-	function dispatchSelfContinuation(ctx: any, prompt: string) {
+	/**
+	 * Send our failover continuation — but ONLY when it is genuinely safe:
+	 *   - the user has not aborted (Esc), and the current op isn't aborting, and
+	 *   - the agent is idle (sending mid-turn throws "Agent is already processing" /
+	 *     "Cannot continue from message role: assistant").
+	 * Returns whether it actually sent. No background timer is ever used, so a turn is
+	 * always active for Esc to cancel — Esc/quit therefore always stop the chain.
+	 */
+	function dispatchSelfContinuation(ctx: any, prompt: string): boolean {
+		if (userAbortedChain || ctx.signal?.aborted || !ctx.isIdle()) return false;
 		lastAutoContinueAt = Date.now();
 		lastSentContinuationPrompt = prompt;
 		expectingSelfContinuation = true;
-		pi.sendUserMessage(prompt, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+		pi.sendUserMessage(prompt);
+		return true;
 	}
 
 	/**
-	 * Send an auto-continuation, but never faster than MIN_AUTOCONTINUE_INTERVAL_MS.
-	 * The spacing keeps a fully rate-limited rotation from pegging CPU/network and gives
-	 * the user a real window in which Esc actually sticks.
+	 * Continue after a successful failover switch — SYNCHRONOUSLY only.
+	 * Deliberately NOT a setTimeout: a deferred timer fires sendUserMessage when there is no
+	 * active turn for Esc to cancel, which is exactly how the chain escaped the user's control
+	 * and resurrected work on its own. Returns whether it sent.
 	 */
-	function scheduleAutoContinue(ctx: any, prompt: string) {
-		if (autoContinueTimer) {
-			clearTimeout(autoContinueTimer);
-			autoContinueTimer = undefined;
-		}
-		const wait = Math.max(0, MIN_AUTOCONTINUE_INTERVAL_MS - (Date.now() - lastAutoContinueAt));
-		if (wait === 0) {
-			dispatchSelfContinuation(ctx, prompt);
-			return;
-		}
-		autoContinueTimer = setTimeout(() => {
-			autoContinueTimer = undefined;
-			if (userAbortedChain || ctx.signal?.aborted) return; // user took over while we waited
-			dispatchSelfContinuation(ctx, prompt);
-		}, wait);
-		ctx.ui.notify(`Provider failover: next auto-continue in ~${Math.ceil(wait / 1000)}s (press Esc to cancel).`, "info");
+	function scheduleAutoContinue(ctx: any, prompt: string): boolean {
+		return dispatchSelfContinuation(ctx, prompt);
 	}
 
 	function clearPendingContinuation() {
@@ -1192,94 +1206,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		persist();
 	}
 
-	function nextPendingWakeDelayMs() {
-		if (!persistedState.pendingContinuationPrompt) return undefined;
-		const now = Date.now();
-		const lastProbe = lastProbeMap();
-		let bestWakeAt = Number.POSITIVE_INFINITY;
-		for (const provider of configuredProviders()) {
-			if (isInvalidated(provider)) continue;
-			const exhaustedUntil = exhaustedUntilByProvider.get(provider) ?? 0;
-			if (exhaustedUntil <= now) return 1000;
-			const probeDueAt = (lastProbe[provider] ?? 0) + config.probeCooldownMs;
-			bestWakeAt = Math.min(bestWakeAt, exhaustedUntil, probeDueAt);
-		}
-		if (!Number.isFinite(bestWakeAt)) return config.probeCooldownMs;
-		return Math.max(1000, Math.min(bestWakeAt - now, 2_147_483_647));
-	}
-
-	function schedulePendingWake(ctx?: any) {
-		if (ctx) latestCtx = ctx;
-		if (pendingWakeTimer) clearTimeout(pendingWakeTimer);
-		const delayMs = nextPendingWakeDelayMs();
-		if (delayMs === undefined) return;
-		pendingWakeTimer = setTimeout(() => {
-			pendingWakeTimer = undefined;
-			void attemptPendingResume();
-		}, delayMs);
-	}
-
 	function setPendingContinuation(ctx: any, reason: string) {
-		// Don't re-arm or re-notify if a pending resume is already queued — switchToFallback
-		// and agent_end can both reach here for the same exhaustion, and the wake timer is
-		// already running.
-		const alreadyPending = !!persistedState.pendingContinuationPrompt;
-		const current = ctx.model ? ref(ctx.model.provider, ctx.model.id) : ("unknown/model" as ModelRef);
-		const record: SwitchRecord = { from: current, to: "next-available/account" as ModelRef, reason, at: Date.now() };
-		persistedState = {
-			...persistedState,
-			pendingContinuationPrompt: persistedState.pendingContinuationPrompt || continuationPrompt(record),
-			pendingSince: persistedState.pendingSince || Date.now(),
-			pendingReason: reason,
-		};
+		// Every available account is rate-limited or unavailable right now. We deliberately do
+		// NOT arm a background timer to auto-resume later: such a timer fires sendUserMessage with
+		// no active turn for Esc to cancel and resurrects work on its own. Instead we STOP cleanly
+		// and tell the user — they retry by sending a message when an account has recovered.
+		const alreadyStopped = persistedState.pendingReason === reason;
+		persistedState = { ...persistedState, pendingReason: reason, pendingContinuationPrompt: undefined, pendingSince: undefined };
 		persist();
-		schedulePendingWake(ctx);
-		if (alreadyPending) return;
-		const delayMs = nextPendingWakeDelayMs();
+		if (alreadyStopped) return;
 		ctx.ui.notify(
-			`Provider failover: all accounts appear exhausted. Will automatically probe/resume in ~${Math.ceil((delayMs ?? config.probeCooldownMs) / 1000)}s if this Pi session stays open.`,
+			`Provider failover: every account is rate-limited or unavailable right now — stopped here. Send a message to retry once one recovers (check /multi-account status).`,
 			"warning",
 		);
-	}
-
-	async function attemptPendingResume() {
-		const ctx = latestCtx;
-		const prompt = persistedState.pendingContinuationPrompt;
-		if (!ctx || !prompt || !config.enabled || !config.autoContinue) return;
-		if (userAbortedChain) {
-			clearPendingContinuation(); // user took over — abandon the background resurrection
-			return;
-		}
-		if (autoContinuesThisPrompt >= config.maxAutoContinuesPerPrompt) {
-			clearPendingContinuation(); // task-level cap reached — stop resurrecting
-			return;
-		}
-		refreshDiscovery();
-		pruneCooldowns();
-		const candidates = findFallbackModels(ctx, ctx.model);
-		if (candidates.length === 0) {
-			schedulePendingWake(ctx);
-			return;
-		}
-		for (const candidate of candidates) {
-			const to = ref(candidate.provider, candidate.id);
-			const ok = await pi.setModel(candidate);
-			if (!ok) {
-				markInvalid(candidate.provider, "setModel failed on resume");
-				continue;
-			}
-			restoreDesiredThinking(); // keep the user's thinking level across the switch
-			setLastProbe(candidate.provider);
-			clearPendingContinuation();
-			// A genuine recovery after a real wait earns a fresh continuation budget so the
-			// agent can keep going whenever an account recovers; rapid flapping (resume that
-			// immediately re-limits) does NOT reset, so the cap still bounds a tight loop.
-			if (Date.now() - lastAutoContinueAt >= config.probeCooldownMs) autoContinuesThisPrompt = 0;
-			ctx.ui.notify(`Provider failover: resuming pending work on ${to}`, "warning");
-			dispatchSelfContinuation(ctx, prompt);
-			return;
-		}
-		schedulePendingWake(ctx);
 	}
 
 	// ----- error classification --------------------------------------------
@@ -1328,6 +1267,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			exhaustedUntilByProvider.clear();
 			currentPromptSwitch = undefined;
 			autoContinuesThisPrompt = 0;
+			userAbortedChain = false;
+			userSelectedProvider = undefined;
 			if (pendingWakeTimer) {
 				clearTimeout(pendingWakeTimer);
 				pendingWakeTimer = undefined;
@@ -1340,7 +1281,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if (command === "next") {
-			await switchToFallback(ctx, "manual /multi-account next", 5 * 60 * 1000);
+			userSelectedProvider = undefined; // explicit request to move — drop any manual pin
+			await switchToFallback(ctx, "manual /multi-account next", 5 * 60 * 1000, true);
 			return;
 		}
 		if (command === "enable" || command === "disable") {
@@ -1455,11 +1397,21 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		refreshDiscovery(); // cheap: only re-scans when auth.json changed (new /login)
 	});
 
+	// Detect a MANUAL model/account selection by the user (vs our own failover setModel) and
+	// pin it, so auto-failover won't immediately yank them off it.
+	pi.on("model_select", (event) => {
+		if (selfModelSwitch) return; // our own failover switch — not a manual pick
+		const model = (event as any).model;
+		if (model?.provider) userSelectedProvider = model.provider;
+	});
+
 	pi.on("after_provider_response", async (event, ctx) => {
 		latestCtx = ctx;
 		if (!config.enabled) return;
 		if (userAbortedChain || ctx.signal?.aborted) return; // user is cancelling — don't fail over
 		const status = (event as any).status;
+		// The user's manually-picked model just worked → resume normal auto-failover for it.
+		if (status < 400 && ctx.model && ctx.model.provider === userSelectedProvider) userSelectedProvider = undefined;
 		if (status === 401) {
 			// Authorization is dead → drop this account, then move on.
 			if (ctx.model) markInvalid(ctx.model.provider, `HTTP 401`);
@@ -1536,9 +1488,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 
 		if (currentPromptSwitch) {
-			autoContinuesThisPrompt++;
 			const prompt = continuationPrompt(currentPromptSwitch);
-			scheduleAutoContinue(ctx, prompt); // spaced + Esc-cancellable, not a tight loop
+			// Continue synchronously and only if it actually sent (agent idle, not aborted).
+			// Count the attempt only when we really sent, so the cap reflects real tries.
+			if (scheduleAutoContinue(ctx, prompt)) autoContinuesThisPrompt++;
 		}
 	});
 }

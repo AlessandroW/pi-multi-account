@@ -11,14 +11,15 @@ permissions:
 
 jobs:
   check:
-    name: Type-check
+    name: Type-check & test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24 # native TypeScript stripping for `node --test test/*.test.ts`
           cache: npm
       - run: npm ci
       - run: npm run check
+      - run: npm test
       - run: npm pack --dry-run

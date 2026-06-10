@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-account",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Automatic multi-account failover & rotation for Pi Agent across Anthropic (Claude), OpenAI/ChatGPT Codex, and Qwen/Alibaba. Auto-discovers authenticated accounts, grows the rotation on login, and drops accounts on logout, expiry, or quota/rate-limit errors.",
   "type": "module",
   "license": "MIT",
@@ -42,6 +42,7 @@
   ],
   "scripts": {
     "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
     "pack:check": "npm pack --dry-run",
     "prepublishOnly": "npm run check"
   },
