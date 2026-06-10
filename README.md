@@ -21,7 +21,11 @@ pi install npm:pi-multi-account
 
 Restart Pi or run `/reload` after installation.
 
-> **Anthropic OAuth aliases** (`anthropic-account-2`, …) require [`@gotgenes/pi-anthropic-auth`](https://www.npmjs.com/package/@gotgenes/pi-anthropic-auth) for request shaping. The base `anthropic` provider and all OpenAI Codex / Qwen accounts work without it.
+> **Anthropic (Claude Pro/Max) works out of the box.** OAuth login and request
+> shaping for the base `anthropic` provider and every `anthropic-account-*` alias
+> are built in — no separate `pi-anthropic-auth` install is required. If you
+> already have `pi-anthropic-auth`, the two coexist safely (the shaping is
+> idempotent). OpenAI Codex / ChatGPT and Qwen accounts work as well.
 
 ### Recommended setting
 

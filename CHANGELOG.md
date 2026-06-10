@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-10
+
+### Added
+
+- **Anthropic (Claude Pro/Max) OAuth now works out of the box.** OAuth login is
+  enabled on the base `anthropic` provider and on every `anthropic-account-*`
+  alias, and outgoing Anthropic OAuth requests are shaped (billing header +
+  system-prompt normalization) directly by this package. A separate
+  `pi-anthropic-auth` install is no longer required.
+
+### Changed
+
+- Request shaping is idempotent and only touches OAuth-marked Anthropic requests,
+  so it coexists safely with `pi-anthropic-auth` if both are installed, and leaves
+  API-key Anthropic and OpenAI Codex / Qwen requests untouched.
+
+### Credits
+
+- Anthropic OAuth request-shaping logic vendored from
+  [`gotgenes/pi-anthropic-auth`](https://github.com/gotgenes/pi-anthropic-auth) (MIT).
+
 ## [1.1.0] - 2026-06-10
 
 ### Fixed
@@ -55,5 +76,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Plaintext-free credential handling (SHA-256 fingerprints only); `0600`
   config/state files.
 
+[1.2.0]: https://github.com/Sarrius/pi-multi-account/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Sarrius/pi-multi-account/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Sarrius/pi-multi-account/releases/tag/v1.0.0
