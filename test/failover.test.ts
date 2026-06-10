@@ -35,6 +35,8 @@ function setup(opts: {
 	config?: Record<string, unknown>;
 	idle?: boolean;
 	aborted?: boolean;
+	/** Pre-seed per-provider cooldowns (ms from now) into the state before the extension loads. */
+	seedCooldownsMsFromNow?: Record<string, number>;
 }) {
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
@@ -42,10 +44,17 @@ function setup(opts: {
 		CONFIG,
 		JSON.stringify({ enabled: true, autoContinue: true, autoDiscover: true, fallbacks: [], ...(opts.config ?? {}) }),
 	);
-	try {
-		rmSync(STATE);
-	} catch {
-		/* none */
+	if (opts.seedCooldownsMsFromNow) {
+		const now = Date.now();
+		const exhaustedUntilByProvider: Record<string, number> = {};
+		for (const [p, ms] of Object.entries(opts.seedCooldownsMsFromNow)) exhaustedUntilByProvider[p] = now + ms;
+		writeFileSync(STATE, JSON.stringify({ stateVersion: 3, exhaustedUntilByProvider, lastProbeAtByProvider: {}, invalidatedByProvider: {}, lastSwitches: [] }));
+	} else {
+		try {
+			rmSync(STATE);
+		} catch {
+			/* none */
+		}
 	}
 
 	const known = new Set<string>(Object.keys(accounts));
@@ -112,6 +121,40 @@ test("429 on the current account switches to an available fallback", async () =>
 	await t.fire("after_provider_response", { status: 429, headers: {} });
 	assert.equal(t.rec.setModels.length, 1, "should switch exactly once");
 	assert.match(t.rec.setModels[0], /^openai-codex-account-2\//, "should switch to the other account");
+});
+
+test("picks a FRESH account and skips one that is still on cooldown", async () => {
+	// 3 accounts: codex-account-2 seeded as still rate-limited (1h left); codex-account-3 free.
+	// A 429 on anthropic must switch to the FRESH account-3, never the cooled-down account-2.
+	const accounts: Account = {
+		anthropic: { access: "a-tok", refresh: "a-ref" },
+		"openai-codex-account-2": { access: "c2-tok", refresh: "c2-ref" },
+		"openai-codex-account-3": { access: "c3-tok", refresh: "c3-ref" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 }, // still limited for 1h
+	});
+	await t.fire("after_provider_response", { status: 429, headers: {} });
+	assert.equal(t.rec.setModels.length, 1, "should switch exactly once");
+	assert.match(t.rec.setModels[0], /^openai-codex-account-3\//, "must pick the FRESH account, not the cooled one");
+	assert.ok(!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-2/")), "must NOT switch into the still-limited account");
+});
+
+test("with only a cooled-down account left, it STOPS instead of switching into a limited one", async () => {
+	const accounts: Account = {
+		anthropic: { access: "a-tok", refresh: "a-ref" },
+		"openai-codex-account-2": { access: "c2-tok", refresh: "c2-ref" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 }, // the only fallback is limited
+	});
+	await t.fire("after_provider_response", { status: 429, headers: {} });
+	assert.equal(t.rec.setModels.length, 0, "must NOT switch into the only-but-limited account");
+	assert.ok(t.rec.notifies.some((m) => /no immediately available|stopped|rate-limited|unavailable/i.test(m)));
 });
 
 test("when every account is rate-limited it STOPS (no churn, no resurrection)", async () => {
