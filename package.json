@@ -1,0 +1,69 @@
+{
+  "name": "pi-multi-account",
+  "version": "1.1.0",
+  "description": "Automatic multi-account failover & rotation for Pi Agent across Anthropic (Claude), OpenAI/ChatGPT Codex, and Qwen/Alibaba. Auto-discovers authenticated accounts, grows the rotation on login, and drops accounts on logout, expiry, or quota/rate-limit errors.",
+  "type": "module",
+  "license": "MIT",
+  "author": "sars267",
+  "homepage": "https://github.com/Sarrius/pi-multi-account#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sarrius/pi-multi-account.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Sarrius/pi-multi-account/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-agent",
+    "pi-coding-agent",
+    "agent-pi",
+    "failover",
+    "fallback",
+    "rotation",
+    "multi-account",
+    "rate-limit",
+    "quota",
+    "anthropic",
+    "claude",
+    "openai",
+    "codex",
+    "chatgpt",
+    "qwen",
+    "alibaba",
+    "oauth"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "npm run check"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.78.0",
+    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "@types/node": "^22.15.3",
+    "typescript": "^6.0.3"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
