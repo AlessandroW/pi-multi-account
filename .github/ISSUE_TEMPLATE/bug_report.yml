@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a problem with pi-multi-account
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please do **not** paste tokens,
+        API keys, or the contents of `auth.json` — this project only ever handles
+        SHA-256 fingerprints, and neither should an issue.
+  - type: input
+    id: version
+    attributes:
+      label: pi-multi-account version
+      description: Output of the package version (see package.json or `/multi-account status`).
+      placeholder: "1.1.0"
+    validations:
+      required: true
+  - type: input
+    id: pi-version
+    attributes:
+      label: Pi Agent version
+      placeholder: "0.78.x"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure accounts ...
+        2. Hit a rate limit ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: "/multi-account status output"
+      description: Run `/multi-account status` and paste the result (no secrets are shown).
+      render: text
+    validations:
+      required: false
