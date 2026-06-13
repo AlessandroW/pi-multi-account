@@ -1,0 +1,296 @@
+export type UsageFamily = "codex" | "anthropic";
+
+export type UsageWindow = {
+	usedPercent: number;
+	resetAt: number;
+	windowSeconds?: number;
+};
+
+export type UsageSnapshot = {
+	provider: string;
+	family: UsageFamily;
+	fetchedAt: number;
+	credentialHash?: string;
+	plan?: string;
+	primary?: UsageWindow;
+	secondary?: UsageWindow;
+	credits?: {
+		hasCredits?: boolean;
+		unlimited?: boolean;
+		balance?: string;
+	};
+};
+
+export type UsageCredential = {
+	type?: string;
+	access?: string;
+	accountId?: string;
+};
+
+export class UsageFetchError extends Error {
+	readonly status?: number;
+
+	constructor(message: string, status?: number) {
+		super(message);
+		this.name = "UsageFetchError";
+		this.status = status;
+	}
+}
+
+function record(value: unknown): Record<string, any> {
+	return value && typeof value === "object" ? (value as Record<string, any>) : {};
+}
+
+function finiteNumber(value: unknown): number | undefined {
+	const number = typeof value === "number" ? value : Number(value);
+	return Number.isFinite(number) ? number : undefined;
+}
+
+function percent(value: unknown): number | undefined {
+	const number = finiteNumber(value);
+	return number === undefined ? undefined : Math.min(100, Math.max(0, number));
+}
+
+function epochMs(value: unknown): number | undefined {
+	if (typeof value === "string" && value.trim() && !Number.isFinite(Number(value))) {
+		const parsed = Date.parse(value);
+		return Number.isFinite(parsed) ? parsed : undefined;
+	}
+	const number = finiteNumber(value);
+	if (number === undefined || number <= 0) return undefined;
+	return number < 10_000_000_000 ? number * 1000 : number;
+}
+
+function usageWindow(value: unknown, fallbackWindowSeconds?: number): UsageWindow | undefined {
+	const source = record(value);
+	const usedPercent = percent(source.used_percent ?? source.utilization);
+	const resetAt = epochMs(source.reset_at ?? source.resets_at);
+	if (usedPercent === undefined || resetAt === undefined) return undefined;
+	const windowSeconds = finiteNumber(source.limit_window_seconds) ?? fallbackWindowSeconds;
+	return {
+		usedPercent,
+		resetAt,
+		...(windowSeconds !== undefined ? { windowSeconds } : {}),
+	};
+}
+
+export function usageFamily(provider: string): UsageFamily | undefined {
+	if (provider === "openai-codex" || /^openai-codex-account-\d+$/.test(provider)) return "codex";
+	if (provider === "anthropic" || /^anthropic-account-\d+$/.test(provider)) return "anthropic";
+	return undefined;
+}
+
+export function parseCodexUsageBody(
+	provider: string,
+	body: unknown,
+	fetchedAt = Date.now(),
+	credentialHash?: string,
+): UsageSnapshot | undefined {
+	const source = record(body);
+	const rateLimit = record(source.rate_limit);
+	const primary = usageWindow(rateLimit.primary_window, 5 * 60 * 60);
+	const secondary = usageWindow(rateLimit.secondary_window, 7 * 24 * 60 * 60);
+	if (!primary && !secondary) return undefined;
+	const credits = record(source.credits);
+	return {
+		provider,
+		family: "codex",
+		fetchedAt,
+		credentialHash,
+		plan: typeof source.plan_type === "string" ? source.plan_type : undefined,
+		primary,
+		secondary,
+		credits: {
+			hasCredits: typeof credits.has_credits === "boolean" ? credits.has_credits : undefined,
+			unlimited: typeof credits.unlimited === "boolean" ? credits.unlimited : undefined,
+			balance:
+				typeof credits.balance === "string" || typeof credits.balance === "number"
+					? String(credits.balance)
+					: undefined,
+		},
+	};
+}
+
+export function parseAnthropicUsageBody(
+	provider: string,
+	body: unknown,
+	fetchedAt = Date.now(),
+	credentialHash?: string,
+): UsageSnapshot | undefined {
+	const source = record(body);
+	const primary = usageWindow(source.five_hour, 5 * 60 * 60);
+	const secondary = usageWindow(source.seven_day, 7 * 24 * 60 * 60);
+	if (!primary && !secondary) return undefined;
+	return {
+		provider,
+		family: "anthropic",
+		fetchedAt,
+		credentialHash,
+		primary,
+		secondary,
+	};
+}
+
+function headerValue(headers: unknown, name: string): string | undefined {
+	const getter = (headers as any)?.get;
+	if (typeof getter === "function") {
+		const value = getter.call(headers, name);
+		return typeof value === "string" ? value : undefined;
+	}
+	for (const [key, value] of Object.entries(record(headers))) {
+		if (key.toLowerCase() === name.toLowerCase() && value !== undefined) return String(value);
+	}
+	return undefined;
+}
+
+function headerWindow(headers: unknown, prefix: "primary" | "secondary"): UsageWindow | undefined {
+	const usedPercent = percent(headerValue(headers, `x-codex-${prefix}-used-percent`));
+	const resetAt = epochMs(headerValue(headers, `x-codex-${prefix}-reset-at`));
+	const windowMinutes = finiteNumber(headerValue(headers, `x-codex-${prefix}-window-minutes`));
+	if (usedPercent === undefined || resetAt === undefined) return undefined;
+	return {
+		usedPercent,
+		resetAt,
+		...(windowMinutes !== undefined ? { windowSeconds: windowMinutes * 60 } : {}),
+	};
+}
+
+export function parseCodexUsageHeaders(
+	provider: string,
+	headers: unknown,
+	fetchedAt = Date.now(),
+	credentialHash?: string,
+): UsageSnapshot | undefined {
+	const primary = headerWindow(headers, "primary");
+	const secondary = headerWindow(headers, "secondary");
+	if (!primary && !secondary) return undefined;
+	return {
+		provider,
+		family: "codex",
+		fetchedAt,
+		credentialHash,
+		plan: headerValue(headers, "x-codex-plan-type"),
+		primary,
+		secondary,
+		credits: {
+			hasCredits: headerValue(headers, "x-codex-credits-has-credits")?.toLowerCase() === "true",
+			unlimited: headerValue(headers, "x-codex-credits-unlimited")?.toLowerCase() === "true",
+			balance: headerValue(headers, "x-codex-credits-balance"),
+		},
+	};
+}
+
+export async function fetchUsageSnapshot(
+	provider: string,
+	credential: UsageCredential,
+	options: {
+		fetchImpl?: typeof fetch;
+		timeoutMs?: number;
+		credentialHash?: string;
+	} = {},
+): Promise<UsageSnapshot> {
+	const family = usageFamily(provider);
+	if (!family) throw new UsageFetchError(`Usage is not supported for ${provider}`);
+	if (credential.type !== "oauth" || !credential.access) {
+		throw new UsageFetchError(`${provider} has no OAuth access token`);
+	}
+
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
+	const headers: Record<string, string> = {
+		Authorization: `Bearer ${credential.access}`,
+		Accept: "application/json",
+	};
+	let url: string;
+	if (family === "codex") {
+		url = "https://chatgpt.com/backend-api/wham/usage";
+		if (credential.accountId) headers["ChatGPT-Account-Id"] = credential.accountId;
+	} else {
+		url = "https://api.anthropic.com/api/oauth/usage";
+		headers["anthropic-beta"] = "oauth-2025-04-20";
+	}
+
+	try {
+		const response = await (options.fetchImpl ?? fetch)(url, {
+			method: "GET",
+			headers,
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			throw new UsageFetchError(`${provider} usage endpoint returned HTTP ${response.status}`, response.status);
+		}
+		const body = await response.json();
+		const snapshot =
+			family === "codex"
+				? parseCodexUsageBody(provider, body, Date.now(), options.credentialHash)
+				: parseAnthropicUsageBody(provider, body, Date.now(), options.credentialHash);
+		if (!snapshot) throw new UsageFetchError(`${provider} usage endpoint returned no 5h/7d windows`);
+		return snapshot;
+	} catch (error) {
+		if (error instanceof UsageFetchError) throw error;
+		if ((error as any)?.name === "AbortError") throw new UsageFetchError(`${provider} usage request timed out`);
+		throw new UsageFetchError(`${provider} usage request failed: ${error instanceof Error ? error.message : String(error)}`);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+export function providerUsageLabel(provider: string): string {
+	const index = provider.match(/-account-(\d+)$/)?.[1];
+	if (provider.startsWith("openai-codex")) return index ? `Codex A${index}` : "Codex";
+	if (provider.startsWith("anthropic")) return index ? `Claude A${index}` : "Claude";
+	return provider;
+}
+
+export function remainingPercent(window: UsageWindow): number {
+	return Math.max(0, Math.round(100 - window.usedPercent));
+}
+
+export function formatResetDuration(resetAt: number, now = Date.now()): string {
+	const minutes = Math.max(0, Math.ceil((resetAt - now) / 60_000));
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	const restMinutes = minutes % 60;
+	if (hours < 24) return restMinutes ? `${hours}h${restMinutes}m` : `${hours}h`;
+	const days = Math.floor(hours / 24);
+	const restHours = hours % 24;
+	return restHours ? `${days}d${restHours}h` : `${days}d`;
+}
+
+export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): string {
+	const parts = [providerUsageLabel(snapshot.provider)];
+	if (snapshot.primary) {
+		parts.push(`5h ${remainingPercent(snapshot.primary)}% left/${formatResetDuration(snapshot.primary.resetAt, now)}`);
+	}
+	if (snapshot.secondary) {
+		parts.push(`7d ${remainingPercent(snapshot.secondary)}% left/${formatResetDuration(snapshot.secondary.resetAt, now)}`);
+	}
+	return parts.join(" | ");
+}
+
+export function formatUsageDetails(snapshot: UsageSnapshot, now = Date.now()): string {
+	const lines = [`Limits for ${providerUsageLabel(snapshot.provider)}${snapshot.plan ? ` (${snapshot.plan})` : ""}`];
+	for (const [label, window] of [
+		["5h", snapshot.primary],
+		["7d", snapshot.secondary],
+	] as const) {
+		if (!window) continue;
+		lines.push(
+			`${label}: ${remainingPercent(window)}% left (${Math.round(window.usedPercent)}% used), resets in ${formatResetDuration(window.resetAt, now)} at ${new Date(window.resetAt).toLocaleString()}`,
+		);
+	}
+	if (snapshot.credits?.unlimited) lines.push("Credits: unlimited");
+	else if (snapshot.credits?.balance !== undefined) lines.push(`Credits: ${snapshot.credits.balance}`);
+	lines.push(`Updated ${formatResetDuration(now, snapshot.fetchedAt)} ago`);
+	return lines.join("\n");
+}
+
+export function usageColor(snapshot: UsageSnapshot): "success" | "warning" | "error" {
+	const remaining = [snapshot.primary, snapshot.secondary]
+		.filter((window): window is UsageWindow => !!window)
+		.map(remainingPercent);
+	const lowest = remaining.length > 0 ? Math.min(...remaining) : 100;
+	if (lowest <= 10) return "error";
+	if (lowest <= 30) return "warning";
+	return "success";
+}

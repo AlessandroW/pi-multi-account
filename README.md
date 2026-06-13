@@ -7,11 +7,14 @@ When the account you are using hits a quota or rate limit, `pi-multi-account` tr
 ## What it does
 
 - **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, and Qwen/Alibaba) and builds the failover rotation dynamically — no manual config editing.
-- **Grows the rotation on login.** Run `/login anthropic-account-3` (or `openai-codex-account-5`) to add an account; the next discovery sweep adds it to the rotation automatically. A spare login slot per family is pre-registered so `/login <id>` works out of the box.
-- **Drops accounts automatically** the moment their token is expired, revoked, logged out, or returns an auth error — and restores them automatically once you re-login.
+- **Grows the rotation on login.** Run `/login`, choose **Use a subscription**, then select a numbered slot such as `anthropic-account-3` or `openai-codex-account-5`. The next discovery sweep adds it to the rotation automatically.
+- **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
 - **Fails over on quota / rate-limit** (429 / 402 / 403 and friends): the exhausted account goes on cooldown (parsed from the provider's own reset metadata when available) and Pi switches to the next available account/model.
 - **Optional auto-continue**: queues a safe continuation prompt after a switch so the agent keeps going from the last safe point.
+- **Session-bound overnight resume**: if every account is cooling down, the live Pi session waits for the earliest recovery and continues automatically. A new user message, `/multi-account stop`, session exit, or Esc during a running turn cancels the chain.
+- **Deduplicates provably identical accounts** so duplicate Codex `accountId` values and identical credentials do not consume multiple rotation slots or get separate cooldowns. New provable duplicate logins are rejected before the redundant slot is saved.
 - **Keeps your thinking level** stable across switches instead of letting it drift downward.
+- **Shows live limits for the active account** in Pi's footer: remaining 5-hour and 7-day allowance plus reset countdowns for Codex and Anthropic OAuth accounts.
 
 ## Install
 
@@ -37,13 +40,17 @@ Set Pi provider-level retries to zero so the SDK does not keep retrying an exhau
 
 ## Usage
 
-Add accounts by logging into numbered slots, then let discovery pick them up:
+Add accounts by opening the login picker:
 
 ```text
-/login anthropic-account-2
-/login openai-codex-account-2
+/login
+Use a subscription
+ChatGPT Plus/Pro (Codex openai-codex-account-2)
 /multi-account rediscover
 ```
+
+Pi 0.79.3 does not accept a provider argument after `/login`; select the account
+slot from the interactive provider picker instead.
 
 Check what's in the rotation at any time:
 
@@ -51,11 +58,18 @@ Check what's in the rotation at any time:
 /multi-account status
 ```
 
+Force-refresh and display detailed limits for the active account:
+
+```text
+/multi-account limits refresh
+```
+
 Example status output:
 
 ```text
 pi-multi-account: enabled · auto-discover ON
 Current: anthropic/claude-opus-4-8
+Current limits: Claude | 5h 0% left/2h14m | 7d 92% left/1d18h
 Rotation (3): anthropic → openai-codex → openai-codex-account-2
 Registered login slots: anthropic-account-2, openai-codex-account-2
 Cooldowns: none
@@ -70,9 +84,11 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 | Subcommand | Description |
 |---|---|
 | `status` (default) | Show enabled state, current model, rotation, login slots, cooldowns, invalidations, pending resume. |
+| `limits [refresh]` | Show active-account 5h/7d limits; `refresh` bypasses the cache. Aliases: `usage`, `quota`. |
 | `rediscover` | Force a re-scan of `auth.json` and rebuild the rotation now. |
-| `add [anthropic\|codex]` | Print the next free login slot id to use with `/login`. |
-| `next` | Manually switch to the next available fallback. |
+| `add [anthropic\|codex]` | Print the next free account slot to select from the interactive `/login` picker. |
+| `next` | Manually switch to the next fallback, deliberately overriding recorded cooldowns. |
+| `stop` | Abort and cancel automatic failover/resume for the current task. |
 | `reset` | Clear all cooldowns, invalidations and any pending auto-resume. |
 | `reload` | Reload config from disk and re-discover accounts. |
 | `enable` / `disable` | Turn failover on/off for the current Pi process. |
@@ -80,10 +96,16 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 ## How rotation membership works
 
 - **Joins the rotation** when an account has a present, non-expired credential in `auth.json` (after `/login`).
-- **Leaves the rotation** when the credential is logged out / removed, its access token is expired with no refresh token, or it returns an authorization error (HTTP 401, `invalid_token`, `revoked`, …) during use. Such accounts are marked *invalidated (need re-login)* and skipped until you log in again.
+- **Leaves the rotation** when the credential is logged out / removed, its access token is expired with no refresh token, an API key is rejected, or a refreshable OAuth credential produces three distinct final auth failures without a success in between.
 - **Quota / rate-limit** does not invalidate an account — it puts it on a temporary cooldown and the account returns once the cooldown expires.
+- **Duplicate identities** share one rotation position and one cooldown, and status/startup identifies the redundant slot. Codex/ChatGPT is matched by stored `accountId`; identical API keys or literal identical tokens are also matched. Separate Anthropic OAuth logins cannot be proven identical because Anthropic's stored credential exposes no stable account identifier.
 
 Rotation refresh is triggered by changes to `auth.json` (detected on session/turn start) or on demand with `/multi-account rediscover`.
+
+After re-authenticating an invalidated slot, restart any older Pi processes that
+were already running. Pi keeps a still-unexpired access token in each process's
+memory, so an old process can continue using the invalidated token even after a
+new `/login` updates `auth.json`.
 
 ## Configuration
 
@@ -97,14 +119,17 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `includeQwen` | `true` | Include Qwen / Alibaba accounts. |
 | `providerOrder` | `["anthropic","openai-codex","qwen"]` | Preferred family order in the rotation. |
 | `cooldownMs` | 6 h | Default cooldown when no reset metadata is provided. |
+| `showUsage` | `true` | Show active Codex/Claude limits in Pi's footer. |
+| `usageRefreshMs` | 5 min | Provider usage cache TTL; Anthropic is clamped to at least 10 min to avoid endpoint throttling. |
+| `usageStatusRefreshMs` | 1 min | Re-render the footer countdown periodically; stale caches are refreshed according to `usageRefreshMs`. |
 | `maxAutoContinuesPerPrompt` | `8` | Cap on auto-resume hops per task. |
 | `continuationPrompt` | (built-in) | Template; supports `{from}`, `{to}`, `{reason}`. |
 
-State (cooldowns, invalidations, recent switches) is persisted to `~/.pi/agent/provider-failover-state.json`.
+State (cooldowns, invalidations, recent switches, and an in-session pending resume marker) is persisted to `~/.pi/agent/provider-failover-state.json`. Pending work is deliberately discarded when the session closes or a different session starts.
 
 ## Privacy & security
 
-`pi-multi-account` **reads** `auth.json` but never writes to it and never stores credentials in plaintext. Account/token values are only ever reduced to a short irreversible SHA-256 fingerprint, used solely to detect re-login and deduplicate the same real account logged into multiple slots. The extension makes no network calls of its own — token exchange happens exclusively through Pi's official OAuth providers. Config and state files are written with `0600` permissions.
+`pi-multi-account` **reads** `auth.json` but never writes credentials itself and never stores credentials in its state. Account/token values are reduced to a short irreversible SHA-256 fingerprint for re-login detection and deduplication. To display limits, the active OAuth access token is sent only to its own provider's usage endpoint (`chatgpt.com/backend-api/wham/usage` or `api.anthropic.com/api/oauth/usage`); cached state contains percentages, reset times, plan/credit metadata, and the fingerprint, never the token. Config and state files are written with `0600` permissions.
 
 ## License
 

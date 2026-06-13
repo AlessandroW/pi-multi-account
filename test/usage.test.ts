@@ -1,0 +1,100 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+	fetchUsageSnapshot,
+	formatUsageCompact,
+	parseAnthropicUsageBody,
+	parseCodexUsageBody,
+	parseCodexUsageHeaders,
+} from "../usage.ts";
+
+const NOW = Date.UTC(2026, 5, 13, 12, 0, 0);
+
+test("parses Codex 5h and weekly usage response", () => {
+	const snapshot = parseCodexUsageBody(
+		"openai-codex-account-2",
+		{
+			plan_type: "plus",
+			rate_limit: {
+				primary_window: {
+					used_percent: 100,
+					limit_window_seconds: 18_000,
+					reset_at: NOW / 1000 + 3600,
+				},
+				secondary_window: {
+					used_percent: 58,
+					limit_window_seconds: 604_800,
+					reset_at: NOW / 1000 + 2 * 86_400,
+				},
+			},
+			credits: { has_credits: false, unlimited: false, balance: "0" },
+		},
+		NOW,
+		"credential",
+	);
+	assert.ok(snapshot);
+	assert.equal(snapshot.plan, "plus");
+	assert.equal(snapshot.primary?.usedPercent, 100);
+	assert.equal(snapshot.secondary?.usedPercent, 58);
+	assert.equal(formatUsageCompact(snapshot, NOW), "Codex A2 | 5h 0% left/1h | 7d 42% left/2d");
+});
+
+test("parses case-insensitive Codex response headers", () => {
+	const snapshot = parseCodexUsageHeaders(
+		"openai-codex-account-4",
+		{
+			"X-Codex-Primary-Used-Percent": "73",
+			"x-codex-primary-window-minutes": "300",
+			"X-Codex-Primary-Reset-At": String(NOW / 1000 + 1800),
+			"x-codex-secondary-used-percent": "9",
+			"X-Codex-Secondary-Window-Minutes": "10080",
+			"x-codex-secondary-reset-at": String(NOW / 1000 + 86_400),
+		},
+		NOW,
+	);
+	assert.ok(snapshot);
+	assert.equal(snapshot.primary?.windowSeconds, 18_000);
+	assert.equal(snapshot.secondary?.windowSeconds, 604_800);
+	assert.equal(formatUsageCompact(snapshot, NOW), "Codex A4 | 5h 27% left/30m | 7d 91% left/1d");
+});
+
+test("parses Anthropic OAuth usage windows", () => {
+	const snapshot = parseAnthropicUsageBody(
+		"anthropic-account-2",
+		{
+			five_hour: { utilization: 84, resets_at: new Date(NOW + 90 * 60_000).toISOString() },
+			seven_day: { utilization: 12, resets_at: new Date(NOW + 3 * 86_400_000).toISOString() },
+		},
+		NOW,
+	);
+	assert.ok(snapshot);
+	assert.equal(snapshot.primary?.usedPercent, 84);
+	assert.equal(formatUsageCompact(snapshot, NOW), "Claude A2 | 5h 16% left/1h30m | 7d 88% left/3d");
+});
+
+test("Codex usage fetch sends the account id and never exposes the token in the snapshot", async () => {
+	let seenHeaders: Headers | undefined;
+	const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+		seenHeaders = new Headers(init?.headers);
+		return new Response(
+			JSON.stringify({
+				plan_type: "plus",
+				rate_limit: {
+					primary_window: { used_percent: 10, reset_at: NOW / 1000 + 3600 },
+					secondary_window: { used_percent: 20, reset_at: NOW / 1000 + 86_400 },
+				},
+			}),
+			{ status: 200, headers: { "content-type": "application/json" } },
+		);
+	}) as typeof fetch;
+
+	const snapshot = await fetchUsageSnapshot(
+		"openai-codex-account-2",
+		{ type: "oauth", access: "secret-access-token", accountId: "account-id" },
+		{ fetchImpl, credentialHash: "safe-hash" },
+	);
+	assert.equal(seenHeaders?.get("ChatGPT-Account-Id"), "account-id");
+	assert.equal(seenHeaders?.get("Authorization"), "Bearer secret-access-token");
+	assert.equal(snapshot.credentialHash, "safe-hash");
+	assert.ok(!JSON.stringify(snapshot).includes("secret-access-token"));
+});
