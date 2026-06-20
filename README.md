@@ -1,12 +1,12 @@
 # pi-multi-account
 
-Automatic multi-account failover & rotation for [Pi Agent](https://pi.dev/), across **Anthropic (Claude)**, **OpenAI / ChatGPT Codex**, and **Qwen / Alibaba**.
+Automatic multi-account failover & rotation for [Pi Agent](https://pi.dev/), across **Anthropic (Claude)**, **OpenAI / ChatGPT Codex**, **Qwen / Alibaba**, and **Ollama**.
 
 When the account you are using hits a quota or rate limit, `pi-multi-account` transparently switches to the next authenticated account/model and (optionally) resumes the interrupted task — so a long agent run does not die just because one account ran out of budget.
 
 ## What it does
 
-- **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, and Qwen/Alibaba) and builds the failover rotation dynamically — no manual config editing.
+- **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
 - **Grows the rotation on login.** Run `/login`, choose **Use a subscription**, then select a numbered slot such as `anthropic-account-3` or `openai-codex-account-5`. The next discovery sweep adds it to the rotation automatically.
 - **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
 - **Fails over on quota / rate-limit** (429 / 402 / 403 and friends): the exhausted account goes on cooldown (parsed from the provider's own reset metadata when available) and Pi switches to the next available account/model.
@@ -117,7 +117,8 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `autoContinue` | `true` | Queue a continuation prompt after a switch. |
 | `autoDiscover` | `true` | Auto-discover accounts from `auth.json`. |
 | `includeQwen` | `true` | Include Qwen / Alibaba accounts. |
-| `providerOrder` | `["anthropic","openai-codex","qwen"]` | Preferred family order in the rotation. |
+| `includeOllama` | `true` | Include Ollama (local) accounts. |
+| `providerOrder` | `["anthropic","openai-codex","qwen","ollama"]` | Preferred family order in the rotation. |
 | `cooldownMs` | 6 h | Default cooldown when no reset metadata is provided. |
 | `showUsage` | `true` | Show active Codex/Claude limits in Pi's footer. |
 | `usageRefreshMs` | 5 min | Provider usage cache TTL; Anthropic is clamped to at least 10 min to avoid endpoint throttling. |

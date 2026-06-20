@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-06-20
+
+### Fixed
+
+- **Failover no longer triggers for unmanaged providers.** Previously, a
+  rate-limit (429) or quota error on *any* provider — including ones this
+  extension does not manage (Ollama, OpenRouter, DeepSeek, etc.) — triggered
+  the failover logic and switched the user to an unrelated managed account.
+  The `message_end` and `after_provider_response` handlers now check
+  `classifyProvider()` before reacting, so only errors from anthropic,
+  openai-codex, qwen, or ollama providers activate failover.
+- **No more false “all limits exhausted” from setModel failures.** When
+  `activateFallback` tried to switch to a fallback account and the
+  `pi.setModel()` call failed (for any reason — model not found, SDK error,
+  etc.), it called `markExhausted()` on that account. If several candidates
+  failed in a row, *all* managed accounts appeared exhausted in the status
+  even though none had actually hit a limit. setModel failures now simply skip
+  the candidate for the current attempt without persisting a cooldown.
+
+### Added
+
+- **Ollama provider support.** Ollama is now a first-class provider family in
+  the rotation, alongside Anthropic, OpenAI Codex, and Qwen. The default
+  model is `glm-5.2:cloud`. Enable/disable with the `includeOllama` config
+  option (default `true`).
+
 ## [1.7.0] - 2026-06-13
 
 ### Fixed

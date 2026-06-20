@@ -54,7 +54,7 @@ import {
 } from "./usage.ts";
 
 type ModelRef = `${string}/${string}`;
-type ProviderFamily = "anthropic" | "openai-codex" | "qwen";
+type ProviderFamily = "anthropic" | "openai-codex" | "qwen" | "ollama";
 
 type OpenAICodexAliasConfig = {
 	id: string;
@@ -74,6 +74,7 @@ type ProviderFailoverConfig = {
 	maxAccountsPerProvider?: number;
 	includeQwen?: boolean;
 	qwenProvider?: string;
+	includeOllama?: boolean;
 	providerOrder?: ProviderFamily[];
 	cooldownMs?: number;
 	probeCooldownMs?: number;
@@ -104,6 +105,7 @@ type RuntimeConfig = Required<
 		| "maxAccountsPerProvider"
 		| "includeQwen"
 		| "qwenProvider"
+		| "includeOllama"
 		| "providerOrder"
 		| "cooldownMs"
 		| "probeCooldownMs"
@@ -183,12 +185,13 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.7.0";
+const VERSION = "1.8.0";
 const MAX_CONSECUTIVE_AUTH_FAILURES = 3;
 const TRANSIENT_AUTH_COOLDOWN_MS = 60 * 1000; // brief skip after a 401 so the next call can refresh
 
 const ANTHROPIC_BASE = "anthropic";
 const CODEX_BASE = "openai-codex";
+const OLLAMA_BASE = "ollama";
 const DEFAULT_QWEN_PROVIDER = "alibaba";
 
 const DEFAULT_LIMIT_PATTERNS = [
@@ -317,6 +320,7 @@ const DEFAULT_PROVIDER_ORDER: ProviderFamily[] = [
 	"anthropic",
 	"openai-codex",
 	"qwen",
+	"ollama",
 ];
 
 const CODEX_MODEL_DEFS: Record<string, Record<string, unknown>> = {
@@ -375,6 +379,10 @@ const DEFAULT_ANTHROPIC_MODELS = [
 	"claude-haiku-4-5",
 ];
 
+const DEFAULT_OLLAMA_MODELS = [
+	"glm-5.2:cloud",
+];
+
 const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	enabled: true,
 	autoContinue: true,
@@ -382,6 +390,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	maxAccountsPerProvider: 10,
 	includeQwen: true,
 	qwenProvider: DEFAULT_QWEN_PROVIDER,
+	includeOllama: true,
 	providerOrder: DEFAULT_PROVIDER_ORDER,
 	cooldownMs: DEFAULT_COOLDOWN_MS,
 	probeCooldownMs: DEFAULT_PROBE_COOLDOWN_MS,
@@ -438,9 +447,13 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		),
 		includeQwen: raw.includeQwen ?? true,
 		qwenProvider: raw.qwenProvider?.trim() || DEFAULT_QWEN_PROVIDER,
+		includeOllama: raw.includeOllama ?? true,
 		providerOrder: order.filter(
 			(f): f is ProviderFamily =>
-				f === "anthropic" || f === "openai-codex" || f === "qwen",
+				f === "anthropic" ||
+				f === "openai-codex" ||
+				f === "qwen" ||
+				f === "ollama",
 		),
 		cooldownMs: positiveOr(raw.cooldownMs, DEFAULT_COOLDOWN_MS),
 		probeCooldownMs: positiveOr(raw.probeCooldownMs, DEFAULT_PROBE_COOLDOWN_MS),
@@ -724,6 +737,7 @@ function classifyProvider(
 	if (id === CODEX_BASE || /^openai-codex-account-\d+$/.test(id))
 		return "openai-codex";
 	if (id === qwenProvider || /^qwen/i.test(id)) return "qwen";
+	if (id === OLLAMA_BASE || /^ollama/i.test(id)) return "ollama";
 	return undefined;
 }
 
@@ -1825,11 +1839,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			anthropic: [],
 			"openai-codex": [],
 			qwen: [],
+			ollama: [],
 		};
 		for (const [id, entry] of Object.entries(auth)) {
 			const family = classifyProvider(id, config.qwenProvider);
 			if (!family) continue;
 			if (family === "qwen" && !config.includeQwen) continue;
+			if (family === "ollama" && !config.includeOllama) continue;
 			if (!isEntryUsable(entry)) continue;
 			if (isInvalidated(id)) continue;
 			byFamily[family].push(id);
@@ -2009,10 +2025,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		const family = classifyProvider(parsed.provider, config.qwenProvider);
 		const preferred =
-			family === "anthropic"
-				? DEFAULT_ANTHROPIC_MODELS
-				: family === "openai-codex"
-					? DEFAULT_CODEX_MODELS
+		family === "anthropic"
+			? DEFAULT_ANTHROPIC_MODELS
+			: family === "openai-codex"
+				? DEFAULT_CODEX_MODELS
+				: family === "ollama"
+					? DEFAULT_OLLAMA_MODELS
 					: [];
 		const modelIds = [
 			...(currentModel?.id ? [currentModel.id] : []),
@@ -2182,10 +2200,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			if (!ok) {
 				ctx.ui.notify(
-					`Provider failover: ${to} could not be activated; skipping it briefly`,
+					`Provider failover: ${to} could not be activated; skipping it for this attempt`,
 					"warning",
 				);
-				markExhausted(fallback.provider, config.transientCooldownMs);
+				// Do NOT markExhausted here: a setModel failure is NOT a rate-limit. The account may be
+				// perfectly healthy — only the model switch failed. Marking it exhausted cascaded into
+				// “all limits exhausted” even though no limits were actually hit.
 				failedProviders.add(fallback.provider);
 				continue;
 			}
@@ -3001,6 +3021,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if ((status === 429 || status === 402 || status === 403) && ctx.model) {
+			// Only set cooldown hints for providers this extension manages.
+			// Without this guard, a 429 on any provider pollutes cooldown state.
+			if (!classifyProvider(ctx.model.provider, config.qwenProvider)) return;
 			const cooldownMs = cooldownFromHeaders((event as any).headers ?? {});
 			if (cooldownMs !== undefined) {
 				responseCooldownHints.set(
@@ -3030,6 +3053,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const modelId =
 			typeof message.model === "string" ? message.model : ctx.model?.id;
 		if (!provider || !modelId) return;
+		// Only react to errors from providers this extension manages (anthropic, openai-codex, qwen, ollama).
+		// Without this guard, a rate-limit on ANY provider (e.g. Ollama, OpenRouter, DeepSeek) triggers
+		// failover and switches the user to an unrelated managed account.
+		if (!classifyProvider(provider, config.qwenProvider)) return;
 		const errorKey = `${provider}/${modelId}:${message.timestamp ?? "unknown"}:${errorText}`;
 		if (handledAssistantErrors.has(errorKey)) return;
 		handledAssistantErrors.add(errorKey);
