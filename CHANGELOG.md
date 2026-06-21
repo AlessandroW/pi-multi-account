@@ -5,6 +5,56 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-06-21
+
+### Fixed
+
+- **False permanent invalidation of live OAuth accounts.** A single transient
+  401 burst from OpenAI Codex (one physical event surfaced as three error hooks)
+  hit `MAX_CONSECUTIVE_AUTH_FAILURES = 3` instantly and permanently killed a
+  live account for a year, even while a parallel Pi session was successfully
+  using the same token. The threshold is raised to 8 and the dedup logic now
+  ignores same-hash repeat failures (refresh didn't reach the wire), so only
+  genuinely distinct refreshed-token failures advance the kill counter.
+- **`refresh_token_invalidated` / `session has ended` no longer treated as
+  terminal.** OpenAI Codex returns these transiently under load. They are now
+  classified as transient — the account gets a short cooldown and the next
+  attempt can still refresh. Only `invalid_grant` and `revoked` remain terminal.
+- **365-day "cooldown" entries removed.** `markInvalid` no longer writes a
+  year-long entry into `exhaustedUntilByProvider` — that polluted cooldown
+  displays ("Cooldowns: account-2: 8696h") and confused users into thinking
+  dead accounts were rate-limited. Invalidated providers are reported
+  separately. `switchToFallback` no longer applies `invalidCooldownMs` to a
+  killed account (it's already in `invalidatedByProvider`).
+- **API-key providers (Ollama, Alibaba) survive a bare 401.** Previously a
+  single 401 on an api_key provider immediately invalidated it for a year.
+  Now only explicit terminal patterns (`invalid api key`, `incorrect api key`,
+  `revoked`) kill the slot; a bare 401 gets a transient cooldown and the same
+  consecutive-failure accounting as OAuth.
+- **Warning messages separate invalidated from cooldowns.** The "no
+  immediately available fallback" warning no longer lists dead accounts with
+  8696h timers — they're shown as `Invalidated (need re-login)`.
+
+### Added
+
+- **Multi-account support for Ollama and Alibaba/Qwen.** API-key providers
+  now support numbered alias slots (`ollama-account-2`, `alibaba-account-3`,
+  …) exactly like OAuth providers. Each slot is a separate API key in
+  `auth.json` and joins the rotation automatically. `/multi-account add
+  ollama|qwen` registers the next free slot.
+- **`/multi-account revive <provider|all>`** — clear a false invalidation
+  and return an account to rotation without wiping all state (unlike `reset`).
+- **Ollama (GLM-5.2) and Alibaba (Qwen3.7-Max) in the default rotation.**
+  `classifyProvider` recognizes `ollama-account-N` and `alibaba-account-N`;
+  `resolveTargets` knows the preferred models for each family.
+
+### Changed
+
+- `DEFAULT_QWEN_MODELS = ["qwen3.7-max", "qwen-max", "qwen-plus"]`.
+- `slotId` and `syncRegisteredSlots` generalized to all four provider
+  families. API-key families skip the "spare slot" auto-registration (no
+  interactive login) to avoid Pi's "apiKey or oauth required" error.
+
 ## [1.8.0] - 2026-06-20
 
 ### Fixed

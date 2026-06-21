@@ -427,6 +427,66 @@ test("picks a fresh account and skips one that is still on cooldown", async () =
 	assert.deepEqual(t.rec.setModels, ["openai-codex-account-3/claude-opus-4-8"]);
 });
 
+test("no-fallback warning reports invalidated accounts separately from cooldowns", async () => {
+	const deadAccess = "dead-2";
+	const deadTokenHash = createHash("sha256")
+		.update(deadAccess)
+		.digest("hex")
+		.slice(0, 12);
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: deadAccess,
+				refresh: "dead-r",
+				accountId: "dead-account",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: "cooldown-3",
+				refresh: "cooldown-r",
+				accountId: "cooldown-account",
+			},
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoContinue: false,
+			autoDiscover: false,
+			fallbacks: [
+				"anthropic",
+				"openai-codex-account-2",
+				"openai-codex-account-3",
+			],
+		},
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {
+				"openai-codex-account-2": Date.now() + 365 * 24 * 60 * 60 * 1000,
+				"openai-codex-account-3": Date.now() + 60 * 60 * 1000,
+			},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {
+				"openai-codex-account-2": {
+					tokenHash: deadTokenHash,
+					at: Date.now(),
+					reason: "OAuth refresh failed permanently: OpenAI",
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	const warning = t.rec.notifies.find((message) =>
+		message.includes("no immediately available fallback"),
+	);
+	assert.ok(warning);
+	assert.ok(warning.includes("openai-codex-account-3"));
+	assert.ok(warning.includes("Invalidated (need re-login): openai-codex-account-2"));
+	assert.ok(!warning.includes("Cooldowns: openai-codex-account-2"));
+});
+
 test("same Codex accountId in two slots is one rotation account and shares cooldown", async () => {
 	const accounts: Account = {
 		anthropic: { type: "oauth", access: "a", refresh: "ar" },
@@ -805,14 +865,15 @@ test("a second account failure in the same agent chain is not hidden by the prev
 	assert.ok(t.readState().invalidatedByProvider?.["openai-codex-account-4"]);
 });
 
-test("three 401s on rotated (refreshed) tokens invalidate a refreshable account", async () => {
+test("rotated (refreshed) tokens 401ing past the threshold invalidate a refreshable account", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 		config: { autoContinue: false },
 	});
-	for (let attempt = 0; attempt < 3; attempt++) {
-		// Simulate Pi refreshing the OAuth token between failures: the access token rotates, and the
-		// freshly minted token STILL 401s → the account is genuinely revoked and must be dropped.
+	// MAX_CONSECUTIVE_AUTH_FAILURES is 8 in v1.9.0+. Each attempt rotates the access token
+	// (simulating Pi refreshing and the NEW token still failing) — distinct refreshed tokens
+	// advance the kill counter. Below the threshold the account must stay alive.
+	for (let attempt = 0; attempt < 7; attempt++) {
 		writeFileSync(
 			AUTH,
 			JSON.stringify({
@@ -832,6 +893,29 @@ test("three 401s on rotated (refreshed) tokens invalidate a refreshable account"
 			"401 authentication_error",
 		);
 	}
+	assert.ok(
+		!t.readState().invalidatedByProvider?.anthropic,
+		"seven rotated-token 401s must NOT invalidate (threshold is 8)",
+	);
+	// One more rotated-token failure crosses the threshold → invalidate.
+	writeFileSync(
+		AUTH,
+		JSON.stringify({
+			anthropic: {
+				type: "oauth",
+				access: `a-tok-7`,
+				refresh: "a-ref-1",
+			},
+		}),
+	);
+	t.setCurrent("anthropic", "claude-opus-4-8");
+	await t.fire("agent_start");
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"401 authentication_error",
+	);
 	assert.ok(t.readState().invalidatedByProvider?.anthropic);
 });
 
@@ -1271,5 +1355,177 @@ test("a refresh keeps the old refresh token when the provider mints no new one",
 		merged.refresh,
 		"KEEP-ME",
 		"a blank refresh from the provider must not wipe the working one",
+	);
+});
+
+// ---------------------------------------------------------------------------
+// v1.9.0 regressions:
+//  - invalidated accounts no longer carry a 365-day cooldown entry
+//  - /multi-account revive restores an account to rotation
+//  - api_key providers (Ollama, Alibaba) survive a transient 401 without being
+//    killed for a year (only terminal auth patterns invalidate immediately)
+//  - Ollama/Alibaba alias slots (ollama-account-2, alibaba-account-2) are
+//    discovered and join the rotation just like OAuth alias slots.
+// ---------------------------------------------------------------------------
+
+test("invalidation no longer writes a 365-day cooldown entry", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { autoContinue: false },
+	});
+	// Force a terminal invalidation: "invalid api key" matches TERMINAL_AUTH_ERROR_PATTERNS.
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"invalid api key",
+	);
+	assert.ok(t.readState().invalidatedByProvider?.anthropic);
+	// The cooldown map must NOT contain an ~365-day entry for the invalidated account.
+	const until = t.readState().exhaustedUntilByProvider?.anthropic;
+	assert.ok(
+		until === undefined,
+		`invalidation must not pollute cooldowns (found ${until})`,
+	);
+});
+
+test("/multi-account revive restores an invalidated account to rotation", async () => {
+	const accounts = {
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "live-2",
+			refresh: "refresh-2",
+			accountId: "codex-2",
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoContinue: false,
+			autoDiscover: true,
+			fallbacks: ["anthropic", "openai-codex-account-2"],
+		},
+	});
+	// Kill anthropic with a terminal pattern.
+	await finishError(t, "anthropic", "claude-opus-4-8", "invalid api key");
+	assert.ok(t.readState().invalidatedByProvider?.anthropic);
+	// Revive it.
+	await t.command("revive anthropic");
+	assert.ok(
+		!t.readState().invalidatedByProvider?.anthropic,
+		"revive must clear the invalidation",
+	);
+});
+
+test("an api_key provider's bare 401 is transient, not a year-long kill", async () => {
+	const accounts = {
+		ollama: { type: "api_key", key: "ollama-key" },
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "ollama", id: "glm-5.2:cloud" },
+		config: {
+			autoContinue: false,
+			autoDiscover: true,
+			fallbacks: ["ollama", "anthropic"],
+		},
+	});
+	// A transient 401 (not "invalid api key", just "401 unauthorized") must NOT
+	// immediately invalidate an api_key slot.
+	await finishError(t, "ollama", "glm-5.2:cloud", "401 unauthorized");
+	assert.ok(
+		!t.readState().invalidatedByProvider?.ollama,
+		"a bare 401 on an api_key provider must not kill it for a year",
+	);
+	// It SHOULD be on a short transient cooldown so selection skips it briefly.
+	const until = t.readState().exhaustedUntilByProvider?.ollama ?? 0;
+	assert.ok(
+		until > Date.now() && until - Date.now() < 60_000,
+		"api_key transient cooldown should be brief (sub-minute)",
+	);
+});
+
+test("Ollama alias slots (ollama-account-2) join the rotation", async () => {
+	const accounts = {
+		ollama: { type: "api_key", key: "k1" },
+		"ollama-account-2": { type: "api_key", key: "k2" },
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoDiscover: true,
+			fallbacks: ["anthropic", "ollama", "ollama-account-2"],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	// The startup notify reports "<N> account(s) in rotation" — with ollama +
+	// ollama-account-2 + anthropic all authed, N must be 3.
+	const startup = t.rec.notifies.find((m) =>
+		m.includes("account(s) in rotation"),
+	);
+	assert.ok(startup, "session_start must report rotation size");
+	assert.ok(
+		/3 account\(s\) in rotation/.test(startup),
+		`expected 3 accounts in rotation, got: ${startup}`,
+	);
+	// And a real failover lands on an ollama-family provider.
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"429 rate_limit_error",
+	);
+	const switchedToOllama = t.rec.setModels.some((m) =>
+		m.startsWith("ollama") || m.startsWith("ollama-account-"),
+	);
+	assert.ok(
+		switchedToOllama,
+		"a 429 on anthropic must fail over to an ollama-family slot",
+	);
+});
+
+test("Alibaba/Qwen alias slots (alibaba-account-2) join the rotation", async () => {
+	const accounts = {
+		alibaba: { type: "api_key", key: "k1" },
+		"alibaba-account-2": { type: "api_key", key: "k2" },
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoDiscover: true,
+			fallbacks: ["anthropic", "alibaba", "alibaba-account-2"],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	const startup = t.rec.notifies.find((m) =>
+		m.includes("account(s) in rotation"),
+	);
+	assert.ok(startup, "session_start must report rotation size");
+	assert.ok(
+		/3 account\(s\) in rotation/.test(startup),
+		`expected 3 accounts in rotation, got: ${startup}`,
+	);
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"429 rate_limit_error",
+	);
+	const switchedToQwen = t.rec.setModels.some((m) =>
+		m.startsWith("alibaba") || m.startsWith("alibaba-account-"),
+	);
+	assert.ok(
+		switchedToQwen,
+		"a 429 on anthropic must fail over to an alibaba/qwen-family slot",
 	);
 });

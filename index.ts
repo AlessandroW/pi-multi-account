@@ -185,8 +185,18 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.8.0";
-const MAX_CONSECUTIVE_AUTH_FAILURES = 3;
+const VERSION = "1.9.0";
+// Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
+// that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
+// and permanently killed a live account. The threshold now tolerates a retry burst plus a
+// few genuinely distinct failures. Dedup in markAuthFailure (same-hash repeats do not count)
+// is the other half of this fix.
+const MAX_CONSECUTIVE_AUTH_FAILURES = 8;
+// Hard wall: even a transient auth failure must not cool an account for longer than the
+// provider's own reset window. One year was a misdesign — it was meant to mean "until re-login"
+// but it also polluted cooldown displays and blocked parallel Pi instances that shared the state
+// file. The exact reset is parsed from headers/body; this is just the safety cap.
+const MAX_TRANSIENT_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
 const TRANSIENT_AUTH_COOLDOWN_MS = 60 * 1000; // brief skip after a 401 so the next call can refresh
 
 const ANTHROPIC_BASE = "anthropic";
@@ -291,12 +301,13 @@ const FORCE_REFRESH_AUTH_ERROR_PATTERNS = [
 	"token has been invalidated",
 ];
 
+// These are explicit refresh-endpoint verdicts that re-login cannot wait out.
+// IMPORTANT: "refresh_token_invalidated" and "session has ended" were REMOVED from this list in
+// v1.9.0 — OpenAI Codex returns them transiently under load even when the account is alive
+// (a parallel Pi session can refresh the same token moments later). They are now treated as
+// transient: the account gets a short cooldown and the next attempt can still refresh.
 const TERMINAL_REFRESH_ERROR_PATTERNS = [
-	"refresh_token_invalidated",
 	"invalid_grant",
-	"session has ended",
-	"please log in again",
-	"please sign in again",
 	"revoked",
 ];
 
@@ -381,6 +392,11 @@ const DEFAULT_ANTHROPIC_MODELS = [
 
 const DEFAULT_OLLAMA_MODELS = [
 	"glm-5.2:cloud",
+];
+const DEFAULT_QWEN_MODELS = [
+	"qwen3.7-max",
+	"qwen-max",
+	"qwen-plus",
 ];
 
 const DEFAULT_CONFIG: ProviderFailoverConfig = {
@@ -736,9 +752,15 @@ function classifyProvider(
 		return "anthropic";
 	if (id === CODEX_BASE || /^openai-codex-account-\d+$/.test(id))
 		return "openai-codex";
-	if (id === qwenProvider || /^qwen/i.test(id)) return "qwen";
-	if (id === OLLAMA_BASE || /^ollama/i.test(id)) return "ollama";
+	if (id === qwenProvider || new RegExp(`^${escapeRegex(qwenProvider)}-account-\\d+$`).test(id) || /^qwen/i.test(id))
+		return "qwen";
+	if (id === OLLAMA_BASE || /^ollama-account-\d+$/.test(id) || /^ollama/i.test(id))
+		return "ollama";
 	return undefined;
+}
+
+function escapeRegex(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function slotIndex(id: string): number {
@@ -746,8 +768,19 @@ function slotIndex(id: string): number {
 	return m ? Number(m[1]) : 1; // base provider counts as slot 1
 }
 
-function slotId(family: "anthropic" | "openai-codex", index: number): string {
-	const base = family === "anthropic" ? ANTHROPIC_BASE : CODEX_BASE;
+function slotId(
+	family: ProviderFamily,
+	index: number,
+	qwenProvider: string = DEFAULT_QWEN_PROVIDER,
+): string {
+	const base =
+		family === "anthropic"
+			? ANTHROPIC_BASE
+			: family === "openai-codex"
+				? CODEX_BASE
+				: family === "qwen"
+					? qwenProvider
+					: OLLAMA_BASE;
 	return index <= 1 ? base : `${base}-account-${index}`;
 }
 
@@ -873,6 +906,112 @@ function registerCodexSlot(pi: ExtensionAPI, id: string) {
 		baseUrl: "https://chatgpt.com/backend-api",
 		api: "openai-codex-responses" as any,
 		oauth: codexOAuthOverride(id, `ChatGPT Plus/Pro (Codex ${id})`),
+		models: models as any,
+	});
+}
+
+// Base URLs and model lists for API-key provider families that support multiple
+// accounts (each account = a separate API key in a numbered slot).
+const OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1";
+const OLLAMA_MODEL_DEFS: Record<string, Record<string, unknown>> = {
+	"glm-5.2:cloud": {
+		id: "glm-5.2:cloud",
+		name: "GLM-5.2 (Ollama Cloud)",
+		contextWindow: 1000000,
+		input: ["text"],
+		reasoning: true,
+	},
+};
+function ollamaModelDef(id: string, providerId: string) {
+	const def = OLLAMA_MODEL_DEFS[id] ?? {
+		id,
+		name: id,
+		contextWindow: 1000000,
+		input: ["text"],
+		reasoning: true,
+	};
+	return { ...def, provider: providerId };
+}
+
+const QWEN_BASE_URL =
+	"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+const QWEN_MODEL_DEFS: Record<string, Record<string, unknown>> = {
+	"qwen3.7-max": {
+		id: "qwen3.7-max",
+		name: "Qwen3.7 Max",
+		contextWindow: 1000000,
+		maxTokens: 65536,
+		input: ["text"],
+		reasoning: true,
+		thinkingLevelMap: { high: "high", low: null, medium: null, minimal: null, xhigh: "max" },
+	},
+	"qwen-max": {
+		id: "qwen-max",
+		name: "Qwen Max",
+		contextWindow: 1000000,
+		input: ["text"],
+		reasoning: true,
+	},
+	"qwen-plus": {
+		id: "qwen-plus",
+		name: "Qwen Plus",
+		contextWindow: 1000000,
+		input: ["text"],
+		reasoning: true,
+	},
+};
+function qwenModelDef(id: string, providerId: string) {
+	const def = QWEN_MODEL_DEFS[id] ?? {
+		id,
+		name: id,
+		contextWindow: 1000000,
+		input: ["text"],
+		reasoning: true,
+	};
+	return { ...def, provider: providerId };
+}
+
+/**
+ * Register an API-key provider slot (ollama-account-2, alibaba-account-3, ...).
+ * Unlike OAuth slots, these never log in interactively — the user adds them by
+ * placing a key in auth.json (type "api_key", key "sk-..."). Discovery then
+ * picks the slot up exactly like a Codex/Anthropic alias.
+ *
+ * Pi requires every provider that defines models to also supply credentials —
+ * either `oauth` or `apiKey`. For API-key slots we read the key from auth.json
+ * at registration time and pass it straight through. If the key is missing
+ * (slot added via `/multi-account add` but not yet filled), we skip model
+ * registration so the slot stays dormant until the user adds a real key.
+ */
+function registerApiKeySlot(
+	pi: ExtensionAPI,
+	id: string,
+	family: "ollama" | "qwen",
+) {
+	const baseId = family === "ollama" ? OLLAMA_BASE : OLLAMA_BASE;
+	if (id === baseId) return;
+	// Read the key from auth.json. No key → no models → Pi won't complain and
+	// the slot simply won't be selectable until the user fills it in.
+	const entry = readAuthFile()[id];
+	const key =
+		entry && typeof entry.key === "string" && entry.key.length > 0
+			? entry.key
+			: undefined;
+	if (!key) return;
+	const baseUrl = family === "ollama" ? OLLAMA_BASE_URL : QWEN_BASE_URL;
+	const preferred =
+		family === "ollama" ? DEFAULT_OLLAMA_MODELS : DEFAULT_QWEN_MODELS;
+	const models = preferred.map((m) =>
+		family === "ollama"
+			? ollamaModelDef(m, id)
+			: qwenModelDef(m, id),
+	);
+	pi.registerProvider(id, {
+		name: `${family === "ollama" ? "Ollama" : "Alibaba/Qwen"} (${id})`,
+		baseUrl,
+		api: "openai-completions" as any,
+		apiKey: key,
+		// No oauth block → no interactive login, no refresh path.
 		models: models as any,
 	});
 }
@@ -1447,11 +1586,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			at: Date.now(),
 			reason: reason.slice(0, 500),
 		});
-		// Also keep a long cooldown so in-flight selection logic skips it immediately.
-		exhaustedUntilByProvider.set(
-			provider,
-			Date.now() + config.invalidCooldownMs,
-		);
+		// Invalidation = "drop from rotation until the user re-logs in / replaces the key".
+		// We do NOT also set a 365-day cooldown — that polluted cooldown displays ("Cooldowns:
+		// account-2: 8696h") and confused users into thinking a dead account was merely rate-
+		// limited. Selection logic checks isInvalidated() directly, so the cooldown entry is
+		// redundant. State stays clean: invalidated providers are reported separately.
 		persist();
 	}
 
@@ -1687,7 +1826,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	/**
 	 * Handle a 401/auth failure WITHOUT nuking an account that just needs a token refresh.
-	 * Non-refreshable (API key): a 401 is genuinely fatal, mark invalid at once.
+	 * Non-refreshable (API key): historically a 401 was marked fatal at once, but in practice
+	 * Ollama Cloud / Alibaba / OpenRouter return 401 transiently under load, or the key rotates
+	 * on the server side without the client knowing. Only the explicit terminal patterns
+	 * ("invalid api key", "incorrect api key", "revoked") kill the slot now; a bare 401 gets a
+	 * transient cooldown and the same consecutive-failure accounting as OAuth, so a momentary
+	 * blip no longer removes a working key for a year.
 	 * Refreshable (OAuth): only a 401 on a *rotated* token — proof Pi actually refreshed and the NEW
 	 * token still failed — counts toward the kill threshold. Repeated 401s on the SAME token mean the
 	 * refresh isn't reaching the wire (a refresh/config fault, e.g. an alias that dropped the refreshed
@@ -1702,17 +1846,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			markInvalid(provider, reason);
 			return true;
 		}
-		if (!isRefreshable(provider)) {
-			markInvalid(provider, reason);
-			return true;
-		}
 		const entry = readAuthFile()[provider];
 		const hash = (entry ? credentialHash(entry) : undefined) ?? "";
 		const prev = authFailures.get(provider);
 		if (prev && prev.hash === hash) {
-			// Same token failed again → Pi's refresh never reached the wire. Do NOT advance toward a
-			// permanent kill (this is exactly how an account whose refresh was being dropped got wrongly
-			// revoked). Keep it on a transient cooldown so the next call still has a chance to refresh.
+			// Same token failed again → Pi's refresh never reached the wire, or (for API-key
+			// providers) the same key failed again on a transient blip. Do NOT advance toward a
+			// permanent kill. Keep it on a transient cooldown so the next call still has a chance.
 			markExhausted(provider, TRANSIENT_AUTH_COOLDOWN_MS);
 			return false;
 		}
@@ -1766,6 +1906,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function markExhausted(provider: string, cooldownMs: number) {
+		if (cooldownMs <= 0) return; // killed accounts are in invalidatedByProvider, not cooldowns
 		const until = Date.now() + Math.max(cooldownMs, 1000);
 		for (const candidate of providersSharingAccount(provider)) {
 			exhaustedUntilByProvider.set(
@@ -1887,7 +2028,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	/** Register authed alias slots plus one spare per family for the next interactive /login. */
 	function syncRegisteredSlots(auth: Record<string, AuthEntry>) {
-		for (const family of ["anthropic", "openai-codex"] as const) {
+		const families: ProviderFamily[] = [
+			"anthropic",
+			"openai-codex",
+			"ollama",
+			"qwen",
+		];
+		for (const family of families) {
 			const authedIndexes = Object.keys(auth)
 				.filter(
 					(id) =>
@@ -1896,17 +2043,26 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				)
 				.map(slotIndex);
 			const wanted = new Set<number>(authedIndexes);
-			// Add the next free slot (>=2) so the user can select it from /login.
-			let spare = 2;
-			while (wanted.has(spare) && spare <= config.maxAccountsPerProvider)
-				spare++;
-			if (spare <= config.maxAccountsPerProvider) wanted.add(spare);
+			// For OAuth families, add the next free slot (>=2) so the user can select it
+			// from /login. API-key families (ollama/qwen) have no interactive login, so a
+			// spare slot with no key would just produce a Pi error ("apiKey or oauth
+			// required when defining models") — skip the spare for those families.
+			if (family === "anthropic" || family === "openai-codex") {
+				let spare = 2;
+				while (wanted.has(spare) && spare <= config.maxAccountsPerProvider)
+					spare++;
+				if (spare <= config.maxAccountsPerProvider) wanted.add(spare);
+			}
 			for (const index of wanted) {
 				if (index <= 1) continue; // base provider is native
-				const id = slotId(family, index);
+				const id = slotId(family, index, config.qwenProvider);
 				if (registeredSlots.has(id)) continue;
 				if (family === "anthropic") registerAnthropicSlot(pi, id);
-				else registerCodexSlot(pi, id);
+				else if (family === "openai-codex") registerCodexSlot(pi, id);
+				else if (family === "ollama")
+					registerApiKeySlot(pi, id, "ollama");
+				else if (family === "qwen")
+					registerApiKeySlot(pi, id, "qwen");
 				registeredSlots.add(id);
 			}
 		}
@@ -2031,7 +2187,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				? DEFAULT_CODEX_MODELS
 				: family === "ollama"
 					? DEFAULT_OLLAMA_MODELS
-					: [];
+					: family === "qwen"
+						? DEFAULT_QWEN_MODELS
+						: [];
 		const modelIds = [
 			...(currentModel?.id ? [currentModel.id] : []),
 			...preferred,
@@ -2200,12 +2358,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			if (!ok) {
 				ctx.ui.notify(
-					`Provider failover: ${to} could not be activated; skipping it for this attempt`,
+					`Provider failover: ${to} could not be activated; skipping it briefly`,
 					"warning",
 				);
-				// Do NOT markExhausted here: a setModel failure is NOT a rate-limit. The account may be
-				// perfectly healthy — only the model switch failed. Marking it exhausted cascaded into
-				// “all limits exhausted” even though no limits were actually hit.
+				// A setModel failure is not a quota/rate-limit and must not receive the normal
+				// multi-hour cooldown. Still cool it briefly so a broken or half-logged-in slot
+				// does not get retried on every failover attempt.
+				markExhausted(fallback.provider, config.transientCooldownMs);
 				failedProviders.add(fallback.provider);
 				continue;
 			}
@@ -2265,11 +2424,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		});
 		if (candidates.length === 0) {
 			const cooldowns = [...exhaustedUntilByProvider.entries()]
-				.filter(([, until]) => until > Date.now())
-				.map(([c, until]) => `${c}: ${formatUntil(until)}`)
+				.filter(([provider, until]) => until > Date.now() && !isInvalidated(provider))
+				.map(([provider, until]) => `${provider}: ${formatUntil(until)}`)
 				.join(", ");
+			const invalids = [...invalidatedByProvider.keys()].join(", ");
+			const availability = [
+				cooldowns ? `Cooldowns: ${cooldowns}` : undefined,
+				invalids ? `Invalidated (need re-login): ${invalids}` : undefined,
+			]
+				.filter(Boolean)
+				.join(". ");
 			ctx.ui.notify(
-				`Provider failover: no immediately available fallback after ${failedModel.provider}/${failedModel.id}. ${cooldowns ? `Cooldowns: ${cooldowns}` : "All known accounts may be unauthenticated, invalidated, or duplicate slots."}`,
+				`Provider failover: no immediately available fallback after ${failedModel.provider}/${failedModel.id}. ${availability || "All known accounts may be unauthenticated, invalidated, or duplicate slots."}`,
 				"warning",
 			);
 			if (!options.manual && config.autoContinue)
@@ -2682,20 +2848,78 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		if (command === "add") {
-			const family =
-				arg1 === "codex" || arg1 === "openai" ? "openai-codex" : "anthropic";
-			const auth = readAuthFile();
-			let n = 2;
-			while (auth[slotId(family, n)] && n <= config.maxAccountsPerProvider) n++;
-			const id = slotId(family, n);
-			syncRegisteredSlots(auth);
+	if (command === "add") {
+		const familyRaw = (arg1 || "").toLowerCase();
+		const family: ProviderFamily | undefined =
+			familyRaw === "codex" || familyRaw === "openai"
+				? "openai-codex"
+				: familyRaw === "anthropic" || familyRaw === "claude"
+					? "anthropic"
+					: familyRaw === "ollama"
+						? "ollama"
+						: familyRaw === "qwen" || familyRaw === "alibaba"
+							? "qwen"
+							: undefined;
+		if (!family) {
+			ctx.ui.notify(
+				"pi-multi-account: usage: /multi-account add <anthropic|codex|ollama|qwen>",
+				"warning",
+			);
+			return;
+		}
+		const auth = readAuthFile();
+		let n = 2;
+		while (auth[slotId(family, n, config.qwenProvider)] && n <= config.maxAccountsPerProvider)
+			n++;
+		if (n > config.maxAccountsPerProvider) {
+			ctx.ui.notify(
+				`pi-multi-account: no free ${family} slot (max ${config.maxAccountsPerProvider}). Remove an unused one from auth.json first.`,
+				"warning",
+			);
+			return;
+		}
+		const id = slotId(family, n, config.qwenProvider);
+		syncRegisteredSlots(auth);
+		if (family === "anthropic" || family === "openai-codex") {
 			ctx.ui.notify(
 				`pi-multi-account: run /login, choose "Use a subscription", select ${id}, then run /multi-account rediscover`,
 				"info",
 			);
+		} else {
+			ctx.ui.notify(
+				`pi-multi-account: add an entry "${id}" to ~/.pi/agent/auth.json with {"type":"api_key","key":"<your key>"} and run /multi-account rediscover`,
+				"info",
+			);
+		}
+		return;
+	}
+	if (command === "revive") {
+		const target = arg1?.trim();
+		if (!target) {
+			ctx.ui.notify(
+				"pi-multi-account: usage: /multi-account revive <provider|all>",
+				"warning",
+			);
 			return;
 		}
+		const targets =
+			target === "all"
+				? [...invalidatedByProvider.keys()]
+				: [target];
+		let revived = 0;
+		for (const p of targets) {
+			if (invalidatedByProvider.delete(p)) revived++;
+			exhaustedUntilByProvider.delete(p);
+			authFailures.delete(p);
+		}
+		if (revived > 0) persist();
+		refreshDiscovery(true, ctx);
+		ctx.ui.notify(
+			`pi-multi-account: revived ${revived} account(s)${target === "all" ? "" : ` (${target})`}. They are back in rotation.`,
+			"info",
+		);
+		return;
+	}
 		if (command === "reset") {
 			exhaustedUntilByProvider.clear();
 			currentPromptSwitch = undefined;
@@ -2813,7 +3037,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Pending auto-resume: ${persistedState.pendingContinuationPrompt ? `yes (reason: ${persistedState.pendingReason ?? "unknown"})` : "none"}`,
 				`Queued user messages: ${queuedUserInputs.length}`,
 				`Config: ${CONFIG_PATH}`,
-				`Commands: status | limits [refresh] | rediscover | add [anthropic|codex] | next | stop | reset | reload | enable | disable`,
+				`Commands: status | limits [refresh] | rediscover | add [anthropic|codex|ollama|qwen] | revive <provider|all> | next | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
@@ -3103,24 +3327,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				killed = markAuthFailure(provider, errorText);
 			}
 			if (killed) {
-				ctx.ui.notify(
-					`Provider failover: ${provider} authorization is invalid. Run /login, choose "Use a subscription", then select ${provider}.`,
-					"warning",
-				);
-			}
-			const cooldownMs = killed
-				? config.invalidCooldownMs
-				: TRANSIENT_AUTH_COOLDOWN_MS;
-			await switchToFallback(
-				ctx,
-				failedModel,
-				killed
-					? `auth invalid: ${reason.slice(0, 100)}`
-					: `transient auth failure: ${reason.slice(0, 100)}`,
-				cooldownMs,
+			ctx.ui.notify(
+				`Provider failover: ${provider} authorization is invalid. Run /login, choose "Use a subscription", then select ${provider}.`,
+				"warning",
 			);
-			return;
 		}
+		// A killed account is already in invalidatedByProvider (no cooldown entry needed —
+		// that was the v1.8.x "8696h cooldown" bug). A transient auth failure gets the brief
+		// TRANSIENT_AUTH_COOLDOWN_MS so selection skips it for a moment and Pi can refresh.
+		const cooldownMs = killed ? 0 : TRANSIENT_AUTH_COOLDOWN_MS;
+		await switchToFallback(
+			ctx,
+			failedModel,
+			killed
+				? `auth invalid: ${reason.slice(0, 100)}`
+				: `transient auth failure: ${reason.slice(0, 100)}`,
+			cooldownMs,
+		);
+		return;
+	}
 		if (isLimitError(errorText)) {
 			const hintedCooldowns = [
 				responseCooldownHints.get(provider),
