@@ -185,7 +185,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.9.2";
+const VERSION = "1.9.3";
 // Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
 // that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
 // and permanently killed a live account. The threshold now tolerates a retry burst plus a
@@ -2922,11 +2922,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 	if (command === "clear") {
 		// Wipe EVERYTHING: fallbacks config, rotation state, cooldowns,
-		// invalidations, usage, pending work — so the user can rebuild the
-		// fallback list from scratch. Alias slots registered with Pi stay
-		// registered (Pi owns the provider registry), but the extension will
-		// only re-discover them once the user re-adds them to auth.json and
-		// runs /multi-account rediscover.
+		// invalidations, usage, pending work, AND alias slots from auth.json —
+		// so the user can rebuild the fallback list from scratch starting at
+		// account-2. Base providers (anthropic, openai-codex, ollama, alibaba)
+		// stay in auth.json; only numbered alias slots are removed.
 		configuredFallbacks = [];
 		config = { ...config, fallbacks: [] };
 		try {
@@ -2941,6 +2940,32 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		} catch {
 			// non-fatal: in-memory state is still cleared
 		}
+		// Remove all numbered alias slots from auth.json so /multi-account add
+		// starts fresh at account-2. Keep base providers (no -account-N suffix)
+		// and keep unrelated providers (openrouter, deepseek, zai, etc.).
+		let removedSlots: string[] = [];
+		try {
+			const auth = readAuthFile();
+			const kept: Record<string, AuthEntry> = {};
+			for (const [id, entry] of Object.entries(auth)) {
+				if (/-account-\d+$/.test(id)) {
+					removedSlots.push(id);
+				} else {
+					kept[id] = entry;
+				}
+			}
+			if (removedSlots.length > 0) {
+				writeFileSync(AUTH_PATH, `${JSON.stringify(kept, null, "\t")}\n`, {
+					encoding: "utf8",
+					mode: 0o600,
+				});
+			}
+		} catch {
+			// non-fatal: auth.json may be locked by a concurrent Pi process
+		}
+		// Forget every alias slot we ever registered with Pi — they no longer
+		// have credentials, so re-discovery will not pick them up.
+		registeredSlots.clear();
 		exhaustedUntilByProvider.clear();
 		exhaustedUntilByModel.clear();
 		invalidatedByProvider.clear();
@@ -2968,8 +2993,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		saveState(persistedState);
 		rotation = [];
 		duplicateSlots = [];
+		reloadHostAuth(ctx);
 		ctx.ui.notify(
-			"pi-multi-account: all fallbacks, cooldowns, invalidations and rotation cleared. Re-add accounts to auth.json and run /multi-account rediscover to rebuild.",
+			`pi-multi-account: cleared all fallbacks, state and ${removedSlots.length} alias slot(s)${removedSlots.length ? ` (${removedSlots.join(", ")})` : ""}. Run /multi-account add <family> then /login to rebuild.`,
 			"info",
 		);
 		return;

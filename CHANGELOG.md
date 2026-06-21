@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.3] - 2026-06-21
+
+### Fixed
+
+- **`/multi-account clear` now removes alias slots from auth.json.** Previously
+  `clear` only wiped the fallbacks config and state, but left
+  `anthropic-account-2`, `openai-codex-account-N`, etc. in `auth.json` — so
+  `/multi-account add` offered account-3 instead of starting fresh at
+  account-2. `clear` now deletes every `-account-N` entry from `auth.json`,
+  resets `registeredSlots`, and reloads host auth so the next `add` starts
+  clean.
+
 ## [1.9.2] - 2026-06-21
 
 ### Added
