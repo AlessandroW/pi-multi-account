@@ -185,7 +185,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.9.1";
+const VERSION = "1.9.2";
 // Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
 // that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
 // and permanently killed a live account. The threshold now tolerates a retry burst plus a
@@ -2920,6 +2920,60 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		);
 		return;
 	}
+	if (command === "clear") {
+		// Wipe EVERYTHING: fallbacks config, rotation state, cooldowns,
+		// invalidations, usage, pending work — so the user can rebuild the
+		// fallback list from scratch. Alias slots registered with Pi stay
+		// registered (Pi owns the provider registry), but the extension will
+		// only re-discover them once the user re-adds them to auth.json and
+		// runs /multi-account rediscover.
+		configuredFallbacks = [];
+		config = { ...config, fallbacks: [] };
+		try {
+			const raw = existsSync(CONFIG_PATH)
+				? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
+				: {};
+			raw.fallbacks = [];
+			writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
+				encoding: "utf8",
+				mode: 0o600,
+			});
+		} catch {
+			// non-fatal: in-memory state is still cleared
+		}
+		exhaustedUntilByProvider.clear();
+		exhaustedUntilByModel.clear();
+		invalidatedByProvider.clear();
+		authFailures.clear();
+		usageByProvider.clear();
+		usageErrors.clear();
+		responseCooldownHints.clear();
+		handledAssistantErrors.clear();
+		currentPromptSwitch = undefined;
+		autoContinuesThisPrompt = 0;
+		userAbortedChain = false;
+		expectingSelfContinuation = false;
+		lastSentContinuationPrompt = "";
+		clearPendingContinuation();
+		clearQueuedInputs();
+		persistedState = {
+			stateVersion: STATE_VERSION,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {},
+			lastSwitches: [],
+		};
+		saveState(persistedState);
+		rotation = [];
+		duplicateSlots = [];
+		ctx.ui.notify(
+			"pi-multi-account: all fallbacks, cooldowns, invalidations and rotation cleared. Re-add accounts to auth.json and run /multi-account rediscover to rebuild.",
+			"info",
+		);
+		return;
+	}
 		if (command === "reset") {
 			exhaustedUntilByProvider.clear();
 			currentPromptSwitch = undefined;
@@ -3037,7 +3091,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Pending auto-resume: ${persistedState.pendingContinuationPrompt ? `yes (reason: ${persistedState.pendingReason ?? "unknown"})` : "none"}`,
 				`Queued user messages: ${queuedUserInputs.length}`,
 				`Config: ${CONFIG_PATH}`,
-				`Commands: status | limits [refresh] | rediscover | add [anthropic|codex|ollama|qwen] | revive <provider|all> | next | stop | reset | reload | enable | disable`,
+				`Commands: status | limits [refresh] | rediscover | add [anthropic|codex|ollama|qwen] | revive <provider|all> | clear | next | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
