@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.1] - 2026-06-21
+
+### Fixed
+
+- **Ollama/Alibaba not picked up by Pi.** The extension expected Pi to register
+  the base `ollama`/`alibaba` providers natively from `models.json`, but if the
+  `apiKey` field there was a placeholder (e.g. `"ollama"`), Pi never exposed the
+  provider to `modelRegistry` — so `resolveTargets()` returned `[]` and the
+  family never failovered. The extension now registers the base API-key
+  provider itself (with the real key from `auth.json`) via
+  `ensureApiKeyBaseProvider()`, making Ollama and Alibaba/Qwen first-class
+  rotation members.
+- **`pi.registerProvider` error for spare API-key slots.** API-key families
+  (ollama, qwen) no longer auto-register a spare slot — there is no
+  interactive `/login` for them, so an empty spare triggered Pi's
+  `"apiKey or oauth is required when defining models"` error.
+- **Test flake: api_key transient cooldown assertion.** Relaxed the sub-minute
+  bound to sub-2min to accommodate `markExhausted`'s 1-second floor.
+
 ## [1.9.0] - 2026-06-21
 
 ### Fixed

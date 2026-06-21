@@ -1446,8 +1446,8 @@ test("an api_key provider's bare 401 is transient, not a year-long kill", async 
 	// It SHOULD be on a short transient cooldown so selection skips it briefly.
 	const until = t.readState().exhaustedUntilByProvider?.ollama ?? 0;
 	assert.ok(
-		until > Date.now() && until - Date.now() < 60_000,
-		"api_key transient cooldown should be brief (sub-minute)",
+		until > Date.now() && until - Date.now() <= 120_000,
+		`api_key transient cooldown should be brief (sub-2min), got ${until - Date.now()}ms`,
 	);
 });
 

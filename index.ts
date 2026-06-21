@@ -185,7 +185,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.9.0";
+const VERSION = "1.9.1";
 // Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
 // that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
 // and permanently killed a live account. The threshold now tolerates a retry burst plus a
@@ -3064,6 +3064,43 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			"ChatGPT Plus/Pro (Codex Subscription)",
 		),
 	} as any);
+
+	// ----- API-key base providers (Ollama, Alibaba/Qwen) ---------------------
+	// Pi registers providers from models.json, but if the apiKey field there is a
+	// placeholder (e.g. "ollama") Pi may not expose the provider to modelRegistry,
+	// which makes resolveTargets() return [] and the family never failovers. To
+	// make the extension self-contained, register the base API-key provider here
+	// whenever a real key exists in auth.json. Idempotent: if Pi already registered
+	// it natively, registerProvider merges/overrides harmlessly.
+	const ensureApiKeyBaseProvider = (
+		family: "ollama" | "qwen",
+		baseId: string,
+	) => {
+		const entry = readAuthFile()[baseId];
+		const key =
+			entry && typeof entry.key === "string" && entry.key.length > 0
+				? entry.key
+				: undefined;
+		if (!key) return; // nothing to register — no real credential
+		const baseUrl = family === "ollama" ? OLLAMA_BASE_URL : QWEN_BASE_URL;
+		const preferred =
+			family === "ollama" ? DEFAULT_OLLAMA_MODELS : DEFAULT_QWEN_MODELS;
+		const models = preferred.map((m) =>
+			family === "ollama"
+				? ollamaModelDef(m, baseId)
+				: qwenModelDef(m, baseId),
+		);
+		pi.registerProvider(baseId, {
+			name: family === "ollama" ? "Ollama" : "Alibaba/Qwen",
+			baseUrl,
+			api: "openai-completions" as any,
+			apiKey: key,
+			models: models as any,
+		} as any);
+	};
+	ensureApiKeyBaseProvider("ollama", OLLAMA_BASE);
+	ensureApiKeyBaseProvider("qwen", config.qwenProvider);
+
 	pi.on("before_provider_request", (event: any) =>
 		shapeAnthropicOAuthPayload(event.payload),
 	);
