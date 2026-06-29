@@ -5,6 +5,161 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.1] - 2026-06-29
+
+### Changed
+
+- **Failover messages now carry the running version**, e.g.
+  `Provider failover [v1.13.1]: openai-codex → openai-codex-account-2 (...)`.
+  A running Pi keeps the extension code it started with, so restarting one window
+  does not update others — and an old window silently shows old behavior. Now the
+  version is printed in the exact messages you read when something goes wrong: if a
+  failover message has **no** `[v…]` tag (or an older number), that window is running
+  stale code and must be restarted. This is the single biggest source of "I fixed it
+  but it still breaks" confusion. Stamped on the switch, stuck-recovery, bounded-wait,
+  and breaker messages.
+
+## [1.13.0] - 2026-06-29
+
+Reliability floor: turn "it just sits there spinning" and "I have to re-type the
+prompt" into automatic recovery, and guarantee the extension can never be *worse*
+than switching accounts by hand.
+
+### Changed
+
+- **The stuck-resume watchdog now ACTS instead of only warning.** When a resumed
+  turn goes silent past `stuckWatchdogMs` (and no tool is running), it auto-cancels
+  the wedged turn and arms auto-resume, which continues the work the moment any
+  account frees up. You no longer have to press Esc and re-type the prompt. Opt out
+  with `autoRecoverStuck: false` (reverts to notify-only).
+- **A running build/test is never mistaken for a wedge.** Tool start/stop is tracked,
+  so a long silent `xcodebuild`/test command is left alone.
+- **The bounded idle-wait now schedules the retry it promised** instead of just
+  saying it would.
+- **Un-continuable resumes self-heal.** If the transcript tail can't be continued
+  (e.g. after a recovery abort), the extension injects the continuation prompt as a
+  message so work proceeds — bounded by `maxAutoContinuesPerPrompt`, never a loop.
+
+### Added
+
+- **Circuit breaker (the reliability floor).** If automatic recovery fails
+  `BREAKER_FAILURE_THRESHOLD` (3) times in a row, the extension drops to *advisory
+  mode* for 10 min: it still flags rate limits and switches you to a fresh account,
+  but stops attempting the auto-continue that was failing — so a bad state can never
+  spiral into repeated hangs. It closes again on the first successful response, a new
+  user prompt, or `/multi-account reset`. Visible in `/multi-account status`.
+- **Black box decision log.** Every meaningful decision (assistant error + how it was
+  classified, account switch, no-fallback, resume start/ok/stuck, watchdog action,
+  breaker open/close, compaction routing, internal errors) is appended to
+  `~/.pi/agent/provider-failover-debug.log`. This turns "it broke again" into a
+  precise, reproducible trail — the basis for fixing real-world bugs that unit tests
+  can't reach. Bounded size (one rotation at 4 MB), credential-free with defensive
+  token redaction. View with `/multi-account log [N]`; toggle with `log on|off`.
+- New config keys `autoRecoverStuck` (default `true`) and `debugLog` (default `true`).
+
+> Fully restart Pi (not `/reload`); confirm `/multi-account status` shows **v1.13.0**.
+
+## [1.12.0] - 2026-06-29
+
+Robustness pass: the two ways a failover could silently freeze the session are
+now fixed at the root, plus a generic watchdog so any *future* stall surfaces as
+an actionable message instead of an endless "Working…" spinner.
+
+### Fixed
+
+- **No more `Cannot continue from message role: assistant`.** After a switch, the
+  pending `currentPromptSwitch` was never cleared on a *successful* turn, so a
+  later `agent_end` re-dispatched a resume when there was nothing to continue —
+  `pi.continueAgent()` then threw that cryptic red error into the transcript. The
+  extension now only resumes when the turn actually ended in an **error** it can
+  continue from; a non-error end clears the switch. (This was the unexplained
+  first error users saw above a stuck spinner.)
+- **Compaction survives account exhaustion.** New `session_before_compact` handler:
+  when the active account is rate-limited/invalidated and Pi needs to summarize
+  (context overflow or threshold), the summary is generated on a **healthy
+  fallback account** instead of dying on the dead one. This was the "rotated and
+  then it just hangs at high context" freeze. Strictly fail-safe — falls back to
+  Pi's default compaction whenever it cannot positively do better.
+- **No unbounded waits.** `resumeWithExistingContext()` replaced its infinite
+  `while (!isIdle)` busy-loop with a bounded wait (`resumeIdleTimeoutMs`, default
+  90s) that retries later instead of wedging, and the routed compaction call is
+  bounded by a 150s timeout.
+- **Never resume onto a still-cooling account.** Before continuing, the extension
+  reconciles live usage; if the just-switched-to account is itself spent (its 5h
+  limit only became visible after a usage refresh), it pauses for the first
+  account that *actually* recovers instead of burning a request / wedging.
+
+### Added
+
+- **Forward-progress watchdog.** A resumed turn that shows no activity (no stream
+  token, tool event, or provider response) for `stuckWatchdogMs` (default 180s)
+  raises a clear, actionable notice — *press Esc, then `/multi-account next` or
+  `/compact`* — and re-checks periodically, so a silent wedge can never again look
+  like normal "working".
+- **`/multi-account status`** now shows the resume-watchdog state, compaction
+  routing mode, and the last context-overflow time.
+- New config keys: `routeCompactionToHealthyAccount` (default `true`),
+  `resumeIdleTimeoutMs`, `stuckWatchdogMs`.
+
+### Hardened (systemic — covers whole classes of failure, not just the bugs above)
+
+Rather than patch individual crashes, the entire surface is now fail-safe by
+construction:
+
+- **Every one of the ~12 Pi event handlers is crash-isolated** (`safeOn`). A throw
+  or async rejection anywhere — a host payload-shape change, a formatter edge case,
+  a null deref we never imagined — is reported once and swallowed, the failover step
+  is skipped, and Pi keeps running. Node aborts the whole process on an unhandled
+  rejection; this removes that entire class of "the extension took Pi down with it".
+- **Every background timer/async task is wrapped** (`runBackground`): the usage
+  footer interval, the pending-resume wake, the queued-input wake, and every
+  fire-and-forget `refreshUsage` can no longer leak an unhandled rejection.
+- **Error reports are deduped** (same fault ≤ once / 30 s) so a repeating internal
+  fault can never become a notification storm, and the dedupe map is capped.
+- **All persistence is best-effort.** `saveState` and the footer renderer can no
+  longer throw out of the code path they run in (locked/*read-only*/full disk, a
+  theme-shape change) — in-memory state stays correct and failover continues.
+- **Timers are `unref`'d** so a pending wake can never keep the process alive after
+  the session ends.
+
+> After updating you **must fully restart Pi** (not `/reload`) for the new code to
+> load; confirm `/multi-account status` shows **v1.12.0**.
+
+## [1.11.0] - 2026-06-28
+
+### Added
+
+- **`/multi-account remove`** — symmetric counterpart to `add`. Pass a family
+  (`anthropic`, `codex`, `cursor`, `ollama`, `qwen`) to drop the highest numbered
+  authed alias slot, or pass a full provider id (e.g. `openai-codex-account-3`)
+  to remove that exact account from `auth.json`, clear its failover state, and
+  refresh rotation. Aliases: `rm`, `delete`.
+
+## [1.10.2] - 2026-06-26
+
+### Fixed
+
+- **Cross-provider failover no longer reuses the source model id on the target
+  provider.** Switching from Anthropic/Cursor/Ollama to Codex (or any other family)
+  now picks that family's default model (e.g. `gpt-5.5`) instead of trying
+  `claude-opus-4-8` on Codex, which caused confusing resumes and activation
+  failures.
+- **Account selection now honours live usage when deciding if a slot is available.**
+  `findFallbackModels()` and `isCurrentModelReady()` use `providerRecoveryAt()`
+  (recorded cooldown reconciled against fresh usage) instead of blindly trusting
+  stale `exhaustedUntilByProvider` timestamps. Accounts with valid tokens whose
+  usage endpoint says they are free are selectable again.
+- **Failover continuation is queued immediately after a successful switch in
+  `message_end`,** not only from `agent_end`. This removes a race where Pi could
+  end the turn before `currentPromptSwitch` was armed, leaving the next account
+  idle or starting from the wrong place.
+- **`before_agent_start` no longer runs `ensureReadyModel()` for extension-owned
+  continuation prompts,** so the failover target is not re-switched away before
+  the resumed turn starts.
+- **Continuation prompts now restate the original user task** captured at the
+  start of the interrupted turn, so the replacement provider knows what to
+  continue instead of guessing from a generic "keep going" message.
+
 ## [1.9.3] - 2026-06-21
 
 ### Fixed

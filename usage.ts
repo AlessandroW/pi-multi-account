@@ -1,4 +1,4 @@
-export type UsageFamily = "codex" | "anthropic";
+export type UsageFamily = "codex" | "anthropic" | "ollama" | "cursor" | "qwen";
 
 export type UsageWindow = {
 	usedPercent: number;
@@ -25,6 +25,8 @@ export type UsageCredential = {
 	type?: string;
 	access?: string;
 	accountId?: string;
+	key?: string;
+	expires?: number;
 };
 
 export class UsageFetchError extends Error {
@@ -77,6 +79,9 @@ function usageWindow(value: unknown, fallbackWindowSeconds?: number): UsageWindo
 export function usageFamily(provider: string): UsageFamily | undefined {
 	if (provider === "openai-codex" || /^openai-codex-account-\d+$/.test(provider)) return "codex";
 	if (provider === "anthropic" || /^anthropic-account-\d+$/.test(provider)) return "anthropic";
+	if (provider === "ollama" || /^ollama-account-\d+$/.test(provider)) return "ollama";
+	if (provider === "cursor" || /^cursor-account-\d+$/.test(provider)) return "cursor";
+	if (provider === "alibaba" || /^alibaba-account-\d+$/.test(provider) || /^qwen/i.test(provider)) return "qwen";
 	return undefined;
 }
 
@@ -180,6 +185,125 @@ export function parseCodexUsageHeaders(
 	};
 }
 
+export function parseOllamaMeBody(
+	provider: string,
+	body: unknown,
+	fetchedAt = Date.now(),
+	credentialHash?: string,
+): UsageSnapshot {
+	const source = record(body);
+	const plan =
+		typeof source.Plan === "string"
+			? source.Plan
+			: typeof source.plan === "string"
+				? source.plan
+				: undefined;
+	const sessionSource =
+		source.session ??
+		source.Session ??
+		source.session_usage ??
+		source.SessionUsage;
+	const weeklySource =
+		source.weekly ??
+		source.Weekly ??
+		source.weekly_usage ??
+		source.WeeklyUsage;
+	const primary = usageWindow(sessionSource, 5 * 60 * 60);
+	const secondary = usageWindow(weeklySource, 7 * 24 * 60 * 60);
+	return {
+		provider,
+		family: "ollama",
+		fetchedAt,
+		credentialHash,
+		plan,
+		primary,
+		secondary,
+	};
+}
+
+async function fetchOllamaUsageSnapshot(
+	provider: string,
+	credential: UsageCredential,
+	options: {
+		fetchImpl?: typeof fetch;
+		timeoutMs?: number;
+		credentialHash?: string;
+	} = {},
+): Promise<UsageSnapshot> {
+	if (credential.type !== "api_key" || !credential.key) {
+		throw new UsageFetchError(`${provider} has no API key`);
+	}
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
+	const fetchImpl = options.fetchImpl ?? fetch;
+	const headers = {
+		Authorization: `Bearer ${credential.key}`,
+		Accept: "application/json",
+		"Content-Type": "application/json",
+	};
+	try {
+		let response = await fetchImpl("https://ollama.com/api/me", {
+			method: "POST",
+			headers,
+			body: "{}",
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			response = await fetchImpl("http://127.0.0.1:11434/api/me", {
+				method: "POST",
+				headers,
+				body: "{}",
+				signal: controller.signal,
+			});
+		}
+		if (!response.ok) {
+			throw new UsageFetchError(
+				`${provider} Ollama account check returned HTTP ${response.status}`,
+				response.status,
+			);
+		}
+		const body = await response.json();
+		return parseOllamaMeBody(
+			provider,
+			body,
+			Date.now(),
+			options.credentialHash,
+		);
+	} catch (error) {
+		if (error instanceof UsageFetchError) throw error;
+		if ((error as any)?.name === "AbortError") {
+			throw new UsageFetchError(`${provider} Ollama usage request timed out`);
+		}
+		throw new UsageFetchError(
+			`${provider} Ollama usage request failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+function fetchCursorUsageSnapshot(
+	provider: string,
+	credential: UsageCredential,
+	credentialHash?: string,
+): UsageSnapshot {
+	if (credential.type !== "oauth" || !credential.access) {
+		throw new UsageFetchError(`${provider} has no OAuth access token`);
+	}
+	const now = Date.now();
+	// Cursor does not expose a usage/quota API. Only the subscription status is
+	// knowable, so report it honestly instead of fabricating a usage percentage
+	// from the OAuth token expiry. Token expiry is tracked separately by the
+	// invalidation/re-auth system.
+	return {
+		provider,
+		family: "cursor",
+		fetchedAt: now,
+		credentialHash,
+		plan: "subscription",
+	};
+}
+
 export async function fetchUsageSnapshot(
 	provider: string,
 	credential: UsageCredential,
@@ -191,6 +315,29 @@ export async function fetchUsageSnapshot(
 ): Promise<UsageSnapshot> {
 	const family = usageFamily(provider);
 	if (!family) throw new UsageFetchError(`Usage is not supported for ${provider}`);
+
+	if (family === "ollama") {
+		return fetchOllamaUsageSnapshot(provider, credential, options);
+	}
+	if (family === "cursor") {
+		return fetchCursorUsageSnapshot(
+			provider,
+			credential,
+			options.credentialHash,
+		);
+	}
+	if (family === "qwen") {
+		// Qwen/Alibaba exposes no usage/quota endpoint over its API-key plans, so we
+		// report the plan honestly instead of attempting (and failing) an OAuth usage
+		// fetch. Keeps `limits` from throwing "not supported".
+		return {
+			provider,
+			family: "qwen",
+			fetchedAt: Date.now(),
+			credentialHash: options.credentialHash,
+			plan: "api-key · no usage endpoint",
+		};
+	}
 	if (credential.type !== "oauth" || !credential.access) {
 		throw new UsageFetchError(`${provider} has no OAuth access token`);
 	}
@@ -239,6 +386,9 @@ export function providerUsageLabel(provider: string): string {
 	const index = provider.match(/-account-(\d+)$/)?.[1];
 	if (provider.startsWith("openai-codex")) return index ? `Codex A${index}` : "Codex";
 	if (provider.startsWith("anthropic")) return index ? `Claude A${index}` : "Claude";
+	if (provider.startsWith("ollama")) return index ? `Ollama A${index}` : "Ollama";
+	if (provider.startsWith("cursor")) return index ? `Cursor A${index}` : "Cursor";
+	if (provider.startsWith("alibaba") || /^qwen/i.test(provider)) return index ? `Qwen A${index}` : "Qwen/Alibaba";
 	return provider;
 }
 
@@ -260,19 +410,53 @@ export function formatResetDuration(resetAt: number, now = Date.now()): string {
 export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): string {
 	const parts = [providerUsageLabel(snapshot.provider)];
 	if (snapshot.primary) {
-		parts.push(`5h ${remainingPercent(snapshot.primary)}% left/${formatResetDuration(snapshot.primary.resetAt, now)}`);
+		const label =
+			snapshot.family === "cursor"
+				? "auth"
+				: snapshot.family === "ollama"
+					? "cloud"
+					: "5h";
+		parts.push(
+			`${label} ${remainingPercent(snapshot.primary)}% left/${formatResetDuration(snapshot.primary.resetAt, now)}`,
+		);
 	}
 	if (snapshot.secondary) {
-		parts.push(`7d ${remainingPercent(snapshot.secondary)}% left/${formatResetDuration(snapshot.secondary.resetAt, now)}`);
+		const weeklyLabel = snapshot.family === "ollama" ? "weekly" : "7d";
+		parts.push(
+			`${weeklyLabel} ${remainingPercent(snapshot.secondary)}% left/${formatResetDuration(snapshot.secondary.resetAt, now)}`,
+		);
+	}
+	if (!snapshot.primary && !snapshot.secondary && snapshot.plan) {
+		if (snapshot.family === "ollama") {
+			parts.push(`${snapshot.plan} · no session/weekly API`);
+		} else {
+			parts.push(snapshot.plan);
+		}
 	}
 	return parts.join(" | ");
 }
 
 export function formatUsageDetails(snapshot: UsageSnapshot, now = Date.now()): string {
 	const lines = [`Limits for ${providerUsageLabel(snapshot.provider)}${snapshot.plan ? ` (${snapshot.plan})` : ""}`];
+	if (!snapshot.primary && !snapshot.secondary && snapshot.plan) {
+		if (snapshot.family === "ollama") {
+			lines.push(
+				`Plan: ${snapshot.plan}. Session/weekly limits are not exposed via Ollama's API yet — check https://ollama.com/settings`,
+			);
+		} else {
+			lines.push(`Status: ${snapshot.plan}`);
+		}
+	}
 	for (const [label, window] of [
-		["5h", snapshot.primary],
-		["7d", snapshot.secondary],
+		[
+			snapshot.family === "cursor"
+				? "auth"
+				: snapshot.family === "ollama"
+					? "session"
+					: "5h",
+			snapshot.primary,
+		],
+		[snapshot.family === "ollama" ? "weekly" : "7d", snapshot.secondary],
 	] as const) {
 		if (!window) continue;
 		lines.push(

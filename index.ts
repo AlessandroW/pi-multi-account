@@ -26,9 +26,11 @@
 
 import { createHash } from "node:crypto";
 import {
+	appendFileSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	renameSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
@@ -42,6 +44,11 @@ import {
 	refreshAnthropicToken,
 } from "@earendil-works/pi-ai/oauth";
 import {
+	CURSOR_BASE,
+	isCursorProviderId,
+	setupCursorSubscription,
+} from "./cursor-bridge.ts";
+import {
 	fetchUsageSnapshot,
 	formatUsageCompact,
 	formatUsageDetails,
@@ -54,7 +61,7 @@ import {
 } from "./usage.ts";
 
 type ModelRef = `${string}/${string}`;
-type ProviderFamily = "anthropic" | "openai-codex" | "qwen" | "ollama";
+type ProviderFamily = "anthropic" | "openai-codex" | "qwen" | "ollama" | "cursor";
 
 type OpenAICodexAliasConfig = {
 	id: string;
@@ -75,6 +82,7 @@ type ProviderFailoverConfig = {
 	includeQwen?: boolean;
 	qwenProvider?: string;
 	includeOllama?: boolean;
+	includeCursor?: boolean;
 	providerOrder?: ProviderFamily[];
 	cooldownMs?: number;
 	probeCooldownMs?: number;
@@ -94,6 +102,19 @@ type ProviderFailoverConfig = {
 	modelErrorPatterns?: string[];
 	ignoreErrorPatterns?: string[];
 	continuationPrompt?: string;
+	// When the active account is rate-limited/cooling/invalid and Pi needs to compact
+	// (context overflow or threshold), run the summary on a HEALTHY fallback account
+	// instead of letting the default summary die on the dead account. Default: true.
+	routeCompactionToHealthyAccount?: boolean;
+	// When a resumed turn wedges (silent past stuckWatchdogMs with no tool running), auto-cancel
+	// it and auto-resume when an account frees, instead of only notifying. Default: true.
+	autoRecoverStuck?: boolean;
+	// Write a structured "black box" decision log to provider-failover-debug.log. Default: true.
+	// Contains no credentials — only provider/model ids, decisions, and truncated reasons.
+	debugLog?: boolean;
+	// Forward-progress watchdog tunables (see constants above). 0/absent ⇒ built-in default.
+	resumeIdleTimeoutMs?: number;
+	stuckWatchdogMs?: number;
 };
 
 type RuntimeConfig = Required<
@@ -106,6 +127,7 @@ type RuntimeConfig = Required<
 		| "includeQwen"
 		| "qwenProvider"
 		| "includeOllama"
+		| "includeCursor"
 		| "providerOrder"
 		| "cooldownMs"
 		| "probeCooldownMs"
@@ -123,6 +145,11 @@ type RuntimeConfig = Required<
 		| "modelErrorPatterns"
 		| "ignoreErrorPatterns"
 		| "continuationPrompt"
+		| "routeCompactionToHealthyAccount"
+		| "autoRecoverStuck"
+		| "debugLog"
+		| "resumeIdleTimeoutMs"
+		| "stuckWatchdogMs"
 	>
 > & {
 	openaiCodexAliases: OpenAICodexAliasConfig[];
@@ -157,6 +184,14 @@ const AGENT_DIR =
 const CONFIG_PATH = join(AGENT_DIR, "provider-failover.json");
 const STATE_PATH = join(AGENT_DIR, "provider-failover-state.json");
 const AUTH_PATH = join(AGENT_DIR, "auth.json");
+// "Black box" flight recorder: a structured, append-only log of every decision the
+// extension makes (switches, errors, watchdog actions, breaker trips, compaction
+// routing). When something misbehaves, this file is the exact reproduction trail —
+// no guessing from screenshots. It NEVER contains tokens/credentials (only provider
+// ids, model ids, truncated reasons). Bounded size with one rotation so it can never
+// fill the disk.
+const DEBUG_LOG_PATH = join(AGENT_DIR, "provider-failover-debug.log");
+const DEBUG_LOG_MAX_BYTES = 4 * 1024 * 1024; // rotate to .log.1 past this
 const STATE_VERSION = 5;
 const DEFAULT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_PROBE_COOLDOWN_MS = 5 * 60 * 1000;
@@ -185,19 +220,38 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.9.3";
+const VERSION = "1.13.1";
+const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
 // that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
 // and permanently killed a live account. The threshold now tolerates a retry burst plus a
 // few genuinely distinct failures. Dedup in markAuthFailure (same-hash repeats do not count)
 // is the other half of this fix.
 const MAX_CONSECUTIVE_AUTH_FAILURES = 8;
-// Hard wall: even a transient auth failure must not cool an account for longer than the
-// provider's own reset window. One year was a misdesign — it was meant to mean "until re-login"
-// but it also polluted cooldown displays and blocked parallel Pi instances that shared the state
-// file. The exact reset is parsed from headers/body; this is just the safety cap.
-const MAX_TRANSIENT_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
 const TRANSIENT_AUTH_COOLDOWN_MS = 60 * 1000; // brief skip after a 401 so the next call can refresh
+
+// --- Forward-progress watchdogs (v1.12.0) ----------------------------------
+// A resumed/rotated turn must NEVER be able to hang the session forever. The old
+// code awaited pi.continueAgent() and busy-waited on ctx.isIdle() with no upper
+// bound, so any stall (a wedged compaction, a provider socket that never returns,
+// an account that quietly accepts the request but never streams) showed the user a
+// spinning "working" animation with zero progress and no way to tell it was dead.
+// These bounds turn whole CLASSES of "it just hangs" — including ones never
+// individually enumerated — into a visible, recoverable state.
+const RESUME_IDLE_TIMEOUT_MS = 90 * 1000; // max wait for the prior turn to go idle before we stop blocking
+const STUCK_WATCHDOG_MS = 180 * 1000; // total silence (no stream/tool/response) on a resumed turn ⇒ "stuck"
+const STUCK_REMINDER_MS = 120 * 1000; // re-surface the stuck notice this often while it stays stuck
+const COMPACTION_WATCHDOG_MS = 150 * 1000; // a healthy-account compaction summary may not exceed this
+
+// --- Circuit breaker (v1.13.0) ---------------------------------------------
+// The reliability FLOOR. If automatic recovery keeps failing (resume wedges, switch
+// makes no progress) the extension stops trying to be clever and drops to "advisory
+// mode": it still flags rate limits and tells you which account to switch to, but it
+// no longer attempts the auto-continue that was hanging. Guarantee: the extension can
+// never make the experience WORSE than switching accounts by hand. Closes again on any
+// real forward progress, a new user prompt, /multi-account reset, or after a cooldown.
+const BREAKER_FAILURE_THRESHOLD = 3; // consecutive failed recoveries before tripping
+const BREAKER_COOLDOWN_MS = 10 * 60 * 1000; // how long advisory mode lasts once tripped
 
 const ANTHROPIC_BASE = "anthropic";
 const CODEX_BASE = "openai-codex";
@@ -293,7 +347,11 @@ const TERMINAL_AUTH_ERROR_PATTERNS = [
 	"invalid_grant",
 	"revoked",
 	"invalid api key",
+	"invalid api-key",
 	"incorrect api key",
+	"incorrect api-key",
+	"api-key provided",
+	"apikey-error",
 ];
 
 const FORCE_REFRESH_AUTH_ERROR_PATTERNS = [
@@ -322,14 +380,16 @@ const DEFAULT_IGNORE_PATTERNS = [
 ];
 
 const DEFAULT_CONTINUATION_PROMPT = [
-	"Provider failover activated: the previous provider/account hit a quota or rate limit, and Pi switched to {to}.",
-	"Continue the interrupted user task from the last safe point.",
-	"Do not repeat destructive actions or duplicate completed work. If state is uncertain, inspect current files/session state first, then continue.",
+	"Provider failover activated: switched to {to} after {from} hit a quota or rate limit.",
+	"Continue the interrupted task from where it stopped.",
+	"Do not repeat completed work or duplicate actions.",
+	"The full conversation context is already in this session — just continue working.",
 ].join(" ");
 
 const DEFAULT_PROVIDER_ORDER: ProviderFamily[] = [
 	"anthropic",
 	"openai-codex",
+	"cursor",
 	"qwen",
 	"ollama",
 ];
@@ -398,6 +458,10 @@ const DEFAULT_QWEN_MODELS = [
 	"qwen-max",
 	"qwen-plus",
 ];
+const DEFAULT_CURSOR_MODELS = [
+	"composer-2.5",
+];
+
 
 const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	enabled: true,
@@ -407,6 +471,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	includeQwen: true,
 	qwenProvider: DEFAULT_QWEN_PROVIDER,
 	includeOllama: true,
+	includeCursor: true,
 	providerOrder: DEFAULT_PROVIDER_ORDER,
 	cooldownMs: DEFAULT_COOLDOWN_MS,
 	probeCooldownMs: DEFAULT_PROBE_COOLDOWN_MS,
@@ -426,6 +491,11 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	modelErrorPatterns: DEFAULT_MODEL_ERROR_PATTERNS,
 	ignoreErrorPatterns: DEFAULT_IGNORE_PATTERNS,
 	continuationPrompt: DEFAULT_CONTINUATION_PROMPT,
+	routeCompactionToHealthyAccount: true,
+	autoRecoverStuck: true,
+	debugLog: true,
+	resumeIdleTimeoutMs: RESUME_IDLE_TIMEOUT_MS,
+	stuckWatchdogMs: STUCK_WATCHDOG_MS,
 };
 
 // ---------------------------------------------------------------------------
@@ -448,6 +518,19 @@ function positiveOr(value: unknown, fallback: number) {
 		: fallback;
 }
 
+function stringArray(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value
+		.filter((item): item is string => typeof item === "string")
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0);
+}
+
+function nonEmptyStringArrayOr(value: unknown, fallback: string[]): string[] {
+	const sanitized = stringArray(value);
+	return sanitized.length > 0 ? sanitized : fallback;
+}
+
 function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 	const order =
 		Array.isArray(raw.providerOrder) && raw.providerOrder.length > 0
@@ -464,10 +547,13 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		includeQwen: raw.includeQwen ?? true,
 		qwenProvider: raw.qwenProvider?.trim() || DEFAULT_QWEN_PROVIDER,
 		includeOllama: raw.includeOllama ?? true,
+		includeCursor: raw.includeCursor ?? true,
 		providerOrder: order.filter(
+
 			(f): f is ProviderFamily =>
 				f === "anthropic" ||
 				f === "openai-codex" ||
+				f === "cursor" ||
 				f === "qwen" ||
 				f === "ollama",
 		),
@@ -491,37 +577,44 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		maxAutoContinuesPerPrompt: Math.floor(
 			positiveOr(raw.maxAutoContinuesPerPrompt, 8),
 		),
-		fallbacks: Array.isArray(raw.fallbacks) ? raw.fallbacks : [],
+		fallbacks: stringArray(raw.fallbacks),
 		openaiCodexAliases: Array.isArray(raw.openaiCodexAliases)
 			? raw.openaiCodexAliases
 			: [],
 		anthropicOAuthAliases: Array.isArray(raw.anthropicOAuthAliases)
 			? raw.anthropicOAuthAliases
 			: [],
-		limitErrorPatterns:
-			Array.isArray(raw.limitErrorPatterns) && raw.limitErrorPatterns.length > 0
-				? raw.limitErrorPatterns
-				: DEFAULT_LIMIT_PATTERNS,
-		authErrorPatterns:
-			Array.isArray(raw.authErrorPatterns) && raw.authErrorPatterns.length > 0
-				? raw.authErrorPatterns
-				: DEFAULT_AUTH_ERROR_PATTERNS,
-		transientErrorPatterns:
-			Array.isArray(raw.transientErrorPatterns) &&
-			raw.transientErrorPatterns.length > 0
-				? raw.transientErrorPatterns
-				: DEFAULT_TRANSIENT_ERROR_PATTERNS,
-		modelErrorPatterns:
-			Array.isArray(raw.modelErrorPatterns) && raw.modelErrorPatterns.length > 0
-				? raw.modelErrorPatterns
-				: DEFAULT_MODEL_ERROR_PATTERNS,
-		ignoreErrorPatterns:
-			Array.isArray(raw.ignoreErrorPatterns) &&
-			raw.ignoreErrorPatterns.length > 0
-				? raw.ignoreErrorPatterns
-				: DEFAULT_IGNORE_PATTERNS,
+		limitErrorPatterns: nonEmptyStringArrayOr(
+			raw.limitErrorPatterns,
+			DEFAULT_LIMIT_PATTERNS,
+		),
+		authErrorPatterns: nonEmptyStringArrayOr(
+			raw.authErrorPatterns,
+			DEFAULT_AUTH_ERROR_PATTERNS,
+		),
+		transientErrorPatterns: nonEmptyStringArrayOr(
+			raw.transientErrorPatterns,
+			DEFAULT_TRANSIENT_ERROR_PATTERNS,
+		),
+		modelErrorPatterns: nonEmptyStringArrayOr(
+			raw.modelErrorPatterns,
+			DEFAULT_MODEL_ERROR_PATTERNS,
+		),
+		ignoreErrorPatterns: nonEmptyStringArrayOr(
+			raw.ignoreErrorPatterns,
+			DEFAULT_IGNORE_PATTERNS,
+		),
 		continuationPrompt:
 			raw.continuationPrompt?.trim() || DEFAULT_CONTINUATION_PROMPT,
+		routeCompactionToHealthyAccount:
+			raw.routeCompactionToHealthyAccount ?? true,
+		autoRecoverStuck: raw.autoRecoverStuck ?? true,
+		debugLog: raw.debugLog ?? true,
+		resumeIdleTimeoutMs: positiveOr(
+			raw.resumeIdleTimeoutMs,
+			RESUME_IDLE_TIMEOUT_MS,
+		),
+		stuckWatchdogMs: positiveOr(raw.stuckWatchdogMs, STUCK_WATCHDOG_MS),
 	};
 }
 
@@ -582,12 +675,74 @@ function loadState(): ProviderFailoverState {
 }
 
 function saveState(state: ProviderFailoverState) {
-	mkdirSync(dirname(STATE_PATH), { recursive: true, mode: 0o700 });
-	writeFileSync(
-		STATE_PATH,
-		`${JSON.stringify({ stateVersion: STATE_VERSION, ...state }, null, "\t")}\n`,
-		{ encoding: "utf8", mode: 0o600 },
-	);
+	// Best-effort: a locked/read-only/full disk must never crash the host. Losing a
+	// state write only costs a cooldown estimate that is re-derived on the next error.
+	try {
+		mkdirSync(dirname(STATE_PATH), { recursive: true, mode: 0o700 });
+		writeFileSync(
+			STATE_PATH,
+			`${JSON.stringify({ stateVersion: STATE_VERSION, ...state }, null, "\t")}\n`,
+			{ encoding: "utf8", mode: 0o600 },
+		);
+	} catch {
+		/* persistence is non-critical; in-memory state remains correct */
+	}
+}
+
+// ---------------------------------------------------------------------------
+// "Black box" decision log — structured, append-only, credential-free, bounded.
+// ---------------------------------------------------------------------------
+
+// Set from the extension closure once config is known. Module-level so the writer
+// (a plain function) can be called from anywhere without threading config through.
+let debugLogEnabled = false;
+const DEBUG_TOKENISH = /(sk-[\w-]{8,}|ey[A-Za-z0-9._-]{12,}|Bearer\s+\S+|[A-Za-z0-9_-]{40,})/g;
+
+// Redact anything that smells like a token/JWT/api key so the log is always safe to
+// share. We never deliberately log credentials, but error strings from providers can
+// occasionally embed one; this is the belt-and-braces guarantee.
+function redactForLog(text: string): string {
+	return text.replace(DEBUG_TOKENISH, "«redacted»");
+}
+
+function rotateDebugLogIfNeeded() {
+	try {
+		const size = statSync(DEBUG_LOG_PATH).size;
+		if (size >= DEBUG_LOG_MAX_BYTES) {
+			renameSync(DEBUG_LOG_PATH, `${DEBUG_LOG_PATH}.1`); // keep exactly one previous file
+		}
+	} catch {
+		/* no file yet, or rotation failed — non-fatal */
+	}
+}
+
+// Append one structured event. Best-effort and utterly silent on failure: logging must
+// NEVER affect failover behaviour or crash the host. `data` should already be free of
+// secrets; string fields are still redacted defensively.
+function logEvent(kind: string, data: Record<string, unknown> = {}) {
+	if (!debugLogEnabled) return;
+	try {
+		const safe: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(data)) {
+			safe[k] = typeof v === "string" ? redactForLog(v).slice(0, 300) : v;
+		}
+		const line = `${JSON.stringify({ t: new Date().toISOString(), kind, ...safe })}\n`;
+		rotateDebugLogIfNeeded();
+		mkdirSync(dirname(DEBUG_LOG_PATH), { recursive: true, mode: 0o700 });
+		appendFileSync(DEBUG_LOG_PATH, line, { encoding: "utf8", mode: 0o600 });
+	} catch {
+		/* diagnostics are best-effort; never throw */
+	}
+}
+
+function readDebugLogTail(maxLines: number): string {
+	try {
+		const raw = readFileSync(DEBUG_LOG_PATH, "utf8");
+		const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+		return lines.slice(-maxLines).join("\n");
+	} catch {
+		return "";
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +796,11 @@ function jwtExpMs(token: string): number | undefined {
 		: undefined;
 }
 
+function getCursorSubFromAccessToken(token: string): string | undefined {
+	const sub = decodeJwtPayload(token)?.sub;
+	return typeof sub === "string" && sub.length > 0 ? sub : undefined;
+}
+
 function getCodexAccountIdFromAccessToken(token: string): string | undefined {
 	return decodeJwtPayload(token)?.["https://api.openai.com/auth"]
 		?.chatgpt_account_id as string | undefined;
@@ -672,6 +832,8 @@ function accountIdentity(entry: AuthEntry): string | undefined {
 	if (entry.access) {
 		const codexId = getCodexAccountIdFromAccessToken(entry.access);
 		if (codexId) return `codex:${hash12(codexId)}`;
+		const cursorSub = getCursorSubFromAccessToken(entry.access);
+		if (cursorSub) return `cursor:${hash12(cursorSub)}`;
 		return `tok:${hash12(entry.access)}`;
 	}
 	if (entry.key) return `key:${hash12(entry.key)}`;
@@ -744,6 +906,68 @@ function isEntryUsable(entry: AuthEntry | undefined): boolean {
 // Provider id helpers
 // ---------------------------------------------------------------------------
 
+const FAMILY_KEYWORDS = new Set([
+	"anthropic",
+	"claude",
+	"codex",
+	"openai",
+	"cursor",
+	"ollama",
+	"qwen",
+	"alibaba",
+]);
+
+function parseFamilyArg(raw: string | undefined): ProviderFamily | undefined {
+	const familyRaw = (raw || "").toLowerCase();
+	if (familyRaw === "codex" || familyRaw === "openai") return "openai-codex";
+	if (familyRaw === "anthropic" || familyRaw === "claude") return "anthropic";
+	if (familyRaw === "ollama") return "ollama";
+	if (familyRaw === "qwen" || familyRaw === "alibaba") return "qwen";
+	if (familyRaw === "cursor") return "cursor";
+	return undefined;
+}
+
+function isFamilyKeyword(raw: string): boolean {
+	return FAMILY_KEYWORDS.has(raw.trim().toLowerCase());
+}
+
+function resolveRemoveTarget(
+	arg: string,
+	auth: Record<string, AuthEntry>,
+	qwenProvider: string,
+): string | undefined {
+	const trimmed = arg.trim();
+	if (!trimmed) return undefined;
+
+	if (/-account-\d+$/.test(trimmed) || isCursorProviderId(trimmed)) {
+		return auth[trimmed] && classifyProvider(trimmed, qwenProvider)
+			? trimmed
+			: undefined;
+	}
+
+	const parsed = parseTarget(trimmed);
+	const exactId = parsed?.provider ?? trimmed;
+	if (!isFamilyKeyword(trimmed)) {
+		return auth[exactId] && classifyProvider(exactId, qwenProvider)
+			? exactId
+			: undefined;
+	}
+
+	const family = parseFamilyArg(trimmed);
+	if (!family) return undefined;
+
+	const aliases = Object.keys(auth)
+		.filter(
+			(id) =>
+				classifyProvider(id, qwenProvider) === family && slotIndex(id) >= 2,
+		)
+		.sort((a, b) => slotIndex(b) - slotIndex(a));
+	if (aliases.length > 0) return aliases[0];
+
+	const baseId = slotId(family, 1, qwenProvider);
+	return auth[baseId] ? baseId : undefined;
+}
+
 function classifyProvider(
 	id: string,
 	qwenProvider: string,
@@ -756,6 +980,7 @@ function classifyProvider(
 		return "qwen";
 	if (id === OLLAMA_BASE || /^ollama-account-\d+$/.test(id) || /^ollama/i.test(id))
 		return "ollama";
+	if (isCursorProviderId(id)) return "cursor";
 	return undefined;
 }
 
@@ -780,7 +1005,9 @@ function slotId(
 				? CODEX_BASE
 				: family === "qwen"
 					? qwenProvider
-					: OLLAMA_BASE;
+					: family === "cursor"
+						? CURSOR_BASE
+						: OLLAMA_BASE;
 	return index <= 1 ? base : `${base}-account-${index}`;
 }
 
@@ -789,8 +1016,9 @@ function ref(provider: string, modelId: string): ModelRef {
 }
 
 function parseTarget(
-	target: string,
+	target: unknown,
 ): { provider: string; modelId?: string } | undefined {
+	if (typeof target !== "string") return undefined;
 	const trimmed = target.trim();
 	if (!trimmed) return undefined;
 	const slash = trimmed.indexOf("/");
@@ -912,13 +1140,27 @@ function registerCodexSlot(pi: ExtensionAPI, id: string) {
 
 // Base URLs and model lists for API-key provider families that support multiple
 // accounts (each account = a separate API key in a numbered slot).
-const OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1";
+const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const OLLAMA_LOCAL_BASE_URL = "http://127.0.0.1:11434/v1";
+const OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1";
+
+function isOllamaCloudModel(modelId: string): boolean {
+	return modelId.includes(":cloud");
+}
+
+function ollamaBaseUrlForModel(modelId: string): string {
+	return isOllamaCloudModel(modelId)
+		? OLLAMA_CLOUD_BASE_URL
+		: OLLAMA_LOCAL_BASE_URL;
+}
 const OLLAMA_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 	"glm-5.2:cloud": {
 		id: "glm-5.2:cloud",
 		name: "GLM-5.2 (Ollama Cloud)",
 		contextWindow: 1000000,
+		maxTokens: 32768,
 		input: ["text"],
+		cost: ZERO_COST,
 		reasoning: true,
 	},
 };
@@ -927,10 +1169,12 @@ function ollamaModelDef(id: string, providerId: string) {
 		id,
 		name: id,
 		contextWindow: 1000000,
+		maxTokens: 32768,
 		input: ["text"],
+		cost: ZERO_COST,
 		reasoning: true,
 	};
-	return { ...def, provider: providerId };
+	return { ...def, provider: providerId, baseUrl: ollamaBaseUrlForModel(id) };
 }
 
 const QWEN_BASE_URL =
@@ -942,6 +1186,7 @@ const QWEN_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 		contextWindow: 1000000,
 		maxTokens: 65536,
 		input: ["text"],
+		cost: ZERO_COST,
 		reasoning: true,
 		thinkingLevelMap: { high: "high", low: null, medium: null, minimal: null, xhigh: "max" },
 	},
@@ -949,14 +1194,18 @@ const QWEN_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 		id: "qwen-max",
 		name: "Qwen Max",
 		contextWindow: 1000000,
+		maxTokens: 8192,
 		input: ["text"],
+		cost: ZERO_COST,
 		reasoning: true,
 	},
 	"qwen-plus": {
 		id: "qwen-plus",
 		name: "Qwen Plus",
 		contextWindow: 1000000,
+		maxTokens: 8192,
 		input: ["text"],
+		cost: ZERO_COST,
 		reasoning: true,
 	},
 };
@@ -965,7 +1214,9 @@ function qwenModelDef(id: string, providerId: string) {
 		id,
 		name: id,
 		contextWindow: 1000000,
+		maxTokens: 8192,
 		input: ["text"],
+		cost: ZERO_COST,
 		reasoning: true,
 	};
 	return { ...def, provider: providerId };
@@ -998,7 +1249,10 @@ function registerApiKeySlot(
 			? entry.key
 			: undefined;
 	if (!key) return;
-	const baseUrl = family === "ollama" ? OLLAMA_BASE_URL : QWEN_BASE_URL;
+	const baseUrl =
+		family === "ollama"
+			? OLLAMA_CLOUD_BASE_URL
+			: QWEN_BASE_URL;
 	const preferred =
 		family === "ollama" ? DEFAULT_OLLAMA_MODELS : DEFAULT_QWEN_MODELS;
 	const models = preferred.map((m) =>
@@ -1136,6 +1390,10 @@ function cooldownMsFromUsage(
 	snapshot: UsageSnapshot,
 	now = Date.now(),
 ): number | undefined {
+	// Codex/Claude short windows can still have headroom while a longer rolling window is maxed.
+	// Treat the account as available when the primary window is not exhausted.
+	if (snapshot.primary && snapshot.primary.usedPercent < 100) return 0;
+
 	const windows = [snapshot.primary, snapshot.secondary].filter(
 		(w): w is UsageWindow => !!w,
 	);
@@ -1451,6 +1709,7 @@ function anthropicOAuthOverride(providerId: string, name: string) {
 
 export default function piMultiAccount(pi: ExtensionAPI) {
 	let config = loadConfig();
+	debugLogEnabled = config.debugLog;
 	let configuredFallbacks = config.fallbacks.slice();
 	let persistedState = loadState();
 
@@ -1499,12 +1758,38 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let queuedInputWakeTimer: ReturnType<typeof setTimeout> | undefined;
 	let usageStatusTimer: ReturnType<typeof setInterval> | undefined;
 	const queuedUserInputs: Array<{ text: string; images?: any[] }> = [];
-	let expectingSelfContinuation = false; // true between our sendUserMessage and its agent_start
-	let lastSentContinuationPrompt = ""; // secondary check to recognise our own re-prompt
+	let continuationDispatchedForAgentTurn = false; // avoid agent_end double-dispatch after message_end failover
 	let userAbortedChain = false; // user pressed Esc → stop auto-continuing until a new prompt
 	let lastLeftProvider: string | undefined; // account we just failed away from (anti-ping-pong)
 	let lastLeftAt = 0;
 	let automaticModelTarget: ModelRef | undefined;
+	// Forward-progress watchdog state. A "resume in flight" is a continuation WE dispatched
+	// (pi.continueAgent after a switch) whose new turn must keep showing activity. Any stream
+	// token, tool event, or provider response is "progress" and disarms the stuck timer; total
+	// silence past stuckWatchdogMs means the rotated turn wedged and the user is staring at a
+	// spinner that will never finish — so we surface a concrete, actionable recovery.
+	let resumeInFlight = false;
+	let progressWatchdogTimer: ReturnType<typeof setTimeout> | undefined;
+	let watchdogCtx: any;
+	let lastResumeProgressAt = 0;
+	let stuckReminders = 0;
+	// True only while WE deliberately abort a wedged resumed turn, so agent_end can tell our
+	// recovery abort apart from a real user Esc and auto-continue instead of stopping.
+	let watchdogAborting = false;
+	// How many tools are executing right now on the resumed turn. A long build/test command is
+	// silent for minutes but is NOT stuck — never abort while a tool is in flight.
+	let toolInFlight = 0;
+	// Set right before we inject a continuation prompt as a user message (the fallback used when
+	// the transcript tail is not continuable, e.g. after a watchdog abort). before_agent_start
+	// checks it so our own continuation does NOT reset the per-task auto-continue counter — that
+	// keeps maxAutoContinuesPerPrompt bounding the recovery loop.
+	let expectingInjectedContinuation = false;
+	let lastContextOverflowAt = 0; // for /multi-account status visibility
+	let compactionRoutedNote: string | undefined; // last healthy-compaction routing decision, for status
+	// Circuit breaker: consecutive failed auto-recoveries, and the time until which advisory mode
+	// (auto-continue paused) stays in effect once tripped.
+	let recoveryFailures = 0;
+	let breakerOpenUntil = 0;
 	// The thinking level the user intended for this turn. pi.setModel() re-clamps and
 	// persists the thinking level on every model switch, so without this it drifts
 	// downward across failovers ("thinking level keeps dropping"). We capture it before
@@ -1526,6 +1811,71 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
 		} catch {
 			/* setThinkingLevel clamps to model caps; ignore if unsupported */
+		}
+	}
+
+	// ---- crash isolation (v1.12.0) ----------------------------------------
+	// This extension hooks ~12 Pi events and runs several background timers. Node
+	// terminates the whole process on an unhandled promise rejection, and a throw
+	// inside an event handler can break the host. So EVERY handler and EVERY timer
+	// callback is funnelled through these guards: the error is reported once
+	// (deduped, so a repeating fault can't spam) and swallowed, the current failover
+	// step is skipped, and Pi keeps running. This is the systemic net that makes the
+	// whole surface fail-safe — not just the specific bugs we already know about.
+	const reportedErrors = new Map<string, number>();
+	function reportExtensionError(where: string, error: unknown, ctx?: any) {
+		const msg = error instanceof Error ? error.message : String(error);
+		const key = `${where}:${msg.slice(0, 80)}`;
+		const now = Date.now();
+		const last = reportedErrors.get(key) ?? 0;
+		// Always record the raw fault in the black box (deduped only for the user-facing toast).
+		logEvent("internal_error", { where, error: msg });
+		if (now - last < 30_000) return; // dedupe identical errors within 30s
+		reportedErrors.set(key, now);
+		if (reportedErrors.size > 50) reportedErrors.clear(); // never grow unbounded
+		try {
+			ctx?.ui?.notify?.(
+				`pi-multi-account: recovered from an internal error in ${where} (${msg.slice(0, 140)}). Failover continues; run /multi-account status if anything looks off.`,
+				"warning",
+			);
+		} catch {
+			/* even notify must never throw us out of the guard */
+		}
+	}
+
+	// Register an event handler that can never crash the host. Preserves the handler's
+	// return value (Pi uses these — e.g. the shaped payload, the input action, the
+	// compaction result); on a sync throw OR async rejection it reports once and
+	// returns undefined, which every Pi event treats as "no opinion / default".
+	function safeOn(event: string, handler: (ev: any, ctx: any) => any) {
+		pi.on(event as any, (ev: any, ctx: any) => {
+			try {
+				const out = handler(ev, ctx);
+				if (out && typeof (out as any).then === "function") {
+					return (out as Promise<unknown>).catch((error) => {
+						reportExtensionError(`${event} handler`, error, ctx);
+						return undefined;
+					});
+				}
+				return out;
+			} catch (error) {
+				reportExtensionError(`${event} handler`, error, ctx);
+				return undefined;
+			}
+		});
+	}
+
+	// Fire-and-forget an async background task (timer callbacks) without ever leaking
+	// an unhandled rejection that would abort the Node process.
+	function runBackground(
+		where: string,
+		ctx: any,
+		fn: () => Promise<unknown>,
+	) {
+		try {
+			void fn().catch((error) => reportExtensionError(where, error, ctx));
+		} catch (error) {
+			reportExtensionError(where, error, ctx);
 		}
 	}
 
@@ -1647,6 +1997,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					entry,
 					await openaiCodexOAuthProvider.refreshToken(entry as any),
 				);
+			} else if (family === "cursor") {
+				const authMod = await import(
+					join(AGENT_DIR, "git/github.com/ndraiman/pi-cursor-provider/auth.ts")
+				);
+				refreshed = mergeRefreshedCredentials(
+					entry,
+					await authMod.refreshCursorToken(entry.refresh),
+				);
 			} else {
 				return { status: "unsupported" };
 			}
@@ -1692,28 +2050,39 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function usageCacheTtl(provider: string): number {
-		return usageFamily(provider) === "anthropic"
-			? Math.max(config.usageRefreshMs, MIN_ANTHROPIC_USAGE_REFRESH_MS)
-			: config.usageRefreshMs;
+		const family = usageFamily(provider);
+		if (family === "anthropic") {
+			return Math.max(config.usageRefreshMs, MIN_ANTHROPIC_USAGE_REFRESH_MS);
+		}
+		if (family === "ollama" || family === "cursor") {
+			return Math.max(config.usageRefreshMs, 5 * 60_000);
+		}
+		return config.usageRefreshMs;
 	}
 
 	function updateUsageStatus(ctx: any, provider = ctx?.model?.provider) {
 		if (typeof ctx?.ui?.setStatus !== "function") return;
-		if (!config.showUsage || !provider || !usageFamily(provider)) {
-			ctx.ui.setStatus("multi-account-quota", undefined);
-			return;
+		// Footer rendering touches host UI + formatting helpers; never let a render hiccup
+		// (theme shape change, formatter edge case) bubble up and break the turn it runs in.
+		try {
+			if (!config.showUsage || !provider || !usageFamily(provider)) {
+				ctx.ui.setStatus("multi-account-quota", undefined);
+				return;
+			}
+			const snapshot = cachedUsage(provider);
+			if (!snapshot) {
+				ctx.ui.setStatus("multi-account-quota", undefined);
+				return;
+			}
+			const text = formatUsageCompact(snapshot);
+			const color = usageColor(snapshot);
+			ctx.ui.setStatus(
+				"multi-account-quota",
+				ctx.ui.theme?.fg ? ctx.ui.theme.fg(color, text) : text,
+			);
+		} catch {
+			/* footer is cosmetic — a render error must not affect failover */
 		}
-		const snapshot = cachedUsage(provider);
-		if (!snapshot) {
-			ctx.ui.setStatus("multi-account-quota", undefined);
-			return;
-		}
-		const text = formatUsageCompact(snapshot);
-		const color = usageColor(snapshot);
-		ctx.ui.setStatus(
-			"multi-account-quota",
-			ctx.ui.theme?.fg ? ctx.ui.theme.fg(color, text) : text,
-		);
 	}
 
 	function storeUsage(ctx: any, snapshot: UsageSnapshot) {
@@ -1809,7 +2178,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		usageStatusTimer = setInterval(() => {
-			void refreshUsage(ctx);
+			runBackground("usage status timer", ctx, () => refreshUsage(ctx));
 		}, config.usageStatusRefreshMs);
 		(usageStatusTimer as any).unref?.();
 	}
@@ -1892,6 +2261,93 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (changed) persist();
 	}
 
+	function isTransientPendingReason(reason: string) {
+		return reason.startsWith(TRANSIENT_PENDING_PREFIX);
+	}
+
+	function isAuthPendingReason(reason: string) {
+		const lower = reason.toLowerCase();
+		return (
+			lower.includes("auth invalid") ||
+			lower.includes("auth failure") ||
+			lower.includes("invalid api-key") ||
+			lower.includes("invalid api key")
+		);
+	}
+
+	/** When does this provider become usable again? Uses recorded cooldown AND fresh usage. */
+	function providerRecoveryAt(provider: string, now = Date.now()): number {
+		let at = Math.max(now, exhaustedUntilByProvider.get(provider) ?? now);
+		const cached = usageByProvider.get(provider);
+		if (cached && now - cached.fetchedAt < usageCacheTtl(provider)) {
+			const usageMs = cooldownMsFromUsage(cached, now);
+			if (usageMs === 0) return now;
+			if (usageMs !== undefined) at = Math.min(at, now + usageMs);
+		}
+		return at;
+	}
+
+	/** Human-readable summary for /multi-account status — earliest account to recover. */
+	function nextRecoveryStatus(ctx: any): string {
+		const now = Date.now();
+		reconcileCooldownsFromUsage(ctx);
+		const providers = rotation.filter((p) => !isInvalidated(p));
+		if (providers.length === 0)
+			return "none — no authenticated accounts in rotation";
+
+		const cooling = providers
+			.map((provider) => ({ provider, at: providerRecoveryAt(provider, now) }))
+			.filter(({ at }) => at > now + 500)
+			.sort((a, b) => a.at - b.at);
+
+		if (cooling.length === 0) return "all rotation accounts available now";
+
+		const parts: string[] = [];
+		const first = cooling[0];
+		parts.push(
+			`first: ${first.provider} in ~${formatDelay(first.at - now)} (${formatUntil(first.at)})`,
+		);
+		if (cooling.length > 1) {
+			const also = cooling
+				.slice(1, 4)
+				.map((r) => `${r.provider} ~${formatDelay(r.at - now)}`)
+				.join(", ");
+			parts.push(`then: ${also}${cooling.length > 4 ? ", …" : ""}`);
+		}
+		if (hasPendingResume()) {
+			const wake = nextPendingWakeDelayMs();
+			if (wake !== undefined)
+				parts.push(`auto-resume check in ~${formatDelay(wake)}`);
+		} else if (queuedUserInputs.length > 0) {
+			const wake = nextModelAvailabilityDelayMs(ctx);
+			if (wake !== undefined)
+				parts.push(`queued input send in ~${formatDelay(wake)}`);
+		}
+		return parts.join(" · ");
+	}
+
+	async function resolveLimitCooldownMs(
+		ctx: any,
+		provider: string,
+		errorText: string,
+	): Promise<number> {
+		const hintedCooldowns = [
+			responseCooldownHints.get(provider),
+			cooldownFromErrorText(errorText),
+		].filter(
+			(value): value is number => typeof value === "number" && value > 0,
+		);
+		const snapshot = await refreshUsage(ctx, provider, true);
+		if (snapshot) {
+			applyUsageToCooldown(provider, snapshot, Date.now());
+			const usageMs = cooldownMsFromUsage(snapshot);
+			if (usageMs !== undefined && usageMs > 0) hintedCooldowns.push(usageMs);
+		}
+		return hintedCooldowns.length > 0
+			? Math.max(...hintedCooldowns)
+			: config.cooldownMs;
+	}
+
 	function providersSharingAccount(provider: string): string[] {
 		const auth = readAuthFile();
 		const identity = auth[provider]
@@ -1966,7 +2422,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const [provider, until] of [...exhaustedUntilByProvider.entries()]) {
 			if (until <= now || isInvalidated(provider) || !usageFamily(provider))
 				continue;
-			void refreshUsage(ctx, provider, true);
+			runBackground("cooldown reconcile usage", ctx, () =>
+				refreshUsage(ctx, provider, true),
+			);
 			const cached = usageByProvider.get(provider);
 			if (cached && now - cached.fetchedAt < usageCacheTtl(provider))
 				applyUsageToCooldown(provider, cached, now);
@@ -1979,6 +2437,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const byFamily: Record<ProviderFamily, string[]> = {
 			anthropic: [],
 			"openai-codex": [],
+			cursor: [],
 			qwen: [],
 			ollama: [],
 		};
@@ -1987,6 +2446,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (!family) continue;
 			if (family === "qwen" && !config.includeQwen) continue;
 			if (family === "ollama" && !config.includeOllama) continue;
+			if (family === "cursor" && !config.includeCursor) continue;
 			if (!isEntryUsable(entry)) continue;
 			if (isInvalidated(id)) continue;
 			byFamily[family].push(id);
@@ -2026,11 +2486,39 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return duplicates;
 	}
 
+	async function refreshCursorSlots(
+		auth: Record<string, AuthEntry>,
+		ctx?: any,
+	) {
+		if (!config.includeCursor) return;
+		const slotIds = [
+			...new Set([
+				...Object.keys(auth).filter(
+					(id) =>
+						isCursorProviderId(id) &&
+						id !== CURSOR_BASE &&
+						isEntryUsable(auth[id]),
+				),
+				...[...registeredSlots].filter(
+					(id) => isCursorProviderId(id) && id !== CURSOR_BASE,
+				),
+			]),
+		].sort((a, b) => slotIndex(a) - slotIndex(b));
+		await setupCursorSubscription(pi, {
+			readAuth: readAuthFile,
+			rejectDuplicateLogin: (slot, creds) =>
+				rejectDuplicateLogin(slot, creds),
+			slotIds,
+			notify: (message, level) => ctx?.ui?.notify?.(message, level),
+		});
+	}
+
 	/** Register authed alias slots plus one spare per family for the next interactive /login. */
 	function syncRegisteredSlots(auth: Record<string, AuthEntry>) {
 		const families: ProviderFamily[] = [
 			"anthropic",
 			"openai-codex",
+			"cursor",
 			"ollama",
 			"qwen",
 		];
@@ -2047,15 +2535,24 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// from /login. API-key families (ollama/qwen) have no interactive login, so a
 			// spare slot with no key would just produce a Pi error ("apiKey or oauth
 			// required when defining models") — skip the spare for those families.
-			if (family === "anthropic" || family === "openai-codex") {
+			if (
+				family === "anthropic" ||
+				family === "openai-codex" ||
+				family === "cursor"
+			) {
 				let spare = 2;
 				while (wanted.has(spare) && spare <= config.maxAccountsPerProvider)
 					spare++;
 				if (spare <= config.maxAccountsPerProvider) wanted.add(spare);
 			}
 			for (const index of wanted) {
-				if (index <= 1) continue; // base provider is native
 				const id = slotId(family, index, config.qwenProvider);
+				if (family === "cursor") {
+					if (index <= 1) continue;
+					if (!registeredSlots.has(id)) registeredSlots.add(id);
+					continue;
+				}
+				if (index <= 1) continue; // base provider is native
 				if (registeredSlots.has(id)) continue;
 				if (family === "anthropic") registerAnthropicSlot(pi, id);
 				else if (family === "openai-codex") registerCodexSlot(pi, id);
@@ -2066,6 +2563,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				registeredSlots.add(id);
 			}
 		}
+		if (config.includeCursor) void refreshCursorSlots(auth);
 	}
 
 	function reloadHostAuth(ctx: any) {
@@ -2171,7 +2669,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
-	function resolveTargets(ctx: any, target: string, currentModel: any) {
+	function resolveTargets(
+		ctx: any,
+		target: string,
+		currentModel: any,
+		preferredOnly = false,
+	) {
 		const parsed = parseTarget(target);
 		if (!parsed) return [];
 		if (parsed.modelId) {
@@ -2180,6 +2683,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 
 		const family = classifyProvider(parsed.provider, config.qwenProvider);
+		const currentFamily = currentModel?.provider
+			? classifyProvider(currentModel.provider, config.qwenProvider)
+			: undefined;
+		const sameFamily = !!family && !!currentFamily && family === currentFamily;
 		const preferred =
 		family === "anthropic"
 			? DEFAULT_ANTHROPIC_MODELS
@@ -2189,14 +2696,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					? DEFAULT_OLLAMA_MODELS
 					: family === "qwen"
 						? DEFAULT_QWEN_MODELS
-						: [];
+						: family === "cursor"
+							? DEFAULT_CURSOR_MODELS
+							: [];
 		const modelIds = [
-			...(currentModel?.id ? [currentModel.id] : []),
+			...(sameFamily && currentModel?.id ? [currentModel.id] : []),
 			...preferred,
-			...ctx.modelRegistry
-				.getAll()
-				.filter((model: any) => model.provider === parsed.provider)
-				.map((model: any) => model.id),
+			...(preferredOnly
+				? []
+				: ctx.modelRegistry
+						.getAll()
+						.filter((model: any) => model.provider === parsed.provider)
+						.map((model: any) => model.id)),
 		];
 		const result: any[] = [];
 		const seen = new Set<string>();
@@ -2220,8 +2731,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			availableNowOnly?: boolean;
 			includeCurrent?: boolean;
 			manualRoundRobin?: boolean;
+			excludeProviders?: Set<string>;
 		} = {},
 	) {
+		reconcileCooldownsFromUsage(ctx);
+		pruneCooldowns();
 		const fallbacks = activeFallbacks();
 		if (fallbacks.length === 0) return [];
 
@@ -2233,6 +2747,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		for (let i = 0; i < fallbacks.length; i++) {
 			for (const model of resolveTargets(ctx, fallbacks[i], currentModel)) {
+				if (options.excludeProviders?.has(model.provider)) continue;
 				if (
 					!options.includeCurrent &&
 					model.provider === currentModel?.provider &&
@@ -2248,7 +2763,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (seen.has(key)) continue;
 				seen.add(key);
 
-				const providerUntil = exhaustedUntilByProvider.get(model.provider) ?? 0;
+				const providerUntil = providerRecoveryAt(model.provider, now);
 				const modelUntil = exhaustedUntilByModel.get(key) ?? 0;
 				const remaining = Math.max(
 					0,
@@ -2328,6 +2843,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const fallback of candidates) {
 			if (failedProviders.has(fallback.provider)) continue;
 			const to = ref(fallback.provider, fallback.id);
+			if (to === from) {
+				markExhausted(fallback.provider, config.transientCooldownMs);
+				failedProviders.add(fallback.provider);
+				continue;
+			}
 			let ok = true;
 			if (
 				ctx.model?.provider !== fallback.provider ||
@@ -2373,6 +2893,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const record = { from, to, reason, at: Date.now() };
 			currentPromptSwitch =
 				options.armContinuation === false ? undefined : record;
+			logEvent("switch", { from, to, reason });
 			pi.appendEntry("provider-failover", record);
 			persist({
 				lastSwitches: [record, ...(persistedState.lastSwitches ?? [])].slice(
@@ -2381,7 +2902,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				),
 			});
 			ctx.ui.notify(
-				`Provider failover: ${from} → ${to} (${reason})`,
+				`Provider failover [v${VERSION}]: ${from} → ${to} (${reason})`,
 				"warning",
 			);
 			return true;
@@ -2418,9 +2939,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return false;
 		}
 
+		const excludeProviders = /auth (invalid|failure)/i.test(reason)
+			? new Set<string>([failedModel.provider])
+			: undefined;
 		const candidates = findFallbackModels(ctx, failedModel, {
 			availableNowOnly: !options.manual,
 			manualRoundRobin: options.manual,
+			excludeProviders,
 		});
 		if (candidates.length === 0) {
 			const cooldowns = [...exhaustedUntilByProvider.entries()]
@@ -2434,6 +2959,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			]
 				.filter(Boolean)
 				.join(". ");
+			logEvent("no_fallback", {
+				after: `${failedModel.provider}/${failedModel.id}`,
+				availability: availability || "none",
+			});
 			ctx.ui.notify(
 				`Provider failover: no immediately available fallback after ${failedModel.provider}/${failedModel.id}. ${availability || "All known accounts may be unauthenticated, invalidated, or duplicate slots."}`,
 				"warning",
@@ -2451,7 +2980,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			{ armContinuation: !options.manual },
 		);
 		if (!switched && !options.manual && config.autoContinue) {
-			setPendingContinuation(ctx, failedModel, reason);
+			reconcileCooldownsFromUsage(ctx);
+			pruneCooldowns();
+			if (isCurrentModelReady(ctx)) {
+				const target = ref(failedModel.provider, failedModel.id);
+				currentPromptSwitch = {
+					from: target,
+					to: target,
+					reason: `${reason} (same account recovered)`,
+					at: Date.now(),
+				};
+			} else {
+				setPendingContinuation(ctx, failedModel, reason);
+			}
 		}
 		return switched;
 	}
@@ -2466,7 +3007,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return false;
 		const now = Date.now();
 		return (
-			(exhaustedUntilByProvider.get(model.provider) ?? 0) <= now &&
+			providerRecoveryAt(model.provider, now) <= now &&
 			(exhaustedUntilByModel.get(ref(model.provider, model.id)) ?? 0) <= now
 		);
 	}
@@ -2487,30 +3028,467 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// ----- pending auto-resume ---------------------------------------------
 
-	function continuationPrompt(record: SwitchRecord) {
-		return config.continuationPrompt
-			.replaceAll("{from}", record.from)
-			.replaceAll("{to}", record.to)
-			.replaceAll("{reason}", record.reason);
+	function hasPendingResume(): boolean {
+		return (
+			!!(persistedState.pendingFrom && persistedState.pendingReason) ||
+			!!persistedState.pendingContinuationPrompt
+		);
 	}
 
-	function dispatchSelfContinuation(ctx: any, prompt: string): boolean {
-		if (userAbortedChain || ctx.signal?.aborted) return false;
-		lastSentContinuationPrompt = prompt;
-		expectingSelfContinuation = true;
+	// Reject a promise that does not settle within `ms`. Used to bound every network-bound
+	// hand-off (compaction summary) so a wedged provider call can never hang the session.
+	function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const timer = setTimeout(
+				() => reject(new Error(`${label} timed out after ${formatDelay(ms)}`)),
+				ms,
+			);
+			timer.unref?.();
+			p.then(
+				(v) => {
+					clearTimeout(timer);
+					resolve(v);
+				},
+				(e) => {
+					clearTimeout(timer);
+					reject(e);
+				},
+			);
+		});
+	}
+
+	// A context-size error (vs. a quota/auth/transient error). Detected against the intrinsic
+	// overflow vocabulary so a user override of ignoreErrorPatterns cannot accidentally make us
+	// treat "input is too long" as a rotate-able limit (rotating just hands the SAME oversized
+	// context to the next account, which overflows again).
+	function isContextOverflowError(text: string): boolean {
+		if (!text.trim()) return false;
+		return patternMatch(text, DEFAULT_IGNORE_PATTERNS);
+	}
+
+	// ----- forward-progress watchdog ---------------------------------------
+	// A resumed turn (one WE started via continueAgent after a switch) must keep showing
+	// activity. Any stream token / tool event / provider response calls noteResumeProgress and
+	// disarms the timer. Total silence past stuckWatchdogMs surfaces an actionable recovery
+	// instead of an eternal "Working…" spinner. This is a generic net: it catches stalls we
+	// never specifically predicted, not just the ones we know about.
+	// ----- circuit breaker (reliability floor) -----------------------------
+	function isBreakerOpen(): boolean {
+		return breakerOpenUntil > Date.now();
+	}
+
+	// Any genuine forward progress (a successful provider response / assistant turn) proves
+	// recovery is working, so reset the failure streak and close advisory mode.
+	function noteRecoveryProgress() {
+		if (recoveryFailures !== 0 || breakerOpenUntil !== 0) {
+			const wasOpen = breakerOpenUntil > Date.now();
+			recoveryFailures = 0;
+			breakerOpenUntil = 0;
+			if (wasOpen) logEvent("breaker_close", { reason: "forward progress" });
+		}
+	}
+
+	// A failed auto-recovery (a wedged/aborted resume, a resume that errored out). After
+	// BREAKER_FAILURE_THRESHOLD in a row, trip the breaker: pause auto-continue and tell the
+	// user we are now only advising manual switches — never hanging on a doomed auto-resume.
+	function noteRecoveryFailure(ctx: any) {
+		recoveryFailures++;
+		logEvent("recovery_failure", { count: recoveryFailures });
+		if (recoveryFailures >= BREAKER_FAILURE_THRESHOLD && !isBreakerOpen()) {
+			breakerOpenUntil = Date.now() + BREAKER_COOLDOWN_MS;
+			logEvent("breaker_open", {
+				failures: recoveryFailures,
+				cooldownMs: BREAKER_COOLDOWN_MS,
+			});
+			ctx?.ui?.notify?.(
+				`pi-multi-account [v${VERSION}]: automatic resume failed ${recoveryFailures}× in a row, so it is pausing auto-continue for ${formatDelay(BREAKER_COOLDOWN_MS)} (safe mode) to avoid making things worse. ` +
+					"It still flags rate limits and switches you to a fresh account — just send your next message, or use /multi-account next. (/multi-account reset re-enables auto-continue immediately.)",
+				"warning",
+			);
+		}
+	}
+
+	function clearProgressWatchdog() {
+		if (progressWatchdogTimer) {
+			clearTimeout(progressWatchdogTimer);
+			progressWatchdogTimer = undefined;
+		}
+	}
+
+	function armStuckWatchdog() {
+		clearProgressWatchdog();
+		if (!resumeInFlight || !config.enabled) return;
+		progressWatchdogTimer = setTimeout(
+			onResumeStuck,
+			Math.max(25, config.stuckWatchdogMs),
+		);
+		progressWatchdogTimer.unref?.();
+	}
+
+	function noteResumeProgress() {
+		if (!resumeInFlight) return;
+		lastResumeProgressAt = Date.now();
+		stuckReminders = 0;
+		armStuckWatchdog();
+	}
+
+	function beginResumeWatch(ctx: any) {
+		resumeInFlight = true;
+		watchdogCtx = ctx;
+		lastResumeProgressAt = Date.now();
+		stuckReminders = 0;
+		toolInFlight = 0;
+		armStuckWatchdog();
+	}
+
+	function endResumeWatch() {
+		resumeInFlight = false;
+		watchdogCtx = undefined;
+		stuckReminders = 0;
+		toolInFlight = 0;
+		clearProgressWatchdog();
+	}
+
+	function onResumeStuck() {
+		progressWatchdogTimer = undefined;
+		if (!resumeInFlight) return;
+		// A timer callback that throws crashes the whole Pi process — the exact "everything
+		// dies" failure we are trying to eliminate. Never let anything escape here.
 		try {
-			if (ctx.isIdle()) pi.sendUserMessage(prompt);
-			else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-			return true;
+			const ctx = watchdogCtx;
+			// A tool (build/test/long bash) running silently for minutes is NOT stuck. Never
+			// abort real work — just re-check later.
+			if (toolInFlight > 0) {
+				armStuckWatchdog();
+				return;
+			}
+			const silentMs = Date.now() - lastResumeProgressAt;
+			const where = ctx?.model
+				? `${ctx.model.provider}/${ctx.model.id}`
+				: "the active account";
+			logEvent("resume_stuck", {
+				model: where,
+				silentMs,
+				action: config.autoRecoverStuck !== false ? "auto_cancel" : "notify",
+			});
+			let recovery = "";
+			try {
+				const status = nextRecoveryStatus(ctx);
+				if (status) recovery = ` (next recovery ${status})`;
+			} catch {
+				/* status is best-effort */
+			}
+
+			// ACTIVE recovery (default): the wedge is almost always a provider request or a
+			// compaction that hung on an exhausted account. Just telling the user to press Esc
+			// is not enough — they should not have to babysit it. So we abort the wedged turn
+			// ourselves (which unblocks ctx.isIdle) and arm auto-resume; the pending-wake timer
+			// then continues the work automatically the moment any account recovers. The abort
+			// is flagged so agent_end treats it as recovery, not a user cancel.
+			// A wedge is a failed recovery — feed the circuit breaker so repeated wedges drop us
+			// to advisory mode instead of aborting/re-resuming forever.
+			noteRecoveryFailure(ctx);
+			if (config.autoRecoverStuck !== false && typeof ctx?.abort === "function") {
+				ctx?.ui?.notify?.(
+					`Provider failover [v${VERSION}]: the resumed turn on ${where} has been silent for ${formatDelay(silentMs)} — auto-cancelling it and will resume automatically when an account is free${recovery}. (/multi-account stop to cancel, /multi-account status to inspect.)`,
+					"warning",
+				);
+				watchdogAborting = true;
+				// Cool the wedged account briefly so the auto-resume does not immediately re-wedge
+				// on the same dead account before usage reconciliation catches up.
+				if (ctx.model?.provider)
+					markExhausted(ctx.model.provider, config.transientCooldownMs);
+				try {
+					ctx.abort();
+				} catch {
+					/* if abort is unavailable, fall through to the reminder path below */
+					watchdogAborting = false;
+				}
+				if (watchdogAborting) return; // agent_end(aborted) will arm the auto-resume
+			}
+
+			// Fallback (auto-recover disabled, or no abort available): notify + periodic reminder.
+			ctx?.ui?.notify?.(
+				`Provider failover: the resumed turn on ${where} has shown no activity for ${formatDelay(silentMs)} and looks stuck${recovery}. ` +
+					"Press Esc to cancel it, then /multi-account next to rotate, or /compact to shrink the context.",
+				"warning",
+			);
+			stuckReminders++;
+			if (stuckReminders < 5 && resumeInFlight) {
+				progressWatchdogTimer = setTimeout(
+					onResumeStuck,
+					Math.max(25, STUCK_REMINDER_MS),
+				);
+				progressWatchdogTimer.unref?.();
+			}
+		} catch {
+			/* never crash the host from a watchdog tick */
+		}
+	}
+
+	// ----- account-aware compaction ----------------------------------------
+	// Pick the model that should generate the compaction summary. Prefer the current account
+	// when it is genuinely healthy (no switch, cheapest); otherwise the first fallback that is
+	// free RIGHT NOW. Returns undefined when nothing healthier than the (unhealthy) current
+	// account exists — the caller then leaves compaction to Pi's default.
+	function pickCompactionModel(ctx: any): any | undefined {
+		if (isCurrentModelReady(ctx)) return ctx.model;
+		const candidates = findFallbackModels(ctx, ctx.model, {
+			availableNowOnly: true,
+			includeCurrent: false,
+		});
+		return candidates[0];
+	}
+
+	// session_before_compact handler. STRICTLY fail-safe: any uncertainty returns undefined so
+	// Pi runs its normal default compaction. We only take over when the active account is
+	// unavailable AND a healthy account exists AND the summary succeeds — turning the classic
+	// "compaction hangs because it ran on the just-rate-limited account" into a clean summary
+	// generated on a live account.
+	async function runHealthyCompaction(
+		event: any,
+		ctx: any,
+	): Promise<{ compaction: any } | undefined> {
+		try {
+			if (!config.enabled || !config.routeCompactionToHealthyAccount)
+				return undefined;
+			const preparation = event?.preparation;
+			if (!preparation) return undefined;
+			// Current account is healthy → Pi's default (on the current account) is fine.
+			if (isCurrentModelReady(ctx)) {
+				compactionRoutedNote = undefined;
+				return undefined;
+			}
+			const model = pickCompactionModel(ctx);
+			if (
+				!model ||
+				(model.provider === ctx.model?.provider &&
+					model.id === ctx.model?.id)
+			) {
+				// No account is free right now. Don't make it worse — let Pi try its default; the
+				// pending-resume machinery pauses the session until an account recovers.
+				compactionRoutedNote = "no live account for compaction; used default";
+				return undefined;
+			}
+			const auth = await ctx.modelRegistry?.getApiKeyAndHeaders?.(model);
+			if (!auth?.ok || (!auth.apiKey && !auth.headers)) {
+				compactionRoutedNote = `compaction auth unavailable for ${model.provider}`;
+				return undefined;
+			}
+			const mod = (await import("@earendil-works/pi-coding-agent").catch(
+				() => undefined,
+			)) as { compact?: (...args: any[]) => Promise<any> } | undefined;
+			const compactFn = mod?.compact;
+			if (typeof compactFn !== "function") return undefined; // older host: cannot route
+			let thinkingLevel: any;
+			try {
+				thinkingLevel = (pi as any).getThinkingLevel?.();
+			} catch {
+				/* optional */
+			}
+			ctx.ui?.notify?.(
+				`Provider failover: ${ctx.model?.provider ?? "active"} account is unavailable for compaction; summarizing on ${model.provider} instead.`,
+				"info",
+			);
+			const result = await withTimeout(
+				compactFn(
+					preparation,
+					model,
+					auth.apiKey,
+					auth.headers,
+					event?.customInstructions,
+					event?.signal,
+					thinkingLevel,
+				),
+				COMPACTION_WATCHDOG_MS,
+				`compaction on ${model.provider}`,
+			);
+			if (
+				!result ||
+				typeof result.summary !== "string" ||
+				!result.summary.trim()
+			) {
+				compactionRoutedNote = "healthy compaction empty; used default";
+				return undefined;
+			}
+			compactionRoutedNote = `compacted on ${model.provider}`;
+			logEvent("compaction_routed", {
+				to: model.provider,
+				reason: event?.reason,
+				from: ctx.model?.provider,
+			});
+			return { compaction: result };
 		} catch (error) {
-			expectingSelfContinuation = false;
-			lastSentContinuationPrompt = "";
+			compactionRoutedNote = `healthy compaction failed: ${String(error).slice(0, 60)}`;
+			logEvent("compaction_failed", { error: String(error) });
+			ctx?.ui?.notify?.(
+				`Provider failover: healthy-account compaction did not finish (${String(error).slice(0, 100)}); using Pi's default compaction.`,
+				"warning",
+			);
+			return undefined;
+		}
+	}
+
+	async function resumeWithExistingContext(ctx: any): Promise<boolean> {
+		if (userAbortedChain || ctx.signal?.aborted) return false;
+		const continueAgent = (
+			pi as {
+				continueAgent?: (options?: {
+					stripErrorAssistant?: boolean;
+				}) => Promise<void>;
+			}
+		).continueAgent;
+		if (typeof continueAgent !== "function") {
 			ctx.ui.notify(
-				`Provider failover: could not queue continuation (${String(error)})`,
+				"Provider failover: seamless resume requires pi.continueAgent(). Update @earendil-works/pi-coding-agent.",
 				"error",
 			);
 			return false;
 		}
+		// Bounded wait for the prior turn to go idle — NEVER an unbounded busy-loop. If it does
+		// not free up within resumeIdleTimeoutMs we return false; the caller (agent_end or the
+		// pending-wake timer) re-arms and tries again, so the session can't wedge here forever.
+		if (!ctx.isIdle()) {
+			const waitUntil = Date.now() + config.resumeIdleTimeoutMs;
+			while (!ctx.isIdle() && !userAbortedChain && !ctx.signal?.aborted) {
+				if (Date.now() >= waitUntil) {
+					ctx.ui.notify(
+						`Provider failover [v${VERSION}]: the previous turn did not go idle within ${formatDelay(config.resumeIdleTimeoutMs)}; auto-retrying the resume in the background.`,
+						"warning",
+					);
+					// Actually schedule the retry instead of just promising it: arm pending
+					// auto-resume, which polls until the turn frees up and then continues by
+					// itself — the user does not have to re-send the prompt.
+					const failed =
+						ctx.model?.provider && ctx.model?.id ? ctx.model : undefined;
+					if (failed && config.enabled && config.autoContinue)
+						setPendingContinuation(
+							ctx,
+							failed,
+							"previous turn was still busy; auto-retry",
+						);
+					return false;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+		}
+		if (userAbortedChain || ctx.signal?.aborted) return false;
+		beginResumeWatch(ctx);
+		logEvent("resume_start", {
+			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown",
+			hop: autoContinuesThisPrompt + 1,
+		});
+		try {
+			await continueAgent({ stripErrorAssistant: true });
+			autoContinuesThisPrompt++;
+			logEvent("resume_ok", {
+				model: ctx.model
+					? `${ctx.model.provider}/${ctx.model.id}`
+					: "unknown",
+			});
+			return true;
+		} catch (error) {
+			const text = String(error);
+			// A deliberate abort (our watchdog recovery, or the user pressing Esc) is not an error
+			// to report — agent_end handles what happens next. Stay silent.
+			if (
+				watchdogAborting ||
+				userAbortedChain ||
+				ctx.signal?.aborted ||
+				/abort/i.test(text)
+			) {
+				return false;
+			}
+			// "Cannot continue from message role: assistant" means the transcript tail is a
+			// COMPLETED assistant message (a finished reply OR a turn we aborted for recovery),
+			// so continueAgent cannot pick it up.
+			if (/cannot continue from message role/i.test(text)) {
+				// If a switch/recovery is genuinely in progress, the work is NOT done — inject the
+				// continuation prompt as a user message instead. That always starts a turn, so the
+				// session keeps moving by itself (this is how auto-recovery after a watchdog abort
+				// continues without the user re-typing anything). Bounded by maxAutoContinuesPerPrompt.
+				if (
+					currentPromptSwitch &&
+					config.autoContinue &&
+					!userAbortedChain &&
+					!ctx.signal?.aborted &&
+					autoContinuesThisPrompt < config.maxAutoContinuesPerPrompt &&
+					typeof pi.sendUserMessage === "function"
+				) {
+					const to =
+						currentPromptSwitch.to ??
+						(ctx.model ? ref(ctx.model.provider, ctx.model.id) : "the active account");
+					const prompt = config.continuationPrompt
+						.replaceAll("{from}", String(currentPromptSwitch.from ?? "the previous account"))
+						.replaceAll("{to}", String(to))
+						.replaceAll("{reason}", currentPromptSwitch.reason ?? "provider failover");
+					try {
+						expectingInjectedContinuation = true;
+						pi.sendUserMessage(prompt);
+						autoContinuesThisPrompt++;
+						return true;
+					} catch {
+						expectingInjectedContinuation = false;
+						/* fall through to give up cleanly */
+					}
+				}
+				// Nothing to continue (spurious) or injection unavailable — drop stale state quietly.
+				currentPromptSwitch = undefined;
+				clearPendingContinuation();
+				return false;
+			}
+			noteRecoveryFailure(ctx);
+			ctx.ui.notify(
+				`Provider failover: could not resume with existing context (${text})`,
+				"error",
+			);
+			return false;
+		} finally {
+			endResumeWatch();
+		}
+	}
+
+	async function maybeDispatchContinuation(ctx: any): Promise<boolean> {
+		if (
+			!config.autoContinue ||
+			userAbortedChain ||
+			ctx.signal?.aborted ||
+			!currentPromptSwitch ||
+			autoContinuesThisPrompt >= config.maxAutoContinuesPerPrompt
+		)
+			return false;
+		// Circuit breaker open → advisory mode. The account switch already happened (useful);
+		// we just don't attempt the auto-resume that has been failing. The user's next message
+		// runs on the fresh account. This is the floor: never worse than switching by hand.
+		if (isBreakerOpen()) {
+			ctx.ui?.notify?.(
+				`Provider failover: switched to ${ctx.model?.provider ?? "a fresh account"} but auto-continue is paused (safe mode after repeated failures). Send your message to continue here, or /multi-account reset to re-enable auto-continue.`,
+				"warning",
+			);
+			return false;
+		}
+		// Never resume onto an account that is ITSELF cooling down. We may have just switched to a
+		// sibling whose 5h limit is also spent (its cooldown only became visible after a usage
+		// refresh). Resuming there burns a request and lands us right back here, or wedges
+		// compaction on a dead account (the "Working…" hang at high context). Pause instead and
+		// let the wake timer resume on the first account that genuinely recovers.
+		reconcileCooldownsFromUsage(ctx);
+		pruneCooldowns();
+		if (!isCurrentModelReady(ctx)) {
+			const failed =
+				ctx.model?.provider && ctx.model?.id ? ctx.model : undefined;
+			if (failed && config.autoContinue) {
+				setPendingContinuation(
+					ctx,
+					failed,
+					currentPromptSwitch?.reason ?? "account is cooling down",
+				);
+			}
+			return false;
+		}
+		const resumed = await resumeWithExistingContext(ctx);
+		if (resumed) continuationDispatchedForAgentTurn = true;
+		return resumed;
 	}
 
 	function clearPendingContinuation() {
@@ -2528,21 +3506,29 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		persist();
 	}
 
-	function nextPendingWakeDelayMs(): number | undefined {
-		const now = Date.now();
-		const providers = [
+	function pendingWakeProviders(): string[] {
+		if (isTransientPendingReason(persistedState.pendingReason ?? "")) {
+			const parsed = persistedState.pendingFrom
+				? parseTarget(persistedState.pendingFrom)
+				: undefined;
+			return parsed?.provider && !isInvalidated(parsed.provider)
+				? [parsed.provider]
+				: [];
+		}
+		return [
 			...new Set(
 				activeFallbacks()
 					.map((target) => parseTarget(target)?.provider)
 					.filter((p): p is string => !!p),
 			),
 		].filter((provider) => !isInvalidated(provider));
+	}
+
+	function nextPendingWakeDelayMs(): number | undefined {
+		const now = Date.now();
+		const providers = pendingWakeProviders();
 		if (providers.length === 0) return undefined;
-		const nextAt = Math.min(
-			...providers.map((provider) =>
-				Math.max(now, exhaustedUntilByProvider.get(provider) ?? now),
-			),
-		);
+		const nextAt = Math.min(...providers.map((p) => providerRecoveryAt(p, now)));
 		return Math.max(MIN_PENDING_WAKE_MS, nextAt - now);
 	}
 
@@ -2550,7 +3536,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (pendingWakeTimer) clearTimeout(pendingWakeTimer);
 		pendingWakeTimer = undefined;
 		if (
-			!persistedState.pendingContinuationPrompt ||
+			!hasPendingResume() ||
 			userAbortedChain ||
 			!config.enabled ||
 			!config.autoContinue
@@ -2564,15 +3550,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		pendingWakeTimer = setTimeout(
 			() => {
 				pendingWakeTimer = undefined;
-				void attemptPendingResume(ctx);
+				runBackground("pending auto-resume", ctx, () =>
+					attemptPendingResume(ctx),
+				);
 			},
 			Math.min(delay, config.pendingPollMs),
 		);
+		pendingWakeTimer.unref?.();
 	}
 
 	async function attemptPendingResume(ctx: any) {
 		if (
-			!persistedState.pendingContinuationPrompt ||
+			!hasPendingResume() ||
 			userAbortedChain ||
 			!config.enabled ||
 			!config.autoContinue
@@ -2607,11 +3596,66 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			clearPendingContinuation();
 			return;
 		}
+
+		// Transient server errors (overload, 503, websocket) are not account-specific.
+		// Retry the SAME account after its brief cooldown — never rotate to a sibling.
+		if (isTransientPendingReason(persistedState.pendingReason ?? "")) {
+			const now = Date.now();
+			if (providerRecoveryAt(sourceModel.provider, now) <= now) {
+				clearPendingContinuation();
+				const same = ref(sourceModel.provider, sourceModel.id);
+				if (
+					ctx.model?.provider !== sourceModel.provider ||
+					ctx.model?.id !== sourceModel.id
+				) {
+					automaticModelTarget = same;
+					try {
+						await pi.setModel(
+							ctx.modelRegistry.find(
+								sourceModel.provider,
+								sourceModel.id,
+							) ?? {
+								provider: sourceModel.provider,
+								id: sourceModel.id,
+							},
+						);
+					} finally {
+						if (automaticModelTarget === same)
+							automaticModelTarget = undefined;
+					}
+				}
+				await resumeWithExistingContext(ctx);
+				return;
+			}
+			schedulePendingWake(ctx);
+			return;
+		}
+
+		const pendingReason = persistedState.pendingReason ?? "";
+		const now = Date.now();
+		const sourceRef = ref(sourceModel.provider, sourceModel.id);
+		const sourceRecovered =
+			!isAuthPendingReason(pendingReason) &&
+			providerRecoveryAt(sourceModel.provider, now) <= now &&
+			(exhaustedUntilByModel.get(sourceRef) ?? 0) <= now &&
+			providerHasUsableAuth(ctx, sourceModel.provider) &&
+			!isInvalidated(sourceModel.provider);
 		const candidates = findFallbackModels(ctx, sourceModel, {
 			availableNowOnly: true,
-			includeCurrent: true,
+			includeCurrent: false,
+			excludeProviders: isAuthPendingReason(pendingReason)
+				? new Set<string>([sourceModel.provider])
+				: undefined,
 		});
-		if (candidates.length === 0) {
+		const otherCandidates = candidates.filter(
+			(m: any) => ref(m.provider, m.id) !== sourceRef,
+		);
+		if (otherCandidates.length === 0) {
+			if (sourceRecovered) {
+				clearPendingContinuation();
+				await resumeWithExistingContext(ctx);
+				return;
+			}
 			schedulePendingWake(ctx);
 			return;
 		}
@@ -2620,32 +3664,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const switched = await activateFallback(
 			ctx,
 			sourceModel,
-			candidates,
+			otherCandidates,
 			reason,
 		);
 		if (!switched || !currentPromptSwitch) {
 			schedulePendingWake(ctx);
 			return;
 		}
-		const prompt = continuationPrompt(currentPromptSwitch);
 		clearPendingContinuation();
-		if (dispatchSelfContinuation(ctx, prompt)) autoContinuesThisPrompt++;
+		await maybeDispatchContinuation(ctx);
 	}
 
 	function setPendingContinuation(ctx: any, failedModel: any, reason: string) {
 		const from = ref(failedModel.provider, failedModel.id);
-		const placeholder: SwitchRecord = {
-			from,
-			to: "next-available/account" as ModelRef,
-			reason,
-			at: Date.now(),
-		};
-		const alreadyPending = !!persistedState.pendingContinuationPrompt;
+		const alreadyPending = hasPendingResume();
 		persistedState = {
 			...persistedState,
 			pendingReason: reason,
 			pendingFrom: from,
-			pendingContinuationPrompt: continuationPrompt(placeholder),
+			pendingContinuationPrompt: undefined,
 			pendingSince: persistedState.pendingSince ?? Date.now(),
 		};
 		persist();
@@ -2662,8 +3699,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		schedulePendingWake(ctx);
 		if (!alreadyPending) {
+			const transient = isTransientPendingReason(reason);
 			ctx.ui.notify(
-				`Provider failover: all accounts are cooling down. This session will retry automatically in ~${formatDelay(delay)} (and re-checks every ${formatDelay(config.pendingPollMs)}). Esc during a run, a new user message, /multi-account stop, or leaving the session cancels it.`,
+				transient
+					? `Provider failover: temporary server error on ${failedModel.provider}. Retrying the same account in ~${formatDelay(delay)} (re-checks every ${formatDelay(config.pendingPollMs)}). Esc, a new message, or /multi-account stop cancels it.`
+					: `Provider failover: all accounts are cooling down. This session will retry automatically in ~${formatDelay(delay)} (and re-checks every ${formatDelay(config.pendingPollMs)}). Esc during a run, a new user message, /multi-account stop, or leaving the session cancels it.`,
 				"warning",
 			);
 		}
@@ -2686,13 +3726,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (candidates.length === 0) return undefined;
 		const now = Date.now();
 		const nextAt = Math.min(
-			...candidates.map((model: any) =>
-				Math.max(
-					now,
-					exhaustedUntilByProvider.get(model.provider) ?? now,
-					exhaustedUntilByModel.get(ref(model.provider, model.id)) ?? now,
-				),
-			),
+			...candidates.map((model: any) => {
+				const modelUntil =
+					exhaustedUntilByModel.get(ref(model.provider, model.id)) ?? now;
+				return Math.max(providerRecoveryAt(model.provider, now), modelUntil);
+			}),
 		);
 		return Math.max(MIN_PENDING_WAKE_MS, nextAt - now);
 	}
@@ -2718,8 +3756,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const delay = Math.min(availabilityDelay, AUTH_CHANGE_POLL_MS);
 		queuedInputWakeTimer = setTimeout(() => {
 			queuedInputWakeTimer = undefined;
-			void attemptQueuedInputResume(ctx);
+			runBackground("queued input resume", ctx, () =>
+				attemptQueuedInputResume(ctx),
+			);
 		}, delay);
+		queuedInputWakeTimer.unref?.();
 	}
 
 	async function attemptQueuedInputResume(ctx: any) {
@@ -2824,16 +3865,94 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// ----- command ----------------------------------------------------------
 
+	function clearProviderRuntimeState(provider: string) {
+		invalidatedByProvider.delete(provider);
+		exhaustedUntilByProvider.delete(provider);
+		authFailures.delete(provider);
+		usageByProvider.delete(provider);
+		usageErrors.delete(provider);
+		credentialHashes.delete(provider);
+		credentialIdentities.delete(provider);
+		registeredSlots.delete(provider);
+		for (const key of [...exhaustedUntilByModel.keys()]) {
+			if (key.startsWith(`${provider}/`)) exhaustedUntilByModel.delete(key);
+		}
+	}
+
+	async function removeAuthSlot(ctx: any, id: string): Promise<boolean> {
+		const auth = readAuthFile();
+		if (!auth[id]) return false;
+		const kept = { ...auth };
+		delete kept[id];
+		try {
+			writeFileSync(AUTH_PATH, `${JSON.stringify(kept, null, "\t")}\n`, {
+				encoding: "utf8",
+				mode: 0o600,
+			});
+		} catch {
+			ctx.ui.notify(
+				"pi-multi-account: could not update auth.json (file may be locked). Try again.",
+				"error",
+			);
+			return false;
+		}
+		clearProviderRuntimeState(id);
+		persist();
+		const wasCurrent = ctx.model?.provider === id;
+		reloadHostAuth(ctx);
+		refreshDiscovery(true, ctx);
+		if (wasCurrent) {
+			await ensureReadyModel(ctx, `removed current account ${id}`);
+		}
+		return true;
+	}
+
 	async function handleCommand(args: string, ctx: any) {
 		const [commandRaw, arg1] = args.trim().split(/\s+/);
 		const command = (commandRaw || "status").toLowerCase();
 
+		if (command === "log" || command === "logs" || command === "debug") {
+			// Show the diagnostic black box so a misbehaviour can be reported precisely.
+			if (arg1 === "off") {
+				config = { ...config, debugLog: false };
+				debugLogEnabled = false;
+				ctx.ui.notify(
+					"pi-multi-account: debug logging disabled for this session. Set \"debugLog\": true in the config to re-enable permanently.",
+					"info",
+				);
+				return;
+			}
+			if (arg1 === "on") {
+				config = { ...config, debugLog: true };
+				debugLogEnabled = true;
+				logEvent("debug_enabled", { version: VERSION });
+				ctx.ui.notify(
+					`pi-multi-account: debug logging enabled. File: ${DEBUG_LOG_PATH}`,
+					"info",
+				);
+				return;
+			}
+			const n = Math.min(
+				200,
+				Math.max(1, Number.parseInt(arg1 ?? "", 10) || 40),
+			);
+			const tail = readDebugLogTail(n);
+			ctx.ui.notify(
+				tail
+					? `pi-multi-account debug log (last ${n} events) — ${DEBUG_LOG_PATH}\n${tail}`
+					: `pi-multi-account: no debug log yet at ${DEBUG_LOG_PATH} (it fills as failover events happen; enable with /multi-account log on if needed).`,
+				"info",
+			);
+			return;
+		}
+
 		if (command === "reload") {
 			config = loadConfig();
+			debugLogEnabled = config.debugLog;
 			configuredFallbacks = config.fallbacks.slice();
 			refreshDiscovery(true, ctx);
 			startUsageStatusTimer(ctx);
-			void refreshUsage(ctx);
+			runBackground("reload usage refresh", ctx, () => refreshUsage(ctx));
 			ctx.ui.notify(
 				"pi-multi-account: config reloaded and accounts re-discovered",
 				"info",
@@ -2848,52 +3967,83 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
-	if (command === "add") {
-		const familyRaw = (arg1 || "").toLowerCase();
-		const family: ProviderFamily | undefined =
-			familyRaw === "codex" || familyRaw === "openai"
-				? "openai-codex"
-				: familyRaw === "anthropic" || familyRaw === "claude"
-					? "anthropic"
-					: familyRaw === "ollama"
-						? "ollama"
-						: familyRaw === "qwen" || familyRaw === "alibaba"
-							? "qwen"
-							: undefined;
-		if (!family) {
-			ctx.ui.notify(
-				"pi-multi-account: usage: /multi-account add <anthropic|codex|ollama|qwen>",
-				"warning",
-			);
+		if (command === "add") {
+			const family = parseFamilyArg(arg1);
+			if (!family) {
+				ctx.ui.notify(
+					"pi-multi-account: usage: /multi-account add <anthropic|codex|cursor|ollama|qwen>",
+					"warning",
+				);
+				return;
+			}
+			const auth = readAuthFile();
+			let n = 2;
+			while (
+				auth[slotId(family, n, config.qwenProvider)] &&
+				n <= config.maxAccountsPerProvider
+			)
+				n++;
+			if (n > config.maxAccountsPerProvider) {
+				ctx.ui.notify(
+					`pi-multi-account: no free ${family} slot (max ${config.maxAccountsPerProvider}). Remove an unused one from auth.json first.`,
+					"warning",
+				);
+				return;
+			}
+			const id = slotId(family, n, config.qwenProvider);
+			syncRegisteredSlots(auth);
+			if (
+				family === "anthropic" ||
+				family === "openai-codex" ||
+				family === "cursor"
+			) {
+				const loginHint =
+					family === "cursor"
+						? `run /login, authenticate your Cursor subscription in the browser, select ${id}`
+						: `run /login, choose "Use a subscription", select ${id}`;
+				ctx.ui.notify(
+					`pi-multi-account: ${loginHint}, then run /multi-account rediscover`,
+					"info",
+				);
+			} else {
+				ctx.ui.notify(
+					`pi-multi-account: add an entry "${id}" to ~/.pi/agent/auth.json with {"type":"api_key","key":"<your key>"} and run /multi-account rediscover`,
+					"info",
+				);
+			}
 			return;
 		}
-		const auth = readAuthFile();
-		let n = 2;
-		while (auth[slotId(family, n, config.qwenProvider)] && n <= config.maxAccountsPerProvider)
-			n++;
-		if (n > config.maxAccountsPerProvider) {
-			ctx.ui.notify(
-				`pi-multi-account: no free ${family} slot (max ${config.maxAccountsPerProvider}). Remove an unused one from auth.json first.`,
-				"warning",
-			);
+		if (command === "remove" || command === "rm" || command === "delete") {
+			const targetRaw = arg1?.trim();
+			if (!targetRaw) {
+				ctx.ui.notify(
+					"pi-multi-account: usage: /multi-account remove <anthropic|codex|cursor|ollama|qwen|provider-id>",
+					"warning",
+				);
+				return;
+			}
+			const auth = readAuthFile();
+			const id = resolveRemoveTarget(targetRaw, auth, config.qwenProvider);
+			if (!id) {
+				const family = parseFamilyArg(targetRaw);
+				ctx.ui.notify(
+					family
+						? `pi-multi-account: no ${family} account to remove.`
+						: `pi-multi-account: unknown or missing account "${targetRaw}". Rotation: ${rotation.join(", ") || "none"}`,
+					"warning",
+				);
+				return;
+			}
+			const removed = await removeAuthSlot(ctx, id);
+			if (removed) {
+				ctx.ui.notify(
+					`pi-multi-account: removed ${id}. Rotation: ${rotation.join(" → ") || "none"}`,
+					"info",
+				);
+			}
 			return;
 		}
-		const id = slotId(family, n, config.qwenProvider);
-		syncRegisteredSlots(auth);
-		if (family === "anthropic" || family === "openai-codex") {
-			ctx.ui.notify(
-				`pi-multi-account: run /login, choose "Use a subscription", select ${id}, then run /multi-account rediscover`,
-				"info",
-			);
-		} else {
-			ctx.ui.notify(
-				`pi-multi-account: add an entry "${id}" to ~/.pi/agent/auth.json with {"type":"api_key","key":"<your key>"} and run /multi-account rediscover`,
-				"info",
-			);
-		}
-		return;
-	}
-	if (command === "revive") {
+		if (command === "revive") {
 		const target = arg1?.trim();
 		if (!target) {
 			ctx.ui.notify(
@@ -2977,8 +4127,6 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		currentPromptSwitch = undefined;
 		autoContinuesThisPrompt = 0;
 		userAbortedChain = false;
-		expectingSelfContinuation = false;
-		lastSentContinuationPrompt = "";
 		clearPendingContinuation();
 		clearQueuedInputs();
 		persistedState = {
@@ -3005,6 +4153,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			currentPromptSwitch = undefined;
 			autoContinuesThisPrompt = 0;
 			userAbortedChain = false;
+			recoveryFailures = 0;
+			breakerOpenUntil = 0;
+			watchdogAborting = false;
+			expectingInjectedContinuation = false;
 			authFailures.clear();
 			responseCooldownHints.clear();
 			handledAssistantErrors.clear();
@@ -3055,6 +4207,76 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
+		if (command === "switch" || command === "use") {
+			const target = arg1?.trim();
+			if (!target) {
+				ctx.ui.notify(
+					`pi-multi-account: usage: /multi-account switch <provider>. Available: ${rotation.join(", ") || "none"}`,
+					"warning",
+				);
+				return;
+			}
+			const parsed = parseTarget(target);
+			if (!parsed) {
+				ctx.ui.notify(
+					`pi-multi-account: unknown provider "${target}". Rotation: ${rotation.join(", ") || "none"}`,
+					"warning",
+				);
+				return;
+			}
+			if (!ctx.model) {
+				ctx.ui.notify(
+					"pi-multi-account: no active model to switch from",
+					"warning",
+				);
+				return;
+			}
+			refreshDiscovery(false, ctx);
+			// Manual override: clear the target's cooldown so a cooling-down account can
+			// be selected directly. The user is explicitly overriding the cooldown here.
+			if (exhaustedUntilByProvider.has(parsed.provider)) {
+				exhaustedUntilByProvider.delete(parsed.provider);
+			}
+			for (const key of [...exhaustedUntilByModel.keys()]) {
+				if (key.startsWith(`${parsed.provider}/`)) {
+					exhaustedUntilByModel.delete(key);
+				}
+			}
+			persist();
+			const candidates = resolveTargets(ctx, target, ctx.model, true).filter(
+				(model: any) =>
+					!isInvalidated(model.provider) &&
+					providerHasUsableAuth(ctx, model.provider),
+			);
+			if (candidates.length === 0) {
+				ctx.ui.notify(
+					`pi-multi-account: no usable model for "${target}". Make sure it is logged in. Rotation: ${rotation.join(", ") || "none"}`,
+					"warning",
+				);
+				return;
+			}
+			currentPromptSwitch = undefined;
+			const switched = await activateFallback(
+				ctx,
+				ctx.model,
+				candidates,
+				`manual /multi-account switch ${target}`,
+				{ armContinuation: false },
+			);
+			currentPromptSwitch = undefined;
+			if (switched) {
+				ctx.ui.notify(
+					`pi-multi-account: switched to ${ctx.model.provider}/${ctx.model.id}`,
+					"info",
+				);
+			} else {
+				ctx.ui.notify(
+					`pi-multi-account: could not switch to "${target}"`,
+					"warning",
+				);
+			}
+			return;
+		}
 		if (command === "next") {
 			if (ctx.model) {
 				currentPromptSwitch = undefined;
@@ -3072,8 +4294,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (command === "stop") {
 			userAbortedChain = true;
 			currentPromptSwitch = undefined;
+			watchdogAborting = false;
+			expectingInjectedContinuation = false;
 			clearPendingContinuation();
 			clearQueuedInputs();
+			endResumeWatch();
 			ctx.abort();
 			ctx.ui.notify(
 				"pi-multi-account: automatic failover/resume stopped for the current task",
@@ -3113,20 +4338,35 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Duplicate slots skipped: ${duplicateSlots.length ? duplicateSlots.map(({ duplicate, primary }) => `${duplicate} = ${primary}`).join(", ") : "none"}`,
 				`Registered login slots: ${[...registeredSlots].join(", ") || "(base accounts only)"}`,
 				`Cooldowns: ${cooldowns.length ? cooldowns.join(", ") : "none"}`,
+				`Next recovery: ${nextRecoveryStatus(ctx)}`,
 				`Invalidated (need re-login): ${invalids.length ? invalids.join(", ") : "none"}`,
-				`Pending auto-resume: ${persistedState.pendingContinuationPrompt ? `yes (reason: ${persistedState.pendingReason ?? "unknown"})` : "none"}`,
+				`Pending auto-resume: ${hasPendingResume() ? `yes (reason: ${persistedState.pendingReason ?? "unknown"})` : "none"}`,
 				`Queued user messages: ${queuedUserInputs.length}`,
+				`Resume watchdog: ${resumeInFlight ? `watching${toolInFlight ? " · tool running" : ""}` : "idle"} · auto-recover ${config.autoRecoverStuck ? "ON" : "OFF"}`,
+				`Compaction routing: ${config.routeCompactionToHealthyAccount ? "to healthy account" : "off"}${compactionRoutedNote ? ` (last: ${compactionRoutedNote})` : ""}${lastContextOverflowAt ? ` · last overflow ${formatUntil(lastContextOverflowAt)}` : ""}`,
+				`Auto-continue breaker: ${isBreakerOpen() ? `OPEN — advisory mode until ${formatUntil(breakerOpenUntil)} (manual switching; /multi-account reset to re-enable)` : `closed${recoveryFailures ? ` (${recoveryFailures}/${BREAKER_FAILURE_THRESHOLD} recent failures)` : ""}`}`,
+				`Debug log: ${config.debugLog ? `on → ${DEBUG_LOG_PATH} (/multi-account log to view)` : "off"}`,
 				`Config: ${CONFIG_PATH}`,
-				`Commands: status | limits [refresh] | rediscover | add [anthropic|codex|ollama|qwen] | revive <provider|all> | clear | next | stop | reset | reload | enable | disable`,
+				`Commands: status | limits [refresh] | log [N|on|off] | rediscover | add [anthropic|codex|cursor|ollama|qwen] | remove [anthropic|codex|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | next | switch <provider> | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
 	}
 
+	// A throw inside a command handler should surface as a friendly message, never crash Pi
+	// or leave the user with a raw stack trace.
+	const safeHandleCommand = async (args: string, ctx: any) => {
+		try {
+			return await handleCommand(args, ctx);
+		} catch (error) {
+			reportExtensionError(`/multi-account ${args.trim().split(/\s+/)[0] || "status"}`, error, ctx);
+			return undefined;
+		}
+	};
 	for (const name of ["multi-account", "provider-failover", "failover"]) {
 		pi.registerCommand(name, {
 			description: "Manage automatic multi-account failover & rotation",
-			handler: handleCommand,
+			handler: safeHandleCommand,
 		});
 	}
 
@@ -3162,7 +4402,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				? entry.key
 				: undefined;
 		if (!key) return; // nothing to register — no real credential
-		const baseUrl = family === "ollama" ? OLLAMA_BASE_URL : QWEN_BASE_URL;
+		const baseUrl =
+		family === "ollama"
+			? OLLAMA_CLOUD_BASE_URL
+			: QWEN_BASE_URL;
 		const preferred =
 			family === "ollama" ? DEFAULT_OLLAMA_MODELS : DEFAULT_QWEN_MODELS;
 		const models = preferred.map((m) =>
@@ -3181,30 +4424,46 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	ensureApiKeyBaseProvider("ollama", OLLAMA_BASE);
 	ensureApiKeyBaseProvider("qwen", config.qwenProvider);
 
-	pi.on("before_provider_request", (event: any) =>
-		shapeAnthropicOAuthPayload(event.payload),
-	);
+	safeOn("before_provider_request", (event: any, ctx?: any) => {
+		const shaped = shapeAnthropicOAuthPayload(event.payload);
+		const payload = (shaped ?? event.payload) as
+			| Record<string, unknown>
+			| undefined;
+		const provider = ctx?.model?.provider;
+		if (payload && typeof provider === "string" && isCursorProviderId(provider)) {
+			payload.pi_session_id = ctx?.sessionManager?.getSessionId?.();
+		}
+		return shaped;
+	});
 
 	// ----- lifecycle hooks --------------------------------------------------
 
 	refreshDiscovery(true);
 
-	pi.on("session_start", async (_event, ctx) => {
+	safeOn("session_start", async (_event, ctx) => {
 		refreshDiscovery(true, ctx);
+		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
 		pruneCooldowns();
 		// Tight session binding: every session starts as a clean slate. Auto-resume only ever
 		// runs *inside the live session that hit the limit* (its timer is armed by
 		// setPendingContinuation). A new session — or a reopened one after a crash — must NEVER
 		// inherit and silently restart a previous session's paused work, so we drop any leftover
 		// pending state and reset all in-memory guards here.
-		if (persistedState.pendingContinuationPrompt) clearPendingContinuation();
+		if (hasPendingResume()) clearPendingContinuation();
 		autoContinuesThisPrompt = 0;
 		userAbortedChain = false;
-		expectingSelfContinuation = false;
-		lastSentContinuationPrompt = "";
+		watchdogAborting = false;
+		expectingInjectedContinuation = false;
+		recoveryFailures = 0;
+		breakerOpenUntil = 0;
 		responseCooldownHints.clear();
 		handledAssistantErrors.clear();
 		clearQueuedInputs();
+		logEvent("session_start", {
+			version: VERSION,
+			enabled: config.enabled,
+			rotation: rotation.length,
+		});
 		ctx.ui.notify(
 			`pi-multi-account v${VERSION} loaded (${config.enabled ? "enabled" : "disabled"}). ${rotation.length} account(s) in rotation. Config: ${CONFIG_PATH}`,
 			"info",
@@ -3226,7 +4485,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// CRITICAL: when the current session ends — for ANY reason (quit, reload, or replacement
 	// by a new/resumed/forked session) — the extension's background activity must end with it.
 	// Kill every timer and drop the pending continuation so nothing survives the session.
-	pi.on("session_shutdown", async (_event, ctx) => {
+	safeOn("session_shutdown", async (_event, ctx) => {
 		if (pendingWakeTimer) {
 			clearTimeout(pendingWakeTimer);
 			pendingWakeTimer = undefined;
@@ -3234,16 +4493,50 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		clearQueuedInputs();
 		clearPendingContinuation();
 		clearUsageStatusTimer();
+		endResumeWatch();
+		watchdogAborting = false;
+		expectingInjectedContinuation = false;
 		userAbortedChain = false;
-		expectingSelfContinuation = false;
 		autoContinuesThisPrompt = 0;
-		lastSentContinuationPrompt = "";
 		responseCooldownHints.clear();
 		handledAssistantErrors.clear();
 		ctx?.ui?.setStatus?.("multi-account-quota", undefined);
 	});
 
-	pi.on("input", async (event, ctx) => {
+	// Make compaction survive account exhaustion. When the active account is rate-limited /
+	// invalidated and Pi needs to summarize (context overflow or threshold), Pi's default would
+	// run the summary on that dead account and hang ("Working…" forever at high context). We
+	// generate the summary on a healthy account instead. Strictly fail-safe: returns undefined
+	// (Pi's default) whenever it cannot positively do better.
+	safeOn("session_before_compact", async (event: any, ctx: any) => {
+		if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
+		return await runHealthyCompaction(event, ctx);
+	});
+
+	// Forward-progress signals: any of these means the resumed turn is alive, so reset the
+	// stuck watchdog. Cheap no-ops when no resume is in flight.
+	for (const evt of [
+		"turn_start",
+		"message_start",
+		"message_update",
+		"tool_execution_update",
+	] as const) {
+		safeOn(evt, () => {
+			noteResumeProgress();
+		});
+	}
+	// Tool lifecycle also adjusts the in-flight count so a long, silent build/test command is
+	// never mistaken for a wedge and aborted mid-run.
+	safeOn("tool_execution_start", () => {
+		toolInFlight++;
+		noteResumeProgress();
+	});
+	safeOn("tool_execution_end", () => {
+		toolInFlight = Math.max(0, toolInFlight - 1);
+		noteResumeProgress();
+	});
+
+	safeOn("input", async (event, ctx) => {
 		if (
 			!config.enabled ||
 			(event as any).source === "extension" ||
@@ -3257,8 +4550,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (/^\s*[/!]/.test(text)) return { action: "continue" as const };
 		autoContinuesThisPrompt = 0;
 		userAbortedChain = false;
-		lastSentContinuationPrompt = "";
-		if (persistedState.pendingContinuationPrompt) clearPendingContinuation();
+		noteRecoveryProgress(); // a fresh user prompt → clean slate, re-enable auto-continue
+		if (hasPendingResume()) clearPendingContinuation();
 
 		if (
 			await ensureReadyModel(ctx, "preflight: selected account unavailable")
@@ -3292,30 +4585,30 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// genuine prompt resets the per-task auto-continue counter and cancels any pending
 	// resurrection — this is what stops maxAutoContinuesPerPrompt from resetting every
 	// iteration (the bug that let the failover loop run forever).
-	pi.on("before_agent_start", async (event, ctx) => {
+	safeOn("before_agent_start", async (_event, ctx) => {
 		await ensureReadyModel(
 			ctx,
 			"last-moment preflight: selected account unavailable",
 		);
-		const prompt =
-			typeof (event as any).prompt === "string" ? (event as any).prompt : "";
-		const isSelfContinuation =
-			expectingSelfContinuation ||
-			(!!lastSentContinuationPrompt &&
-				prompt.trim() === lastSentContinuationPrompt.trim());
-		if (isSelfContinuation) return;
-		// Genuine user input → fresh task: reset the chain and stop any auto-resume so the
-		// user is fully back in control.
+		// Our own injected continuation (recovery fallback) must NOT be mistaken for a genuine
+		// new user prompt — otherwise it resets the auto-continue counter every iteration and the
+		// recovery loop becomes unbounded. Preserve the chain in that case.
+		if (expectingInjectedContinuation) {
+			expectingInjectedContinuation = false;
+			continuationDispatchedForAgentTurn = true; // this turn IS the continuation
+			return;
+		}
+		// Genuine user input → fresh task: reset the chain and stop any auto-resume.
 		autoContinuesThisPrompt = 0;
 		userAbortedChain = false;
-		lastSentContinuationPrompt = "";
-		if (persistedState.pendingContinuationPrompt) clearPendingContinuation();
+		continuationDispatchedForAgentTurn = false;
+		if (hasPendingResume()) clearPendingContinuation();
 	});
 
-	pi.on("agent_start", async (_event, ctx) => {
+	safeOn("agent_start", async (_event, ctx) => {
+		noteResumeProgress(); // a resumed turn actually started → it is making progress
 		currentPromptSwitch = undefined;
 		automaticModelTarget = undefined;
-		expectingSelfContinuation = false; // consume the flag once the run has started
 		responseCooldownHints.clear();
 		handledAssistantErrors.clear();
 		captureDesiredThinking(); // remember the level BEFORE any failover can clamp it
@@ -3324,11 +4617,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		updateUsageStatus(ctx);
 	});
 
-	pi.on("model_select", (event, ctx) => {
+	safeOn("model_select", (event, ctx) => {
 		const model = (event as any).model;
 		if (!model?.provider || !model?.id) return;
 		updateUsageStatus(ctx, model.provider);
-		void refreshUsage(ctx, model.provider);
+		runBackground("model_select usage refresh", ctx, () =>
+			refreshUsage(ctx, model.provider),
+		);
 		const selected = ref(model.provider, model.id);
 		if (automaticModelTarget === selected) {
 			automaticModelTarget = undefined;
@@ -3340,11 +4635,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// failover still applies to that completed request.
 		currentPromptSwitch = undefined;
 		userAbortedChain = false;
-		if (persistedState.pendingContinuationPrompt) clearPendingContinuation();
+		if (hasPendingResume()) clearPendingContinuation();
 	});
 
-	pi.on("after_provider_response", (event, ctx) => {
-		if (ctx.model && usageFamily(ctx.model.provider)) {
+	safeOn("after_provider_response", (event, ctx) => {
+		noteResumeProgress(); // a provider response arrived → the resumed turn is alive
+		if (ctx.model && usageFamily(ctx.model.provider) === "codex") {
 			const entry = readAuthFile()[ctx.model.provider];
 			const snapshot = parseCodexUsageHeaders(
 				ctx.model.provider,
@@ -3358,6 +4654,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const status = (event as any).status;
 		if (status < 400 && ctx.model) {
 			noteAuthSuccess(ctx.model.provider, ctx.model.id);
+			noteRecoveryProgress(); // a good response → recovery works → close the breaker
 			responseCooldownHints.delete(ctx.model.provider);
 			return;
 		}
@@ -3378,7 +4675,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("message_end", async (event, ctx) => {
+	safeOn("message_end", async (event, ctx) => {
 		const message = (event as any).message;
 		if (message?.role !== "assistant") return;
 		if (message.stopReason !== "error") {
@@ -3405,6 +4702,22 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			provider,
 			id: modelId,
 		};
+		logEvent("assistant_error", {
+			provider,
+			model: modelId,
+			classified: isAuthError(errorText)
+				? "auth"
+				: isContextOverflowError(errorText)
+					? "context_overflow"
+					: isLimitError(errorText)
+						? "limit"
+						: isModelError(errorText)
+							? "model"
+							: isTransientError(errorText)
+								? "transient"
+								: "unhandled",
+			error: errorText,
+		});
 
 		if (isAuthError(errorText)) {
 			let killed = false;
@@ -3464,16 +4777,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return;
 	}
 		if (isLimitError(errorText)) {
-			const hintedCooldowns = [
-				responseCooldownHints.get(provider),
-				cooldownFromErrorText(errorText),
-			].filter(
-				(value): value is number => typeof value === "number" && value > 0,
-			);
-			const cooldownMs =
-				hintedCooldowns.length > 0
-					? Math.max(...hintedCooldowns)
-					: config.cooldownMs;
+			const cooldownMs = await resolveLimitCooldownMs(ctx, provider, errorText);
 			responseCooldownHints.delete(provider);
 			await switchToFallback(
 				ctx,
@@ -3494,33 +4798,66 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if (isTransientError(errorText)) {
-			await switchToFallback(
-				ctx,
-				failedModel,
-				`temporary provider failure: ${errorText.slice(0, 120)}`,
-				config.transientCooldownMs,
-			);
+			const reason = `${TRANSIENT_PENDING_PREFIX} ${errorText.slice(0, 120)}`;
+			markExhausted(provider, config.transientCooldownMs);
+			if (!config.autoContinue) {
+				ctx.ui.notify(
+					`Provider failover: temporary server error on ${provider}/${modelId}. Retry manually in ~${formatDelay(config.transientCooldownMs)}.`,
+					"warning",
+				);
+				return;
+			}
+			setPendingContinuation(ctx, failedModel, reason);
 		}
 	});
 
-	pi.on("agent_end", async (event, ctx) => {
+	safeOn("agent_end", async (event, ctx) => {
+		const stop = lastAssistantStopReason((event as any).messages ?? []);
+		// Our own watchdog aborted a wedged resumed turn — this is RECOVERY, not a user cancel.
+		// Arm auto-resume so the work continues by itself the moment any account is free again;
+		// the user should never have to re-type the prompt to get unstuck.
+		if (watchdogAborting) {
+			watchdogAborting = false;
+			endResumeWatch();
+			const failed =
+				ctx.model?.provider && ctx.model?.id ? ctx.model : undefined;
+			currentPromptSwitch = undefined;
+			continuationDispatchedForAgentTurn = false;
+			if (failed && config.enabled && config.autoContinue) {
+				setPendingContinuation(
+					ctx,
+					failed,
+					"auto-recovered a stuck resume; waiting for an account to free up",
+				);
+			}
+			return;
+		}
 		// Respect the user: if they pressed Esc, the last assistant message is "aborted".
-		if (
-			lastAssistantStopReason((event as any).messages ?? []) === "aborted" ||
-			ctx.signal?.aborted
-		) {
+		if (stop === "aborted" || ctx.signal?.aborted) {
 			userAbortedChain = true;
 			clearPendingContinuation();
 			currentPromptSwitch = undefined;
+			continuationDispatchedForAgentTurn = false;
+			endResumeWatch();
+			return;
+		}
+		// The resumed/continued turn has ended — stop watching it for stalls.
+		endResumeWatch();
+		// CRITICAL (fixes "Cannot continue from message role: assistant"): only resume when the
+		// turn actually ended in an ERROR we can continue from. A non-error end means the work
+		// already advanced on the (switched) account; there is nothing to resume. The old code
+		// kept currentPromptSwitch set across later agent_end cycles and re-dispatched a resume
+		// on a SUCCESSFUL assistant tail, which threw that cryptic error into the transcript.
+		if (stop !== "error") {
+			currentPromptSwitch = undefined;
+			continuationDispatchedForAgentTurn = false;
+			return;
+		}
+		if (continuationDispatchedForAgentTurn) {
+			continuationDispatchedForAgentTurn = false;
 			return;
 		}
 		if (!config.enabled || !config.autoContinue || userAbortedChain) return;
-		if (
-			currentPromptSwitch &&
-			autoContinuesThisPrompt < config.maxAutoContinuesPerPrompt
-		) {
-			const prompt = continuationPrompt(currentPromptSwitch);
-			if (dispatchSelfContinuation(ctx, prompt)) autoContinuesThisPrompt++;
-		}
+		await maybeDispatchContinuation(ctx);
 	});
 }

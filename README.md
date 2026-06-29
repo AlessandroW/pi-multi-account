@@ -86,7 +86,8 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 | `status` (default) | Show enabled state, current model, rotation, login slots, cooldowns, invalidations, pending resume. |
 | `limits [refresh]` | Show active-account 5h/7d limits; `refresh` bypasses the cache. Aliases: `usage`, `quota`. |
 | `rediscover` | Force a re-scan of `auth.json` and rebuild the rotation now. |
-| `add [anthropic\|codex]` | Print the next free account slot to select from the interactive `/login` picker. |
+| `add [anthropic\|codex\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. |
+| `remove [anthropic\|codex\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
 | `next` | Manually switch to the next fallback, deliberately overriding recorded cooldowns. |
 | `stop` | Abort and cancel automatic failover/resume for the current task. |
 | `reset` | Clear all cooldowns, invalidations and any pending auto-resume. |
@@ -125,12 +126,27 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `usageStatusRefreshMs` | 1 min | Re-render the footer countdown periodically; stale caches are refreshed according to `usageRefreshMs`. |
 | `maxAutoContinuesPerPrompt` | `8` | Cap on auto-resume hops per task. |
 | `continuationPrompt` | (built-in) | Template; supports `{from}`, `{to}`, `{reason}`. |
+| `routeCompactionToHealthyAccount` | `true` | When the active account is rate-limited/invalid and Pi needs to compact (context overflow or threshold), generate the summary on a healthy fallback account instead of letting it hang on the dead one. |
+| `resumeIdleTimeoutMs` | 90 s | Max time to wait for the previous turn to go idle before a resume gives up and retries later (never an unbounded loop). |
+| `stuckWatchdogMs` | 180 s | A resumed turn silent for this long (with no tool running) is treated as wedged. |
+| `autoRecoverStuck` | `true` | When a resume wedges, auto-cancel it and auto-resume when an account frees, instead of only notifying. Set `false` for notify-only. |
+| `debugLog` | `true` | Write a structured "black box" decision log to `provider-failover-debug.log` (no credentials — only provider/model ids and truncated reasons). View with `/multi-account log`. |
 
 State (cooldowns, invalidations, recent switches, and an in-session pending resume marker) is persisted to `~/.pi/agent/provider-failover-state.json`. Pending work is deliberately discarded when the session closes or a different session starts.
 
+## Staying unstuck (resilience)
+
+A failover is only useful if the agent actually keeps working afterward. These guarantees keep a switch from silently freezing the session:
+
+- **Compaction survives account limits.** When your context fills up and the active account is rate-limited, the summary that compaction needs is generated on a *healthy* account, so a long run does not wedge at "Working…" the moment it needs to compact.
+- **Resumes only happen when there is something to resume.** The extension continues a turn only when it actually ended in an error it can pick up from — it never tries to "continue" a finished reply (the cause of the cryptic `Cannot continue from message role: assistant` error).
+- **A forward-progress watchdog that acts.** If a resumed turn goes completely silent (no streaming, no tool activity, no provider response) and no tool is running, the extension auto-cancels the wedged turn and resumes the work itself when an account frees up — you do not have to press Esc or re-type the prompt. A long, silent build/test command is never mistaken for a wedge.
+- **A circuit breaker as the floor.** If automatic recovery keeps failing, the extension drops to *advisory mode*: it still flags limits and switches you to a fresh account, but stops the auto-continue that was failing, so a bad state can never spiral into repeated hangs. It re-enables itself on the next success, a new prompt, or `/multi-account reset`.
+- **A black box for diagnosis.** Every decision (switch, error and how it was classified, watchdog action, breaker trip, compaction routing) is appended to `~/.pi/agent/provider-failover-debug.log`. If anything misbehaves, run `/multi-account log` — the exact sequence is there, so a bug can be reproduced and fixed instead of guessed at. The file is bounded in size, contains no credentials, and is safe to share.
+
 ## Privacy & security
 
-`pi-multi-account` **reads** `auth.json` but never writes credentials itself and never stores credentials in its state. Account/token values are reduced to a short irreversible SHA-256 fingerprint for re-login detection and deduplication. To display limits, the active OAuth access token is sent only to its own provider's usage endpoint (`chatgpt.com/backend-api/wham/usage` or `api.anthropic.com/api/oauth/usage`); cached state contains percentages, reset times, plan/credit metadata, and the fingerprint, never the token. Config and state files are written with `0600` permissions.
+`pi-multi-account` **reads** `auth.json` but never writes credentials itself and never stores credentials in its state. Account/token values are reduced to a short irreversible SHA-256 fingerprint for re-login detection and deduplication. To display limits, the active OAuth access token is sent only to its own provider's usage endpoint (`chatgpt.com/backend-api/wham/usage` or `api.anthropic.com/api/oauth/usage`); cached state contains percentages, reset times, plan/credit metadata, and the fingerprint, never the token. Config, state, and the debug log are written with `0600` permissions. The debug log records only provider/model ids, decisions, and truncated reasons — token-shaped material is redacted defensively — so it is safe to share when reporting an issue. Disable it with `"debugLog": false` or `/multi-account log off`.
 
 ## License
 

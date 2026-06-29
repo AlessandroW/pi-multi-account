@@ -24,6 +24,18 @@ const { default: piMultiAccount, mergeRefreshedCredentials } = (await import(
 const AUTH = join(AGENT_DIR, "auth.json");
 const CONFIG = join(AGENT_DIR, "provider-failover.json");
 const STATE = join(AGENT_DIR, "provider-failover-state.json");
+const DEBUG_LOG = join(AGENT_DIR, "provider-failover-debug.log");
+
+function readDebugLog(): Array<Record<string, any>> {
+	try {
+		return readFileSync(DEBUG_LOG, "utf8")
+			.split("\n")
+			.filter((l) => l.trim())
+			.map((l) => JSON.parse(l));
+	} catch {
+		return [];
+	}
+}
 
 type Credential = {
 	type?: string;
@@ -65,6 +77,19 @@ function setup(opts: {
 		| { status: "terminal"; error: string }
 		| { status: "transient"; error: string }
 	>;
+	compactionAuth?: {
+		ok: boolean;
+		error?: string;
+		apiKey?: string;
+		headers?: Record<string, string>;
+	};
+	contextUsage?: {
+		tokens: number | null;
+		contextWindow: number;
+		percent: number | null;
+	};
+	continueThrows?: string;
+	continueBlocks?: () => Promise<void>;
 }) {
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
@@ -106,9 +131,11 @@ function setup(opts: {
 	const mkModel = (provider: string, id: string) => ({ provider, id });
 	const rec = {
 		sent: [] as Array<{ prompt: string; options?: Record<string, unknown> }>,
+		continueCalls: [] as Array<{ options?: Record<string, unknown> }>,
 		setModels: [] as string[],
 		notifies: [] as string[],
 		statuses: [] as Array<{ key: string; value: string | undefined }>,
+		compactionAuthFor: [] as string[],
 		aborts: 0,
 		authReloads: 0,
 	};
@@ -154,7 +181,14 @@ function setup(opts: {
 			getProviderAuthStatus: (provider: string) => ({
 				configured: known.has(provider),
 			}),
+			getApiKeyAndHeaders: async (model: { provider: string; id: string }) => {
+				rec.compactionAuthFor.push(`${model.provider}/${model.id}`);
+				return (
+					opts.compactionAuth ?? { ok: false as const, error: "no key in test" }
+				);
+			},
 		},
+		getContextUsage: () => opts.contextUsage,
 	};
 
 	const pi: any = {
@@ -182,6 +216,11 @@ function setup(opts: {
 		},
 		sendUserMessage: (prompt: string, options?: Record<string, unknown>) =>
 			rec.sent.push({ prompt, options }),
+		continueAgent: async (options?: Record<string, unknown>) => {
+			rec.continueCalls.push({ options });
+			if (opts.continueThrows) throw new Error(opts.continueThrows);
+			if (opts.continueBlocks) await opts.continueBlocks();
+		},
 		appendEntry: () => {},
 		getThinkingLevel: () => "high",
 		setThinkingLevel: () => {},
@@ -248,6 +287,7 @@ async function finishError(
 ) {
 	const message = assistantError(provider, model, errorMessage);
 	await t.fire("message_end", { message });
+	t.setIdle(true);
 	await t.fire("agent_end", { messages: [message] });
 	return message;
 }
@@ -316,17 +356,44 @@ test("HTTP retry responses never switch early; one final 429 switches exactly on
 		"claude-opus-4-8",
 		'429 {"type":"rate_limit_error"}',
 	);
-	assert.deepEqual(t.rec.setModels, ["openai-codex-account-2/claude-opus-4-8"]);
+	assert.deepEqual(t.rec.setModels, ["openai-codex-account-2/gpt-5.5"]);
 	assert.equal(
-		t.rec.sent.length,
+		t.rec.continueCalls.length,
 		1,
-		"the interrupted task should be continued once",
+		"the interrupted task should resume once with existing context",
 	);
-	assert.deepEqual(
-		t.rec.sent[0].options,
-		{ deliverAs: "followUp" },
-		"agent_end must queue a follow-up while Pi is not idle",
-	);
+	assert.equal(t.rec.sent.length, 0, "must not inject a fake user message");
+});
+
+test("cross-family failover picks the target provider's default model, not the source model id", async () => {
+	const accounts: Account = {
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		"openai-codex": {
+			type: "oauth",
+			access: "c",
+			refresh: "cr",
+			accountId: "codex-1",
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.deepEqual(t.rec.setModels, ["openai-codex/gpt-5.5"]);
+});
+
+test("failover resumes with existing context instead of injecting a user message", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	await t.fire("before_agent_start", {
+		prompt: "Refactor the auth module and add tests",
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.rec.continueCalls.length, 1, "must resume on the new provider");
+	assert.equal(t.rec.sent.length, 0, "must not inject a continuation user message");
 });
 
 test("the failed assistant provider is authoritative even if ctx.model changed", async () => {
@@ -424,7 +491,7 @@ test("picks a fresh account and skips one that is still on cooldown", async () =
 		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
 	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
-	assert.deepEqual(t.rec.setModels, ["openai-codex-account-3/claude-opus-4-8"]);
+	assert.deepEqual(t.rec.setModels, ["openai-codex-account-3/gpt-5.5"]);
 });
 
 test("no-fallback warning reports invalidated accounts separately from cooldowns", async () => {
@@ -583,13 +650,13 @@ test("an activation failure is retried after auth reload, cooled briefly, and sk
 	const t = setup({
 		accounts,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
-		setModelFailures: ["openai-codex-account-2/claude-opus-4-8"],
+		setModelFailures: ["openai-codex-account-2/gpt-5.5"],
 	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
 	assert.deepEqual(t.rec.setModels, [
-		"openai-codex-account-2/claude-opus-4-8",
-		"openai-codex-account-2/claude-opus-4-8",
-		"openai-codex-account-3/claude-opus-4-8",
+		"openai-codex-account-2/gpt-5.5",
+		"openai-codex-account-2/gpt-5.5",
+		"openai-codex-account-3/gpt-5.5",
 	]);
 	assert.ok(t.readState().exhaustedUntilByProvider?.["openai-codex-account-2"]);
 	assert.ok(!t.readState().invalidatedByProvider?.["openai-codex-account-2"]);
@@ -771,10 +838,11 @@ test("an early-invalidated access token is force-refreshed and retried on the sa
 		"a successful refresh must stay on the same account",
 	);
 	assert.equal(
-		t.rec.sent.length,
+		t.rec.continueCalls.length,
 		1,
 		"the interrupted task should retry once with the refreshed token",
 	);
+	assert.equal(t.rec.sent.length, 0);
 	assert.ok(!t.readState().invalidatedByProvider?.["openai-codex-account-2"]);
 	assert.ok(
 		t.rec.notifies.some((message) =>
@@ -859,7 +927,7 @@ test("a second account failure in the same agent chain is not hidden by the prev
 	});
 	assert.deepEqual(t.rec.setModels, [
 		"openai-codex-account-4/gpt-5.5",
-		"anthropic/gpt-5.5",
+		"anthropic/claude-opus-4-8",
 	]);
 	assert.ok(t.readState().invalidatedByProvider?.["openai-codex-account-2"]);
 	assert.ok(t.readState().invalidatedByProvider?.["openai-codex-account-4"]);
@@ -1004,10 +1072,9 @@ test("the per-task auto-continue cap survives the extension's own follow-up", as
 		config: { maxAutoContinuesPerPrompt: 1 },
 	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
-	assert.equal(t.rec.sent.length, 1);
+	assert.equal(t.rec.continueCalls.length, 1);
+	assert.equal(t.rec.sent.length, 0);
 
-	await t.fire("before_agent_start", { prompt: t.rec.sent[0].prompt });
-	await t.fire("agent_start");
 	await finishError(
 		t,
 		"openai-codex-account-2",
@@ -1015,9 +1082,9 @@ test("the per-task auto-continue cap survives the extension's own follow-up", as
 		"429 rate limit",
 	);
 	assert.equal(
-		t.rec.sent.length,
+		t.rec.continueCalls.length,
 		1,
-		"the second failure must stop instead of creating another follow-up",
+		"the second failure must stop instead of creating another resume",
 	);
 	assert.equal(
 		t.rec.setModels.length,
@@ -1033,7 +1100,7 @@ test("dead authorization with no fallback does not leave fake pending work", asy
 	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "401 invalid api key");
 	assert.ok(t.readState().invalidatedByProvider?.anthropic);
-	assert.ok(!t.readState().pendingContinuationPrompt);
+	assert.ok(!t.readState().pendingFrom);
 });
 
 test("manual next can override cooldowns without arming an automatic continuation", async () => {
@@ -1042,7 +1109,7 @@ test("manual next can override cooldowns without arming an automatic continuatio
 		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
 	});
 	await t.command("next");
-	assert.deepEqual(t.rec.setModels, ["openai-codex-account-2/claude-opus-4-8"]);
+	assert.deepEqual(t.rec.setModels, ["openai-codex-account-2/gpt-5.5"]);
 	await t.fire("agent_end", { messages: [] });
 	assert.equal(
 		t.rec.sent.length,
@@ -1080,12 +1147,12 @@ test("Esc abort stops the chain and clears pending resume", async () => {
 		"429 rate limit",
 	);
 	await t.fire("message_end", { message });
-	assert.ok(t.readState().pendingContinuationPrompt);
+	assert.ok(t.readState().pendingFrom && t.readState().pendingReason);
 	await t.fire("agent_end", {
 		messages: [{ role: "assistant", stopReason: "aborted" }],
 	});
 	assert.equal(t.rec.sent.length, 0);
-	assert.ok(!t.readState().pendingContinuationPrompt);
+	assert.ok(!t.readState().pendingFrom);
 	await new Promise((resolve) => setTimeout(resolve, 1100));
 	assert.equal(
 		t.rec.sent.length,
@@ -1102,14 +1169,14 @@ test("all-limited work resumes in the same live session after cooldown", async (
 	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
 	assert.equal(t.rec.sent.length, 0, "nothing is available immediately");
-	assert.ok(t.readState().pendingContinuationPrompt);
+	assert.ok(t.readState().pendingFrom && t.readState().pendingReason);
 	await new Promise((resolve) => setTimeout(resolve, 1200));
 	assert.equal(
-		t.rec.sent.length,
+		t.rec.continueCalls.length,
 		1,
 		"the task resumes once the account cooldown expires",
 	);
-	assert.ok(!t.readState().pendingContinuationPrompt);
+	assert.ok(!t.readState().pendingFrom);
 });
 
 test("session shutdown cancels pending work permanently", async () => {
@@ -1122,7 +1189,7 @@ test("session shutdown cancels pending work permanently", async () => {
 	await t.fire("session_shutdown", { reason: "quit" });
 	await new Promise((resolve) => setTimeout(resolve, 1100));
 	assert.equal(t.rec.sent.length, 0);
-	assert.ok(!t.readState().pendingContinuationPrompt);
+	assert.ok(!t.readState().pendingFrom);
 });
 
 test("a cooled account stays skipped after its OAuth access token refreshes", async () => {
@@ -1163,7 +1230,7 @@ test("a cooled account stays skipped after its OAuth access token refreshes", as
 		"a routine token refresh must not wipe a still-active rate-limit cooldown",
 	);
 	assert.ok(
-		t.readState().pendingContinuationPrompt,
+		t.readState().pendingFrom && t.readState().pendingReason,
 		"both accounts cooling → pending resume armed",
 	);
 });
@@ -1230,12 +1297,13 @@ test("resume fires on whichever account recovers first, not rotation order", asy
 	});
 	await t.fire("session_start");
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
-	assert.ok(t.readState().pendingContinuationPrompt, "pending must be armed");
+	assert.ok(t.readState().pendingFrom && t.readState().pendingReason, "pending must be armed");
 	await wait(1400);
-	assert.equal(t.rec.sent.length, 1, "work resumes when codex-2 recovers first");
+	assert.equal(t.rec.continueCalls.length, 1, "work resumes when codex-2 recovers first");
+	assert.equal(t.rec.sent.length, 0);
 	assert.equal(
 		t.rec.setModels.at(-1),
-		"openai-codex-account-2/claude-opus-4-8",
+		"openai-codex-account-2/gpt-5.5",
 		"resume on the first-recovered account",
 	);
 });
@@ -1267,14 +1335,16 @@ test("a long over-estimated cooldown is corrected by fresh usage and resumes", a
 	await t.fire("session_start");
 	// 429 with no reset hint → recorded cooldown defaults to a long (6h) estimate.
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
-	assert.ok(
-		t.readState().pendingContinuationPrompt,
-		"pending armed (recorded cooldown is hours)",
+	assert.equal(
+		t.rec.continueCalls.length,
+		1,
+		"usage reconciliation should resume immediately on the same account",
 	);
+	assert.equal(t.rec.sent.length, 0);
 	// Without reconciliation this would sleep ~6h; usage shows recovery, so the next poll resumes.
 	await wait(450);
 	assert.equal(
-		t.rec.sent.length,
+		t.rec.continueCalls.length,
 		1,
 		"must resume once fresh usage shows the account recovered",
 	);
@@ -1527,5 +1597,677 @@ test("Alibaba/Qwen alias slots (alibaba-account-2) join the rotation", async () 
 	assert.ok(
 		switchedToQwen,
 		"a 429 on anthropic must fail over to an alibaba/qwen-family slot",
+	);
+});
+
+test("immediate failover never injects a continuation user message", async () => {
+	const t = setup({
+		accounts: TWO_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { autoDiscover: true },
+	});
+	await t.fire("session_start");
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.rec.continueCalls.length, 1);
+	assert.equal(t.rec.sent.length, 0);
+});
+
+test("malformed config arrays are sanitized instead of crashing failover", async () => {
+	const t = setup({
+		accounts: TWO_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoDiscover: true,
+			fallbacks: ["openai-codex-account-2", 42, null, ""],
+			limitErrorPatterns: [null, "usage limit", 0],
+			ignoreErrorPatterns: [false, "context window"],
+		} as any,
+	});
+	await t.fire("session_start");
+	await finishError(t, "anthropic", "claude-opus-4-8", "usage limit reached");
+	assert.equal(t.ctx.model.provider, "openai-codex-account-2");
+});
+
+test("corrupt pending target state is ignored safely on resume checks", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			pendingContinuationPrompt: "old pending prompt",
+			pendingFrom: { provider: "anthropic" },
+			pendingReason: "account cooldown expired",
+			lastSwitches: [],
+		} as any,
+	});
+	await t.fire("session_start");
+	assert.ok(!t.readState().pendingFrom);
+});
+
+test("reload re-reads config from disk before handling the next failure", async () => {
+	const t = setup({
+		accounts: TWO_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { enabled: false, fallbacks: [] },
+	});
+	await t.fire("session_start");
+	writeFileSync(
+		CONFIG,
+		`${JSON.stringify({ enabled: true, autoDiscover: false, fallbacks: ["openai-codex-account-2"] }, null, "\t")}\n`,
+	);
+	await t.command("reload");
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.ctx.model.provider, "openai-codex-account-2");
+});
+
+test("disable blocks automatic failover and enable restores it", async () => {
+	const t = setup({
+		accounts: TWO_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { autoDiscover: true },
+	});
+	await t.fire("session_start");
+	await t.command("disable");
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(t.ctx.model.provider, "anthropic");
+
+	await t.command("enable");
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit again");
+	assert.equal(t.ctx.model.provider, "openai-codex-account-2");
+});
+
+test("add cursor guides the user through subscription login, not API-key setup", async () => {
+	const t = setup({ accounts: ONE_ACCOUNT });
+	await t.command("add cursor");
+	const notice = t.rec.notifies.at(-1) ?? "";
+	assert.match(notice, /authenticate your Cursor subscription in the browser/);
+	assert.doesNotMatch(notice, /api[_ -]?key/i);
+});
+
+test("remove codex drops the highest numbered authed alias slot", async () => {
+	const accounts: Account = {
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		"openai-codex": {
+			type: "oauth",
+			access: "c1",
+			refresh: "cr1",
+			accountId: "codex-1",
+		},
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "c2",
+			refresh: "cr2",
+			accountId: "codex-2",
+		},
+		"openai-codex-account-3": {
+			type: "oauth",
+			access: "c3",
+			refresh: "cr3",
+			accountId: "codex-3",
+		},
+	};
+	const t = setup({ accounts });
+	await t.fire("session_start");
+	await t.command("remove codex");
+	const auth = JSON.parse(readFileSync(AUTH, "utf8"));
+	assert.ok(!auth["openai-codex-account-3"]);
+	assert.ok(auth["openai-codex-account-2"]);
+	assert.ok(auth["openai-codex"]);
+	const notice = t.rec.notifies.at(-1) ?? "";
+	assert.match(notice, /removed openai-codex-account-3/);
+});
+
+test("remove <provider-id> deletes a specific slot from auth.json", async () => {
+	const t = setup({ accounts: TWO_ACCOUNTS });
+	await t.fire("session_start");
+	await t.command("remove openai-codex-account-2");
+	const auth = JSON.parse(readFileSync(AUTH, "utf8"));
+	assert.ok(!auth["openai-codex-account-2"]);
+	assert.ok(auth.anthropic);
+});
+
+test("remove anthropic with only the base slot removes that credential", async () => {
+	const t = setup({ accounts: ONE_ACCOUNT });
+	await t.fire("session_start");
+	await t.command("remove anthropic");
+	const auth = JSON.parse(readFileSync(AUTH, "utf8"));
+	assert.ok(!auth.anthropic);
+});
+
+test("remove without args prints usage", async () => {
+	const t = setup({ accounts: ONE_ACCOUNT });
+	await t.command("remove");
+	const notice = t.rec.notifies.at(-1) ?? "";
+	assert.match(notice, /usage:.*remove/i);
+});
+
+test("transient overload retries the same account instead of rotating siblings", async () => {
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "b",
+			refresh: "br",
+			accountId: "codex-2",
+		},
+		"openai-codex-account-4": {
+			type: "oauth",
+			access: "d",
+			refresh: "dr",
+			accountId: "codex-4",
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { transientCooldownMs: 500, pendingPollMs: 200 },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"Codex err: Our servers are currently overloaded. Please try again later.",
+	);
+	assert.equal(
+		t.rec.setModels.length,
+		0,
+		"transient overload must not switch to a sibling account",
+	);
+	assert.ok(t.readState().pendingFrom && t.readState().pendingReason, "pending retry must be armed");
+	await wait(1300);
+	assert.equal(t.rec.setModels.length, 0, "retry must stay on the same account");
+	assert.equal(t.rec.continueCalls.length, 1, "resume must fire after cooldown");
+	assert.equal(t.rec.sent.length, 0);
+});
+
+test("hyphenated Invalid API-key immediately invalidates Alibaba and fails over", async () => {
+	const accounts: Account = {
+		alibaba: { type: "api_key", key: "bad-key" },
+		cursor: { type: "oauth", access: "c-tok", refresh: "c-ref" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "alibaba", id: "qwen3.7-max" },
+		config: {
+			fallbacks: ["cursor/composer-2.5", "alibaba"],
+			includeCursor: true,
+		},
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"alibaba",
+		"qwen3.7-max",
+		"401 Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error",
+	);
+	const state = t.readState();
+	assert.ok(
+		state.invalidatedByProvider?.alibaba,
+		"bad Alibaba API-key must invalidate the slot immediately",
+	);
+	assert.notEqual(
+		t.ctx.model.provider,
+		"alibaba",
+		"must not keep serving requests on invalidated Alibaba",
+	);
+});
+
+test("pending resume after auth failure does not rotate back to the same provider", async () => {
+	const accounts: Account = {
+		alibaba: { type: "api_key", key: "bad-key" },
+		cursor: { type: "oauth", access: "c-tok", refresh: "c-ref" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "alibaba", id: "qwen3.7-max" },
+		config: {
+			fallbacks: ["cursor/composer-2.5", "alibaba"],
+			includeCursor: true,
+			pendingPollMs: 200,
+		},
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"alibaba",
+		"qwen3.7-max",
+		"401 Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error",
+	);
+	const switches = t.readState().lastSwitches ?? [];
+	const selfSwitch = switches.find(
+		(s: { from?: string; to?: string }) => s.from === s.to,
+	);
+	assert.equal(
+		selfSwitch,
+		undefined,
+		"failover must never record alibaba -> alibaba",
+	);
+});
+
+// ---------------------------------------------------------------------------
+// v1.12.0 robustness: no spurious resume, account-aware compaction, watchdog
+// ---------------------------------------------------------------------------
+
+function okAssistant(provider: string, model: string) {
+	return {
+		role: "assistant",
+		content: [],
+		provider,
+		model,
+		stopReason: "stop",
+		timestamp: messageTimestamp++,
+	};
+}
+
+test("does not re-resume from a successful assistant turn (the 'Cannot continue from message role: assistant' bug)", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	await t.fire("before_agent_start", {});
+	// A real 429 switches to codex and resumes the interrupted work exactly once.
+	const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+	await t.fire("message_end", { message: err });
+	t.setIdle(true);
+	await t.fire("agent_end", { messages: [err] });
+	assert.equal(t.rec.continueCalls.length, 1, "the error turn resumes once");
+
+	// The switched-to account then completes a SUCCESSFUL turn. This agent_end consumes the
+	// internal dispatch flag.
+	const ok = okAssistant("openai-codex-account-2", "gpt-5.5");
+	await t.fire("agent_end", { messages: [ok] });
+	assert.equal(t.rec.continueCalls.length, 1, "a successful turn is never resumed");
+
+	// A LATER agent_end (e.g. the agent ran another tool loop) with a successful tail. The old
+	// bug re-dispatched a resume here because currentPromptSwitch was still set, and
+	// pi.continueAgent() then threw "Cannot continue from message role: assistant".
+	await t.fire("agent_end", { messages: [ok] });
+	assert.equal(
+		t.rec.continueCalls.length,
+		1,
+		"must never resume from a completed assistant message",
+	);
+});
+
+test("an un-continuable resume (e.g. tail aborted by the watchdog) recovers by injecting the continuation prompt — never a red error", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+		continueThrows: "Cannot continue from message role: assistant",
+	});
+	const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+	await t.fire("message_end", { message: err });
+	t.setIdle(true);
+	await t.fire("agent_end", { messages: [err] });
+	assert.equal(t.rec.continueCalls.length, 1, "it tries the seamless resume first");
+	assert.ok(
+		!t.rec.notifies.some((n) =>
+			/could not resume with existing context/i.test(n),
+		),
+		"the cryptic continue error is never surfaced as a red error",
+	);
+	assert.equal(
+		t.rec.sent.length,
+		1,
+		"it falls back to injecting the continuation prompt so the work keeps moving by itself",
+	);
+});
+
+test("session_before_compact: leaves Pi's default compaction alone when the active account is healthy", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	const result = await t.fire("session_before_compact", {
+		reason: "threshold",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 1000,
+		},
+		signal: { aborted: false },
+	});
+	assert.equal(result, undefined, "healthy account → Pi's default compaction");
+	assert.equal(
+		t.rec.compactionAuthFor.length,
+		0,
+		"no reroute auth resolved when not needed",
+	);
+});
+
+test("session_before_compact: routes the summary to a healthy account when the active account is cooling", async () => {
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		// The active codex account is itself spent — Pi's default would try to summarize on it.
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+		// ok:false stops the handler before the real compact() call (no network in unit tests),
+		// while still proving WHICH account it chose to summarize on.
+		compactionAuth: { ok: false },
+	});
+	const result = await t.fire("session_before_compact", {
+		reason: "overflow",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 250000,
+		},
+		signal: { aborted: false },
+	});
+	assert.ok(
+		t.rec.compactionAuthFor.some((m) => m.startsWith("anthropic/")),
+		"compaction is routed to the healthy anthropic account, not the cooling codex one",
+	);
+	assert.ok(
+		!t.rec.compactionAuthFor.some((m) =>
+			m.startsWith("openai-codex-account-2/"),
+		),
+		"the cooling account is never chosen to summarize",
+	);
+	assert.equal(result, undefined, "auth unavailable in test → safe fallback");
+});
+
+test("session_before_compact: falls back to Pi default (never throws/hangs) when no account is available", async () => {
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: { anthropic: 60 * 60 * 1000 },
+	});
+	const result = await t.fire("session_before_compact", {
+		reason: "overflow",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 250000,
+		},
+		signal: { aborted: false },
+	});
+	assert.equal(result, undefined, "no live account → safe fallback");
+	assert.equal(
+		t.rec.compactionAuthFor.length,
+		0,
+		"no reroute attempted when nothing is healthy",
+	);
+});
+
+test("the wait-for-idle before a resume is bounded — never an infinite busy-loop", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+		config: { resumeIdleTimeoutMs: 50 },
+	});
+	const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+	await t.fire("message_end", { message: err });
+	// Deliberately keep the session non-idle so the resume's wait MUST time out instead of
+	// spinning forever, then return without ever calling continueAgent.
+	await t.fire("agent_end", { messages: [err] });
+	assert.equal(
+		t.rec.continueCalls.length,
+		0,
+		"must not call continueAgent while the prior turn never goes idle",
+	);
+	assert.ok(
+		t.rec.notifies.some((n) => /did not go idle/i.test(n)),
+		"the bounded wait surfaces a clear, recoverable notice",
+	);
+});
+
+test("a silent resumed turn is AUTO-cancelled and auto-resume armed — no manual prompt needed (active watchdog)", async () => {
+	let release: () => void = () => {};
+	const blocked = new Promise<void>((res) => {
+		release = res;
+	});
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+		config: { stuckWatchdogMs: 40 },
+		continueBlocks: () => blocked,
+	});
+	const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+	await t.fire("message_end", { message: err });
+	t.setIdle(true);
+	// continueAgent blocks (simulating a wedged provider/compaction). Do not await agent_end yet.
+	const pending = t.fire("agent_end", { messages: [err] });
+	await wait(120); // let the 40ms watchdog fire with no progress events
+	assert.ok(
+		t.rec.aborts >= 1,
+		"the watchdog ACTIVELY cancels the wedged turn — it does not just warn and wait",
+	);
+	assert.ok(
+		t.rec.notifies.some((n) => /resume automatically|auto-cancel/i.test(n)),
+		"the user is told it will continue by itself",
+	);
+	release();
+	await pending;
+	// The watchdog abort surfaces as an aborted agent_end; that must ARM auto-resume, not stop.
+	await t.fire("agent_end", {
+		messages: [{ role: "assistant", stopReason: "aborted" }],
+	});
+	const state = t.readState();
+	assert.ok(
+		state.pendingFrom || state.pendingReason,
+		"auto-resume is armed to continue the work when an account frees up",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("the watchdog never aborts a resumed turn while a tool (build/test) is running", async () => {
+	let release: () => void = () => {};
+	const blocked = new Promise<void>((res) => {
+		release = res;
+	});
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+		config: { stuckWatchdogMs: 40 },
+		continueBlocks: () => blocked,
+	});
+	const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+	await t.fire("message_end", { message: err });
+	t.setIdle(true);
+	const pending = t.fire("agent_end", { messages: [err] });
+	// A long, silent tool (e.g. an xcodebuild) is executing — silence is expected, not a wedge.
+	await t.fire("tool_execution_start", {});
+	await wait(120); // the watchdog window elapses, but a tool is in flight
+	assert.equal(
+		t.rec.aborts,
+		0,
+		"a running build/test command must never be killed as 'stuck'",
+	);
+	await t.fire("tool_execution_end", {});
+	release();
+	await pending;
+	await t.fire("session_shutdown");
+});
+
+// ---------------------------------------------------------------------------
+// v1.13.0 circuit breaker: repeated recovery failures drop to safe advisory mode
+// ---------------------------------------------------------------------------
+
+test("after repeated resume failures the breaker opens and auto-continue stops (advisory mode)", async () => {
+	const accounts: Account = {
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "b",
+			refresh: "br",
+			accountId: "b",
+		},
+	};
+	// Every continueAgent attempt throws a hard (non-continuable, non-abort) error → each is a
+	// recovery failure. After 3 in a row the breaker must trip and stop auto-continuing.
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		continueThrows: "network exploded mid-resume",
+	});
+	for (let i = 0; i < 3; i++) {
+		await finishError(
+			t,
+			"anthropic",
+			"claude-opus-4-8",
+			"429 rate limit",
+		);
+	}
+	assert.ok(
+		t.rec.notifies.some((n) => /safe mode|auto-continue/i.test(n)),
+		"the breaker announces it has dropped to advisory mode",
+	);
+	const continueCallsAtTrip = t.rec.continueCalls.length;
+	// A further limit error must NOT trigger another auto-resume while the breaker is open.
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	assert.equal(
+		t.rec.continueCalls.length,
+		continueCallsAtTrip,
+		"while the breaker is open, no more auto-resume attempts are made (no worse than manual)",
+	);
+});
+
+test("the breaker resets on a genuine new user prompt so auto-continue is restored", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		continueThrows: "network exploded mid-resume",
+	});
+	for (let i = 0; i < 3; i++) {
+		await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	}
+	// A real user message is a clean slate — it must clear the failure streak.
+	await t.input("ok continue please");
+	const status = await t.command("status");
+	void status;
+	assert.ok(
+		t.rec.notifies.some((n) => /Auto-continue breaker: closed/i.test(n)),
+		"a fresh user prompt closes the breaker and re-enables auto-continue",
+	);
+});
+
+// ---------------------------------------------------------------------------
+// v1.12.0 crash isolation: no handler/timer fault can crash Pi or freeze a turn
+// ---------------------------------------------------------------------------
+
+function faultyAssistantMessage() {
+	return {
+		role: "assistant",
+		stopReason: "error",
+		// Any property access throws — a stand-in for ANY unexpected internal fault
+		// (a host payload shape change, a formatter edge case, a null deref, …).
+		get errorMessage(): string {
+			throw new Error("synthetic internal fault");
+		},
+	};
+}
+
+test("an unexpected internal fault in an event handler is contained, not propagated to the host", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	// Must resolve cleanly — the extension must never throw out into Pi.
+	await t.fire("message_end", { message: faultyAssistantMessage() });
+	assert.ok(
+		t.rec.notifies.some((n) => /recovered from an internal error/i.test(n)),
+		"the fault is reported once and swallowed",
+	);
+});
+
+test("repeated identical internal faults are reported once, not spammed", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await t.fire("message_end", { message: faultyAssistantMessage() });
+	await t.fire("message_end", { message: faultyAssistantMessage() });
+	await t.fire("message_end", { message: faultyAssistantMessage() });
+	const recovered = t.rec.notifies.filter((n) =>
+		/recovered from an internal error/i.test(n),
+	);
+	assert.equal(
+		recovered.length,
+		1,
+		"identical faults are deduped within the window (no notification storm)",
+	);
+});
+
+test("failover messages are stamped with the running version so a stale (un-restarted) Pi window is obvious at a glance", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.ok(
+		t.rec.notifies.some((n) =>
+			/Provider failover \[v\d+\.\d+\.\d+\]:/.test(n),
+		),
+		"the switch message carries [vX.Y.Z]; its ABSENCE in a window means that window runs old code",
+	);
+});
+
+// ---------------------------------------------------------------------------
+// v1.13.0 black box: every decision is recorded so real bugs become reproducible
+// ---------------------------------------------------------------------------
+
+test("a real failover writes a structured switch + assistant_error to the debug log", async () => {
+	rmSync(DEBUG_LOG, { force: true });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	const events = readDebugLog();
+	const classified = events.find((e) => e.kind === "assistant_error");
+	assert.equal(classified?.classified, "limit", "the error is logged and classified");
+	const sw = events.find((e) => e.kind === "switch");
+	assert.ok(sw, "the actual account switch is recorded");
+	assert.match(
+		String(sw?.to),
+		/openai-codex-account-2/,
+		"the log captures which account it switched to",
+	);
+});
+
+test("the debug log never contains token-like material (defensive redaction)", async () => {
+	rmSync(DEBUG_LOG, { force: true });
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	// An error string that embeds a JWT/token-shaped blob must be redacted in the log.
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"429 rate limit; token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payloadpayloadpayload.sigsigsig",
+	);
+	const raw = (() => {
+		try {
+			return readFileSync(DEBUG_LOG, "utf8");
+		} catch {
+			return "";
+		}
+	})();
+	assert.ok(raw.length > 0, "something was logged");
+	assert.ok(
+		!/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.payloadpayloadpayload/.test(raw),
+		"the JWT-shaped blob is redacted, never written verbatim",
+	);
+	assert.ok(raw.includes("«redacted»"), "redaction marker is present");
+});
+
+test("/multi-account log shows recent events and reports the file path", async () => {
+	rmSync(DEBUG_LOG, { force: true });
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	t.rec.notifies.length = 0;
+	await t.command("log 20");
+	assert.ok(
+		t.rec.notifies.some(
+			(n) => /debug log/i.test(n) && /switch|assistant_error/.test(n),
+		),
+		"the log command surfaces the recorded events to the user",
+	);
+});
+
+test("/multi-account log off then on toggles recording without crashing", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await t.command("log off");
+	rmSync(DEBUG_LOG, { force: true });
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.equal(
+		readDebugLog().length,
+		0,
+		"with logging off, no events are written",
+	);
+	await t.command("log on");
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.ok(
+		readDebugLog().length > 0,
+		"with logging on again, events resume",
 	);
 });
