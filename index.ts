@@ -230,7 +230,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.2";
+const VERSION = "1.13.3";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
 // that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
@@ -4758,10 +4758,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const modelId =
 			typeof message.model === "string" ? message.model : ctx.model?.id;
 		if (!provider || !modelId) return;
-		// Only react to errors from providers this extension manages (anthropic, openai-codex, qwen, ollama).
-		// Without this guard, a rate-limit on ANY provider (e.g. Ollama, OpenRouter, DeepSeek) triggers
-		// failover and switches the user to an unrelated managed account.
-		if (!classifyProvider(provider, config.qwenProvider)) return;
+		// Normally we only react to errors from providers this extension manages. But if the
+		// user's ACTIVE model is on an unmanaged provider (e.g. a plain `openai` API key that hit
+		// its billing quota — "You exceeded your current quota"), we still rescue the task by
+		// failing over to a managed account, which is exactly what the user expects. We only skip
+		// errors from unmanaged providers that are NOT the model the user is currently on (those
+		// are unrelated background errors we must not hijack).
+		const managed = !!classifyProvider(provider, config.qwenProvider);
+		const isCurrentModelProvider = provider === ctx.model?.provider;
+		if (!managed && !isCurrentModelProvider) return;
 		const errorKey = `${provider}/${modelId}:${message.timestamp ?? "unknown"}:${errorText}`;
 		if (handledAssistantErrors.has(errorKey)) return;
 		handledAssistantErrors.add(errorKey);
@@ -4785,6 +4790,28 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 								: "unhandled",
 			error: errorText,
 		});
+
+		// Unmanaged active provider (e.g. plain `openai` API quota): we cannot manage its
+		// cooldown/refresh lifecycle, but we rescue the task by switching to a managed account on
+		// any actionable error. scope:"model" + a short cooldown so we never poison a provider we
+		// don't own.
+		if (!managed) {
+			if (
+				isLimitError(errorText) ||
+				isAuthError(errorText) ||
+				isModelError(errorText) ||
+				isTransientError(errorText)
+			) {
+				await switchToFallback(
+					ctx,
+					failedModel,
+					`external provider out of quota: ${errorText.slice(0, 100)}`,
+					config.transientCooldownMs,
+					{ scope: "model" },
+				);
+			}
+			return;
+		}
 
 		if (isAuthError(errorText)) {
 			let killed = false;

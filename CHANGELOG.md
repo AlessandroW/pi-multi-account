@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.3] - 2026-06-30
+
+### Fixed
+
+- **Fail over when your ACTIVE model is on an unmanaged provider** (e.g. a plain
+  `openai` API key that returns "You exceeded your current quota / insufficient_quota").
+  Previously the extension only reacted to errors from providers it manages
+  (`anthropic`, `openai-codex`, `qwen`, `ollama`, `cursor`), so a quota error on a plain
+  `openai` model was ignored and no rotation happened. Now, if the model you are
+  currently using hits a limit/auth/quota error — even on an unmanaged provider — the
+  task is rescued by switching to a managed account (short model-scoped cooldown; the
+  unmanaged provider's lifecycle is left untouched). Background errors from unrelated
+  providers you are NOT on are still ignored, so nothing gets hijacked.
+
 ## [1.13.2] - 2026-06-29
 
 ### Fixed

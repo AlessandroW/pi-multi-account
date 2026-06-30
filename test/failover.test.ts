@@ -2182,6 +2182,34 @@ test("repeated identical internal faults are reported once, not spammed", async 
 	);
 });
 
+test("a quota error on the ACTIVE unmanaged provider (e.g. plain openai API) still fails over to a managed account", async () => {
+	const t = setup({
+		// The user is actively working on a plain `openai` API model (not managed by the extension).
+		current: { provider: "openai", id: "gpt-5.5" },
+	});
+	await finishError(
+		t,
+		"openai",
+		"gpt-5.5",
+		"You exceeded your current quota, please check your plan and billing details. insufficient_quota",
+	);
+	assert.ok(
+		t.rec.setModels.length > 0,
+		`must rescue the task by switching to a managed account, got: ${t.rec.setModels.join(", ") || "none"}`,
+	);
+});
+
+test("a limit error on an unmanaged provider that is NOT the active model is ignored (no hijack)", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	// Background error from some unrelated provider the user is NOT on → must be ignored.
+	await finishError(t, "deepseek", "deepseek-chat", "429 quota exceeded");
+	assert.equal(
+		t.rec.setModels.length,
+		0,
+		"an unrelated background provider error must not trigger a switch",
+	);
+});
+
 test("failover prefers the latest model: a turn stuck on gpt-5.4 is upgraded back to gpt-5.5 on a codex→codex switch", async () => {
 	const accounts: Account = {
 		"openai-codex-account-2": {
