@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.2] - 2026-06-29
+
+### Fixed
+
+- **Always use the newest model; never stay downgraded.** Once a turn dropped to an
+  older model (e.g. `gpt-5.4` after a momentary limit or model-cooldown on `gpt-5.5`),
+  the "keep the current model across same-family switches" logic carried the old model
+  forward forever. Failover now tries the newest preferred model **first**, so it
+  upgrades back to the latest the moment it is available again. New config
+  `preferLatestModel` (default `true`); set `false` for the old keep-current behavior.
+
+### Added
+
+- **`preferredModels` config** — pin the newest model per provider without a code
+  change, e.g. `"preferredModels": { "openai-codex": ["gpt-5.6","gpt-5.5"] }`. Keys:
+  `anthropic`, `openai-codex`, `cursor`, `qwen`, `ollama`. Newest first.
+- **`/multi-account models`** — shows, per account, the model order the extension would
+  use (★ = selected), so you can see at a glance whether the latest model is available
+  and chosen everywhere.
+
 ## [1.13.1] - 2026-06-29
 
 ### Changed

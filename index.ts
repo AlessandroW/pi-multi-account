@@ -112,6 +112,14 @@ type ProviderFailoverConfig = {
 	// Write a structured "black box" decision log to provider-failover-debug.log. Default: true.
 	// Contains no credentials — only provider/model ids, decisions, and truncated reasons.
 	debugLog?: boolean;
+	// Always upgrade to the newest available model on failover instead of carrying a
+	// previously-downgraded model forward forever. Default: true.
+	preferLatestModel?: boolean;
+	// Per-family override of the preferred model order (newest first). Lets you pin the
+	// latest model for each provider WITHOUT a code change when a new one ships, e.g.
+	// { "openai-codex": ["gpt-5.6", "gpt-5.5"], "anthropic": ["claude-opus-4-9"] }.
+	// Keys: anthropic | openai-codex | cursor | qwen | ollama.
+	preferredModels?: Record<string, string[]>;
 	// Forward-progress watchdog tunables (see constants above). 0/absent ⇒ built-in default.
 	resumeIdleTimeoutMs?: number;
 	stuckWatchdogMs?: number;
@@ -148,6 +156,8 @@ type RuntimeConfig = Required<
 		| "routeCompactionToHealthyAccount"
 		| "autoRecoverStuck"
 		| "debugLog"
+		| "preferLatestModel"
+		| "preferredModels"
 		| "resumeIdleTimeoutMs"
 		| "stuckWatchdogMs"
 	>
@@ -220,7 +230,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.1";
+const VERSION = "1.13.2";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
 // that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
@@ -494,6 +504,8 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	routeCompactionToHealthyAccount: true,
 	autoRecoverStuck: true,
 	debugLog: true,
+	preferLatestModel: true,
+	preferredModels: {},
 	resumeIdleTimeoutMs: RESUME_IDLE_TIMEOUT_MS,
 	stuckWatchdogMs: STUCK_WATCHDOG_MS,
 };
@@ -610,6 +622,15 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 			raw.routeCompactionToHealthyAccount ?? true,
 		autoRecoverStuck: raw.autoRecoverStuck ?? true,
 		debugLog: raw.debugLog ?? true,
+		preferLatestModel: raw.preferLatestModel ?? true,
+		preferredModels:
+			raw.preferredModels && typeof raw.preferredModels === "object"
+				? Object.fromEntries(
+						Object.entries(raw.preferredModels)
+							.map(([k, v]) => [k, stringArray(v)] as const)
+							.filter(([, v]) => v.length > 0),
+					)
+				: {},
 		resumeIdleTimeoutMs: positiveOr(
 			raw.resumeIdleTimeoutMs,
 			RESUME_IDLE_TIMEOUT_MS,
@@ -2687,7 +2708,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			? classifyProvider(currentModel.provider, config.qwenProvider)
 			: undefined;
 		const sameFamily = !!family && !!currentFamily && family === currentFamily;
-		const preferred =
+		const hardcodedPreferred =
 		family === "anthropic"
 			? DEFAULT_ANTHROPIC_MODELS
 			: family === "openai-codex"
@@ -2699,16 +2720,30 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						: family === "cursor"
 							? DEFAULT_CURSOR_MODELS
 							: [];
-		const modelIds = [
-			...(sameFamily && currentModel?.id ? [currentModel.id] : []),
-			...preferred,
-			...(preferredOnly
-				? []
-				: ctx.modelRegistry
-						.getAll()
-						.filter((model: any) => model.provider === parsed.provider)
-						.map((model: any) => model.id)),
-		];
+		// A per-family config override (preferredModels) wins, so a new flagship model can be
+		// pinned without a code change. Order is newest-first either way.
+		const configuredPreferred = family
+			? config.preferredModels[family]
+			: undefined;
+		const preferred =
+			configuredPreferred && configuredPreferred.length > 0
+				? configuredPreferred
+				: hardcodedPreferred;
+		const keepCurrent =
+			sameFamily && currentModel?.id ? [currentModel.id] : [];
+		const registryModels = preferredOnly
+			? []
+			: ctx.modelRegistry
+					.getAll()
+					.filter((model: any) => model.provider === parsed.provider)
+					.map((model: any) => model.id);
+		// preferLatestModel (default): try the newest preferred model FIRST, so a turn that was
+		// once downgraded (e.g. gpt-5.4 after a momentary limit on gpt-5.5) is upgraded back to
+		// the latest the moment it is available again — instead of carrying the old model forever.
+		// Legacy mode keeps the current model first (never changes the model unless it has to).
+		const modelIds = config.preferLatestModel
+			? [...preferred, ...keepCurrent, ...registryModels]
+			: [...keepCurrent, ...preferred, ...registryModels];
 		const result: any[] = [];
 		const seen = new Set<string>();
 		for (const modelId of modelIds) {
@@ -3946,6 +3981,38 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 
+		if (command === "models" || command === "model") {
+			// Show, per account in the rotation, the model order this extension would use
+			// (★ = the one that would be selected). Lets you SEE whether the latest model is
+			// actually available and chosen on each account.
+			refreshDiscovery(false, ctx);
+			const lines = [
+				`pi-multi-account models (prefer-latest: ${config.preferLatestModel ? "ON" : "OFF"}) — ★ = selected first:`,
+			];
+			for (const target of activeFallbacks()) {
+				const parsed = parseTarget(target);
+				if (!parsed) continue;
+				const ordered = resolveTargets(ctx, target, ctx.model).map(
+					(m: any, i: number) => (i === 0 ? `★${m.id}` : m.id),
+				);
+				lines.push(
+					`  ${parsed.provider}: ${ordered.join(", ") || "(no models registered — check /login)"}`,
+				);
+			}
+			const overrides = Object.entries(config.preferredModels);
+			if (overrides.length > 0) {
+				lines.push(
+					`Config overrides: ${overrides.map(([fam, list]) => `${fam}=[${list.join(", ")}]`).join("; ")}`,
+				);
+			} else {
+				lines.push(
+					'Tip: pin the newest model per provider in provider-failover.json, e.g. "preferredModels": { "openai-codex": ["gpt-5.6","gpt-5.5"] }, then /multi-account reload.',
+				);
+			}
+			ctx.ui.notify(lines.join("\n"), "info");
+			return;
+		}
+
 		if (command === "reload") {
 			config = loadConfig();
 			debugLogEnabled = config.debugLog;
@@ -4347,7 +4414,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Auto-continue breaker: ${isBreakerOpen() ? `OPEN — advisory mode until ${formatUntil(breakerOpenUntil)} (manual switching; /multi-account reset to re-enable)` : `closed${recoveryFailures ? ` (${recoveryFailures}/${BREAKER_FAILURE_THRESHOLD} recent failures)` : ""}`}`,
 				`Debug log: ${config.debugLog ? `on → ${DEBUG_LOG_PATH} (/multi-account log to view)` : "off"}`,
 				`Config: ${CONFIG_PATH}`,
-				`Commands: status | limits [refresh] | log [N|on|off] | rediscover | add [anthropic|codex|cursor|ollama|qwen] | remove [anthropic|codex|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | next | switch <provider> | stop | reset | reload | enable | disable`,
+				`Commands: status | limits [refresh] | models | log [N|on|off] | rediscover | add [anthropic|codex|cursor|ollama|qwen] | remove [anthropic|codex|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | next | switch <provider> | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);

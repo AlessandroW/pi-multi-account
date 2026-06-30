@@ -2182,6 +2182,50 @@ test("repeated identical internal faults are reported once, not spammed", async 
 	);
 });
 
+test("failover prefers the latest model: a turn stuck on gpt-5.4 is upgraded back to gpt-5.5 on a codex→codex switch", async () => {
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "b",
+			refresh: "br",
+			accountId: "b",
+		},
+		"openai-codex-account-3": {
+			type: "oauth",
+			access: "c",
+			refresh: "cr",
+			accountId: "c",
+		},
+	};
+	// The active codex turn is on the OLD model gpt-5.4. A same-family failover must NOT carry
+	// 5.4 forward — it must select the newest preferred model (gpt-5.5).
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.4" },
+	});
+	await finishError(t, "openai-codex-account-2", "gpt-5.4", "429 rate_limit_error");
+	assert.ok(
+		t.rec.setModels.some((m) => m.endsWith("/gpt-5.5")),
+		`must upgrade to the latest model, got: ${t.rec.setModels.join(", ")}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.endsWith("/gpt-5.4")),
+		"must not carry the downgraded gpt-5.4 forward",
+	);
+});
+
+test("preferredModels config override pins the newest model per provider without a code change", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { preferredModels: { "openai-codex": ["gpt-5.5", "gpt-5.4"] } },
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.ok(
+		t.rec.setModels.some((m) => m.endsWith("/gpt-5.5")),
+		`override should select gpt-5.5, got: ${t.rec.setModels.join(", ")}`,
+	);
+});
+
 test("failover messages are stamped with the running version so a stale (un-restarted) Pi window is obvious at a glance", async () => {
 	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
