@@ -2012,6 +2012,56 @@ test("the wait-for-idle before a resume is bounded — never an infinite busy-lo
 	);
 });
 
+test("a 'still busy' auto-retry resumes the SAME model — it never downgrades gpt-5.5 to gpt-5.4 on the same account", async () => {
+	// Reproduces the reported log: "openai-codex-account-4/gpt-5.5 → openai-codex-account-4/gpt-5.4
+	// (previous turn was still busy; auto-retry)". A busy-retry is a TIMING issue, not a model
+	// failure — the same account's quota is shared, so dropping to gpt-5.4 escapes nothing and
+	// only downgrades. The resume must keep gpt-5.5.
+	const t = setup({
+		accounts: TWO_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+		config: {
+			resumeIdleTimeoutMs: 40,
+			pendingPollMs: 40,
+			cooldownMs: 40,
+			autoContinue: true,
+		},
+	});
+	// anthropic hits a limit and we switch to the codex account on gpt-5.5. The prior turn never
+	// goes idle in time, so a "still busy" auto-retry is armed for openai-codex-account-2/gpt-5.5.
+	const err = assistantError("anthropic", "claude-opus-4-8", "429 rate limit");
+	await t.fire("message_end", { message: err });
+	assert.deepEqual(
+		t.rec.setModels,
+		["openai-codex-account-2/gpt-5.5"],
+		"the switch lands on the newest model",
+	);
+	// Keep the session non-idle so the resume's bounded wait times out and arms a busy auto-retry.
+	await t.fire("agent_end", { messages: [err] });
+	assert.ok(
+		/still busy/i.test(t.readState().pendingReason ?? ""),
+		"a busy auto-retry must be armed (not a model failure)",
+	);
+	// The turn frees up; let the auto-resume wake fire.
+	t.setIdle(true);
+	await wait(250);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.endsWith("/gpt-5.4")),
+		`busy-retry must NEVER downgrade to gpt-5.4; got: ${t.rec.setModels.join(", ")}`,
+	);
+	assert.ok(
+		t.rec.continueCalls.length >= 1,
+		"the work resumes on the same model",
+	);
+	assert.equal(
+		t.ctx.model.id,
+		"gpt-5.5",
+		"the resumed model is still the latest, gpt-5.5",
+	);
+	await t.fire("session_shutdown");
+});
+
 test("a silent resumed turn is AUTO-cancelled and auto-resume armed — no manual prompt needed (active watchdog)", async () => {
 	let release: () => void = () => {};
 	const blocked = new Promise<void>((res) => {

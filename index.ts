@@ -230,8 +230,13 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.4";
+const VERSION = "1.13.5";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
+// Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
+// not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
+// a failure of the current model (doing so would downgrade it to an older sibling on the same
+// account, which shares the same quota pool and gains nothing).
+const BUSY_RETRY_REASON = "previous turn was still busy; auto-retry";
 // Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
 // that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
 // and permanently killed a live account. The threshold now tolerates a retry burst plus a
@@ -2286,6 +2291,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return reason.startsWith(TRANSIENT_PENDING_PREFIX);
 	}
 
+	// A "still busy" auto-retry is a timing issue, not a model failure: resume the SAME model,
+	// never rotate to a sibling model/account (which would silently downgrade it).
+	function isBusyRetryPendingReason(reason: string) {
+		return reason === BUSY_RETRY_REASON;
+	}
+
+	// Reasons where the source model is healthy and must be resumed as-is — never downgraded.
+	function isSameModelResumeReason(reason: string) {
+		return (
+			isTransientPendingReason(reason) || isBusyRetryPendingReason(reason)
+		);
+	}
+
 	function isAuthPendingReason(reason: string) {
 		const lower = reason.toLowerCase();
 		return (
@@ -3425,11 +3443,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					const failed =
 						ctx.model?.provider && ctx.model?.id ? ctx.model : undefined;
 					if (failed && config.enabled && config.autoContinue)
-						setPendingContinuation(
-							ctx,
-							failed,
-							"previous turn was still busy; auto-retry",
-						);
+						setPendingContinuation(ctx, failed, BUSY_RETRY_REASON);
 					return false;
 				}
 				await new Promise((resolve) => setTimeout(resolve, 20));
@@ -3570,7 +3584,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function pendingWakeProviders(): string[] {
-		if (isTransientPendingReason(persistedState.pendingReason ?? "")) {
+		if (isSameModelResumeReason(persistedState.pendingReason ?? "")) {
 			const parsed = persistedState.pendingFrom
 				? parseTarget(persistedState.pendingFrom)
 				: undefined;
@@ -3660,9 +3674,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 
-		// Transient server errors (overload, 503, websocket) are not account-specific.
-		// Retry the SAME account after its brief cooldown — never rotate to a sibling.
-		if (isTransientPendingReason(persistedState.pendingReason ?? "")) {
+		// Transient server errors (overload, 503, websocket) and "still busy" auto-retries are
+		// NOT account/model failures: retry the SAME account/model after any brief cooldown —
+		// never rotate to a sibling model (which would silently downgrade e.g. gpt-5.5 → gpt-5.4
+		// on the same account, whose quota is shared, so the downgrade escapes nothing).
+		if (isSameModelResumeReason(persistedState.pendingReason ?? "")) {
 			const now = Date.now();
 			if (providerRecoveryAt(sourceModel.provider, now) <= now) {
 				clearPendingContinuation();
@@ -3762,11 +3778,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		schedulePendingWake(ctx);
 		if (!alreadyPending) {
+			const busy = isBusyRetryPendingReason(reason);
 			const transient = isTransientPendingReason(reason);
 			ctx.ui.notify(
-				transient
-					? `Provider failover: temporary server error on ${failedModel.provider}. Retrying the same account in ~${formatDelay(delay)} (re-checks every ${formatDelay(config.pendingPollMs)}). Esc, a new message, or /multi-account stop cancels it.`
-					: `Provider failover: all accounts are cooling down. This session will retry automatically in ~${formatDelay(delay)} (and re-checks every ${formatDelay(config.pendingPollMs)}). Esc during a run, a new user message, /multi-account stop, or leaving the session cancels it.`,
+				busy
+					? `Provider failover [v${VERSION}]: the previous turn is still busy on ${failedModel.provider}/${failedModel.id}. Resuming the SAME model in ~${formatDelay(delay)} (re-checks every ${formatDelay(config.pendingPollMs)}) — it will not be downgraded. Esc, a new message, or /multi-account stop cancels it.`
+					: transient
+						? `Provider failover: temporary server error on ${failedModel.provider}. Retrying the same account in ~${formatDelay(delay)} (re-checks every ${formatDelay(config.pendingPollMs)}). Esc, a new message, or /multi-account stop cancels it.`
+						: `Provider failover: all accounts are cooling down. This session will retry automatically in ~${formatDelay(delay)} (and re-checks every ${formatDelay(config.pendingPollMs)}). Esc during a run, a new user message, /multi-account stop, or leaving the session cancels it.`,
 				"warning",
 			);
 		}

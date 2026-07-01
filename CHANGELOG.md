@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.5] - 2026-07-01
+
+### Fixed
+
+- **A "still busy" auto-retry no longer downgrades the model.** When a resumed turn had
+  not gone idle in time, the auto-retry treated the current model as failed and rotated to
+  an older sibling on the SAME account — the reported `openai-codex-account-4/gpt-5.5 →
+  openai-codex-account-4/gpt-5.4 (previous turn was still busy; auto-retry)`. But a
+  "still busy" state is a timing issue, not a model failure, and a same-account switch
+  shares the same quota pool, so the downgrade escaped nothing and only lost quality. The
+  busy auto-retry now resumes the **same** model (waiting for it if the account is briefly
+  cooling), exactly like a transient-server-error retry. Regression test locks it
+  (proved red→green: without the fix the resume produced `gpt-5.5 → gpt-5.4`).
+
 ## [1.13.4] - 2026-07-01
 
 ### Fixed
