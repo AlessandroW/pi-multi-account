@@ -230,7 +230,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.3";
+const VERSION = "1.13.4";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Raised from 3 → 8. A single transient 401 burst from OpenAI Codex (one physical event
 // that Pi surfaces as 3 error hooks: response/message/agent) hit the old threshold instantly
@@ -2690,6 +2690,35 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
+	// Newest-first preferred model list for a family. A per-family config override
+	// (preferredModels) wins so a new flagship can be pinned without a code change.
+	function familyPreferredModels(family: string | undefined): string[] {
+		if (!family) return [];
+		const configured = config.preferredModels[family];
+		if (configured && configured.length > 0) return configured;
+		return family === "anthropic"
+			? DEFAULT_ANTHROPIC_MODELS
+			: family === "openai-codex"
+				? DEFAULT_CODEX_MODELS
+				: family === "ollama"
+					? DEFAULT_OLLAMA_MODELS
+					: family === "qwen"
+						? DEFAULT_QWEN_MODELS
+						: family === "cursor"
+							? DEFAULT_CURSOR_MODELS
+							: [];
+	}
+
+	// Rank of a model within its family's newest-first preferred order (0 = newest).
+	// Unknown models sort last. Used to keep the latest model across accounts, not
+	// just within one account, during fallback ranking.
+	function modelRecencyRank(model: any): number {
+		const family = classifyProvider(model?.provider, config.qwenProvider);
+		const order = familyPreferredModels(family);
+		const idx = order.indexOf(model?.id);
+		return idx < 0 ? Number.MAX_SAFE_INTEGER : idx;
+	}
+
 	function resolveTargets(
 		ctx: any,
 		target: string,
@@ -2708,27 +2737,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			? classifyProvider(currentModel.provider, config.qwenProvider)
 			: undefined;
 		const sameFamily = !!family && !!currentFamily && family === currentFamily;
-		const hardcodedPreferred =
-		family === "anthropic"
-			? DEFAULT_ANTHROPIC_MODELS
-			: family === "openai-codex"
-				? DEFAULT_CODEX_MODELS
-				: family === "ollama"
-					? DEFAULT_OLLAMA_MODELS
-					: family === "qwen"
-						? DEFAULT_QWEN_MODELS
-						: family === "cursor"
-							? DEFAULT_CURSOR_MODELS
-							: [];
 		// A per-family config override (preferredModels) wins, so a new flagship model can be
 		// pinned without a code change. Order is newest-first either way.
-		const configuredPreferred = family
-			? config.preferredModels[family]
-			: undefined;
-		const preferred =
-			configuredPreferred && configuredPreferred.length > 0
-				? configuredPreferred
-				: hardcodedPreferred;
+		const preferred = familyPreferredModels(family);
 		const keepCurrent =
 			sameFamily && currentModel?.id ? [currentModel.id] : [];
 		const registryModels = preferredOnly
@@ -2776,7 +2787,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		const now = Date.now();
 
-		type Scored = { model: any; remaining: number; rotIndex: number };
+		type Scored = {
+			model: any;
+			remaining: number;
+			rotIndex: number;
+			rank: number;
+		};
+		// When preferLatestModel is on, the newest model wins ACROSS accounts — not just
+		// within one account. Without this, failing over from gpt-5.5 could land on the
+		// same account's older gpt-5.4 (lower rotIndex) instead of gpt-5.5 on a healthy
+		// account, silently downgrading the model. rank is the primary tiebreak.
+		const byRankThenRot = (a: Scored, b: Scored) =>
+			(config.preferLatestModel ? a.rank - b.rank : 0) ||
+			a.rotIndex - b.rotIndex;
 		const scored: Scored[] = [];
 		const seen = new Set<string>();
 
@@ -2804,7 +2827,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					0,
 					Math.max(providerUntil, modelUntil) - now,
 				);
-				scored.push({ model, remaining, rotIndex: i });
+				scored.push({
+					model,
+					remaining,
+					rotIndex: i,
+					rank: modelRecencyRank(model),
+				});
 			}
 		}
 		if (scored.length === 0) return [];
@@ -2844,7 +2872,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		let availableNow = scored
 			.filter((s) => s.remaining === 0)
-			.sort((a, b) => a.rotIndex - b.rotIndex);
+			.sort(byRankThenRot);
 		if (
 			lastLeftProvider &&
 			now - lastLeftAt < ANTI_PINGPONG_MS &&
@@ -2859,7 +2887,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 		if (options.availableNowOnly) return [];
 		return scored
-			.sort((a, b) => a.remaining - b.remaining || a.rotIndex - b.rotIndex)
+			.sort((a, b) => a.remaining - b.remaining || byRankThenRot(a, b))
 			.map((s) => s.model);
 	}
 

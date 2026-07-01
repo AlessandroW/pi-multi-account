@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.4] - 2026-07-01
+
+### Fixed
+
+- **Never silently downgrade the model during a rotation.** When failover switched
+  accounts, the newest model (e.g. `gpt-5.5`) could be dropped in favour of an older one
+  (`gpt-5.4`) on a nearer account. Root cause: fallback candidates were ranked only by
+  account rotation index and cooldown — model recency was not part of the ranking at all,
+  so an older model on a lower-index account beat the newest model on a healthy account.
+  Now, when `preferLatestModel` is on (the default), model recency is the **primary**
+  tiebreak: the latest available model wins across accounts, and rotation order only
+  breaks ties between equally-new models. Regression test locks the behaviour
+  (proved red→green).
+
 ## [1.13.3] - 2026-06-30
 
 ### Fixed

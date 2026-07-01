@@ -2242,6 +2242,63 @@ test("failover prefers the latest model: a turn stuck on gpt-5.4 is upgraded bac
 	);
 });
 
+test("failover never downgrades across accounts: gpt-5.5 on a healthy account beats gpt-5.4 on a nearer account", async () => {
+	// Reproduces the reported bug: on rotation the model silently dropped from gpt-5.5 to gpt-5.4.
+	// Root cause: fallback candidates were ranked ONLY by account rotation index + cooldown, so an
+	// older model on a nearer (lower-index) account beat the newest model on a healthy farther
+	// account. Model recency must be the PRIMARY tiebreak when preferLatestModel is on.
+	const now = Date.now();
+	const accounts: Account = {
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "b",
+			refresh: "br",
+			accountId: "b",
+		},
+		"openai-codex-account-3": {
+			type: "oauth",
+			access: "c",
+			refresh: "cr",
+			accountId: "c",
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoContinue: false,
+			fallbacks: [
+				"anthropic",
+				"openai-codex-account-2",
+				"openai-codex-account-3",
+			],
+		},
+		// gpt-5.5 is model-cooled on the NEARER account (account-2) only; that account is otherwise
+		// healthy, so account-2/gpt-5.4 is available RIGHT NOW. account-3/gpt-5.5 is fully healthy.
+		// The old rotIndex-only ranking would grab account-2/gpt-5.4 (nearer) and downgrade.
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {
+				"openai-codex-account-2/gpt-5.5": now + 30 * 60 * 1000,
+			},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.equal(
+		t.rec.setModels[0],
+		"openai-codex-account-3/gpt-5.5",
+		`must pick the newest model on a healthy account, not a nearer account's gpt-5.4; got: ${t.rec.setModels.join(", ")}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.endsWith("/gpt-5.4")),
+		"must never downgrade to gpt-5.4 while gpt-5.5 is available on any healthy account",
+	);
+});
+
 test("preferredModels config override pins the newest model per provider without a code change", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
