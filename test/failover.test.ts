@@ -2450,3 +2450,116 @@ test("/multi-account log off then on toggles recording without crashing", async 
 		"with logging on again, events resume",
 	);
 });
+
+// ---------------------------------------------------------------------------
+// v1.13.6 regression tests:
+//  - API-key providers: repeated same-key 401s eventually invalidate (was an
+//    infinite 1-minute cooldown loop because same-hash failures never advanced
+//    toward the kill threshold).
+//  - Re-login (credential change) clears stale authFailures tracking for accounts
+//    on transient cooldown (not just invalidated ones).
+// ---------------------------------------------------------------------------
+
+test("api_key provider: repeated same-key 401s eventually invalidate (no infinite loop)", async () => {
+	const accounts = {
+		ollama: { type: "api_key", key: "dead-key" },
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "ollama", id: "glm-5.2:cloud" },
+		config: {
+			autoContinue: false,
+			autoDiscover: true,
+			fallbacks: ["ollama", "anthropic"],
+		},
+	});
+	// First 401: transient cooldown, not invalidated.
+	t.setCurrent("ollama", "glm-5.2:cloud");
+	await t.fire("agent_start");
+	await finishError(t, "ollama", "glm-5.2:cloud", "401 Unauthorized");
+	assert.ok(
+		!t.readState().invalidatedByProvider?.ollama,
+		"first 401 must not invalidate an api_key provider",
+	);
+	// Second 401: still transient, but the same-key counter advances.
+	t.setCurrent("ollama", "glm-5.2:cloud");
+	await t.fire("agent_start");
+	await finishError(t, "ollama", "glm-5.2:cloud", "401 Unauthorized");
+	assert.ok(
+		!t.readState().invalidatedByProvider?.ollama,
+		"second 401 must not invalidate yet",
+	);
+	// Third 401: same key has failed MAX_SAME_KEY_AUTH_FAILURES times → invalidate.
+	t.setCurrent("ollama", "glm-5.2:cloud");
+	await t.fire("agent_start");
+	await finishError(t, "ollama", "glm-5.2:cloud", "401 Unauthorized");
+	assert.ok(
+		t.readState().invalidatedByProvider?.ollama,
+		"after 3 consecutive same-key 401s, an api_key provider must be invalidated to break the loop",
+	);
+});
+
+test("oauth provider: repeated same-token 401s do NOT invalidate (refresh-fault tolerant)", async () => {
+	const accounts = {
+		anthropic: { type: "oauth", access: "static-tok", refresh: "static-ref" },
+		"openai-codex-account-2": { type: "oauth", access: "c", refresh: "cr", accountId: "c2" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { autoContinue: false, fallbacks: ["anthropic", "openai-codex-account-2"] },
+	});
+	// 10 repeated 401s on the SAME token (same hash) — must NEVER invalidate.
+	for (let i = 0; i < 10; i++) {
+		t.setCurrent("anthropic", "claude-opus-4-8");
+		await t.fire("agent_start");
+		await finishError(t, "anthropic", "claude-opus-4-8", "401 Unauthorized");
+	}
+	assert.ok(
+		!t.readState().invalidatedByProvider?.anthropic,
+		"same-hash 401s on an OAuth provider must not invalidate (refresh-fault, not revoked)",
+	);
+});
+
+test("re-login with new credentials clears stale authFailures for transient-cooldown accounts", async () => {
+	const accounts = {
+		ollama: { type: "api_key", key: "old-key" },
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "ollama", id: "glm-5.2:cloud" },
+		config: {
+			autoContinue: false,
+			autoDiscover: true,
+			fallbacks: ["ollama", "anthropic"],
+		},
+	});
+	// Trigger two 401s to build up a same-key failure streak.
+	for (let i = 0; i < 2; i++) {
+		t.setCurrent("ollama", "glm-5.2:cloud");
+		await t.fire("agent_start");
+		await finishError(t, "ollama", "glm-5.2:cloud", "401 Unauthorized");
+	}
+	assert.ok(!t.readState().invalidatedByProvider?.ollama);
+	// Simulate re-login: write new credentials to auth.json.
+	writeFileSync(
+		AUTH,
+		JSON.stringify({
+			ollama: { type: "api_key", key: "new-valid-key" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		}),
+	);
+	// Trigger refreshDiscovery via session_start (detects auth.json mtime change).
+	await t.fire("session_start", { reason: "startup" });
+	// After re-login, the stale authFailures entry must be cleared. A single new 401
+	// should NOT immediately invalidate (the counter starts fresh).
+	t.setCurrent("ollama", "glm-5.2:cloud");
+	await t.fire("agent_start");
+	await finishError(t, "ollama", "glm-5.2:cloud", "401 Unauthorized");
+	assert.ok(
+		!t.readState().invalidatedByProvider?.ollama,
+		"after re-login, a single 401 must not invalidate — stale same-key counter was cleared",
+	);
+});

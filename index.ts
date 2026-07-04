@@ -245,6 +245,12 @@ const BUSY_RETRY_REASON = "previous turn was still busy; auto-retry";
 const MAX_CONSECUTIVE_AUTH_FAILURES = 8;
 const TRANSIENT_AUTH_COOLDOWN_MS = 60 * 1000; // brief skip after a 401 so the next call can refresh
 
+// For non-refreshable (API-key) providers, repeated 401s with the SAME key are not a
+// transient blip — the key is permanently invalid. After this many consecutive same-key
+// failures, invalidate the account so the user is told to re-login instead of looping
+// on a 1-minute cooldown forever.
+const MAX_SAME_KEY_AUTH_FAILURES = 3;
+
 // --- Forward-progress watchdogs (v1.12.0) ----------------------------------
 // A resumed/rotated turn must NEVER be able to hang the session forever. The old
 // code awaited pi.continueAgent() and busy-waited on ctx.isIdle() with no upper
@@ -2226,7 +2232,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * on the server side without the client knowing. Only the explicit terminal patterns
 	 * ("invalid api key", "incorrect api key", "revoked") kill the slot now; a bare 401 gets a
 	 * transient cooldown and the same consecutive-failure accounting as OAuth, so a momentary
-	 * blip no longer removes a working key for a year.
+	 * blip no longer removes a working key for a year. However, repeated 401s with the SAME key
+	 * (same hash) are not a transient blip for API-key providers — the key is permanently
+	 * invalid. After MAX_SAME_KEY_AUTH_FAILURES consecutive same-key failures, the slot is
+	 * invalidated so the user is told to re-login instead of looping on a 1-minute cooldown
+	 * forever.
 	 * Refreshable (OAuth): only a 401 on a *rotated* token — proof Pi actually refreshed and the NEW
 	 * token still failed — counts toward the kill threshold. Repeated 401s on the SAME token mean the
 	 * refresh isn't reaching the wire (a refresh/config fault, e.g. an alias that dropped the refreshed
@@ -2246,8 +2256,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const prev = authFailures.get(provider);
 		if (prev && prev.hash === hash) {
 			// Same token failed again → Pi's refresh never reached the wire, or (for API-key
-			// providers) the same key failed again on a transient blip. Do NOT advance toward a
-			// permanent kill. Keep it on a transient cooldown so the next call still has a chance.
+			// providers) the same key failed again. For OAuth providers this is likely a refresh
+			// fault (the refresh didn't reach the wire), so we keep the account recoverable.
+			// For non-refreshable (API-key) providers, the same key failing repeatedly is NOT a
+			// transient blip — the key is permanently invalid. Advance toward invalidation so
+			// the user is told to re-login instead of looping on a 1-minute cooldown forever.
+			if (!isRefreshable(provider)) {
+				const distinct = (prev.distinct ?? 0) + 1;
+				if (distinct >= MAX_SAME_KEY_AUTH_FAILURES) {
+					authFailures.delete(provider);
+					markInvalid(
+						provider,
+						`${reason} (after ${distinct} same-key 401s)`,
+					);
+					return true;
+				}
+				authFailures.set(provider, { hash, distinct });
+			}
 			markExhausted(provider, TRANSIENT_AUTH_COOLDOWN_MS);
 			return false;
 		}
@@ -2639,6 +2664,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				nextIdentity !== previousIdentity
 			) {
 				if (exhaustedUntilByProvider.delete(provider)) cooldownsCleared = true;
+				// A different real account also clears any stale 401-streak tracking: the new
+				// account's credentials are unrelated to the old failures.
+				authFailures.delete(provider);
 				exhaustedUntilByModel.forEach((_until, key) => {
 					if (key.startsWith(`${provider}/`)) {
 						exhaustedUntilByModel.delete(key);
@@ -2648,9 +2676,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			// The usage snapshot is tied to the token, so refresh it whenever the credential blob
 			// changes (cheap to re-fetch, and never used to gate availability).
+			// For non-refreshable (API-key) providers, a credential change means the user manually
+			// replaced the key (re-login) — stale 401-streak tracking is irrelevant and must be
+			// cleared so the new key gets a fresh start. For OAuth providers, a hash change is a
+			// routine token refresh by Pi; the 401 streak MUST survive so rotated-token failures
+			// can still accumulate toward the kill threshold. Rate-limit cooldowns are NOT
+			// cleared here (they are server-side limits tied to the account, not the token).
 			if (previousHash && nextHash !== previousHash) {
 				usageByProvider.delete(provider);
 				usageErrors.delete(provider);
+				const refreshable =
+					!!entry &&
+					typeof entry.refresh === "string" &&
+					entry.refresh.length > 0;
+				if (!refreshable) authFailures.delete(provider);
 			}
 			if (nextHash) credentialHashes.set(provider, nextHash);
 			else credentialHashes.delete(provider);
@@ -4207,7 +4246,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Remove all numbered alias slots from auth.json so /multi-account add
 		// starts fresh at account-2. Keep base providers (no -account-N suffix)
 		// and keep unrelated providers (openrouter, deepseek, zai, etc.).
-		let removedSlots: string[] = [];
+		const removedSlots: string[] = [];
 		try {
 			const auth = readAuthFile();
 			const kept: Record<string, AuthEntry> = {};

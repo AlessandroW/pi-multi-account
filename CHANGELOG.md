@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.6] - 2026-07-04
+
+### Fixed
+
+- **API-key providers no longer loop forever on a dead key.** A bare `401
+  Unauthorized` from a non-refreshable provider (Ollama Cloud, Alibaba, OpenRouter)
+  was treated as transient: the same key kept getting 1-minute cooldowns but the
+  consecutive-failure counter never advanced (same-hash repeats were deliberately
+  ignored to avoid false kills on OAuth refresh faults). This created an infinite
+  loop — the account was never invalidated, never told the user to re-login, and
+  consumed the entire fallback rotation one retry at a time. Now, for
+  non-refreshable (API-key) providers, repeated same-key 401s advance a separate
+  `MAX_SAME_KEY_AUTH_FAILURES` (3) counter and invalidate the slot after 3
+  consecutive failures. OAuth providers are unaffected — same-hash 401s on a
+  refreshable account still only re-arm the transient cooldown (refresh-fault
+  tolerance preserved). Regression test locks both paths.
+
+- **Re-login now clears stale 401-streak tracking for transient-cooldown accounts.**
+  Previously, `clearReauthedInvalidations()` only cleared `authFailures` for
+  accounts in `invalidatedByProvider`. An account on transient cooldown (not
+  invalidated) kept its stale `authFailures` entry after the user re-logged in with
+  new credentials, so the next 401 inherited the old failure count and could
+  invalidate prematurely or loop. Now `refreshDiscovery()` clears `authFailures`
+  when: (a) the stable account fingerprint changes (different real account —
+  re-login to a new slot), and (b) the credential hash changes for a
+  non-refreshable (API-key) provider (user manually replaced the key). OAuth
+  token rotations (routine Pi refresh) do NOT clear the streak — the 401 counter
+  must survive so rotated-token failures can still accumulate toward the kill
+  threshold. Regression test locks the re-login fresh-start path.
+
 ## [1.13.5] - 2026-07-01
 
 ### Fixed
