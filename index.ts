@@ -61,7 +61,12 @@ import {
 } from "./usage.ts";
 
 type ModelRef = `${string}/${string}`;
-type ProviderFamily = "anthropic" | "openai-codex" | "qwen" | "ollama" | "cursor";
+type ProviderFamily =
+	| "anthropic"
+	| "openai-codex"
+	| "qwen"
+	| "ollama"
+	| "cursor";
 
 type OpenAICodexAliasConfig = {
 	id: string;
@@ -211,6 +216,14 @@ const DEFAULT_USAGE_REFRESH_MS = 5 * 60 * 1000;
 const DEFAULT_USAGE_STATUS_REFRESH_MS = 60 * 1000;
 const MIN_ANTHROPIC_USAGE_REFRESH_MS = 10 * 60 * 1000;
 const MAX_MIGRATED_COOLDOWN_MS = 8 * 24 * 60 * 60 * 1000;
+// v1.13.7 — Hard ceiling on any LIVE-parsed cooldown. Codex/usage error bodies can report the
+// reset of a long ROLLING window (weekly/monthly) as `resets_at`, which — taken literally — evicts
+// an account from rotation for weeks even though its short (primary) window has already freed. Any
+// single estimate is capped here so a mis-parsed or long-window reset can never lock a live account
+// for more than this; the account is re-probed at the cap and cooldownMsFromUsage self-corrects the
+// moment the primary window has headroom. Cooling-down accounts are otherwise never probed, so
+// without this cap the far-future estimate is a dead end (the "bogus cooldown" bug, open since v1.13.1).
+const MAX_LIVE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const MIN_PENDING_WAKE_MS = 1000;
 const AUTH_CHANGE_POLL_MS = 5000;
 // While a session is paused waiting for ANY account to recover, never sleep longer than this
@@ -230,7 +243,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.5";
+const VERSION = "1.13.7";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -385,10 +398,7 @@ const FORCE_REFRESH_AUTH_ERROR_PATTERNS = [
 // v1.9.0 — OpenAI Codex returns them transiently under load even when the account is alive
 // (a parallel Pi session can refresh the same token moments later). They are now treated as
 // transient: the account gets a short cooldown and the next attempt can still refresh.
-const TERMINAL_REFRESH_ERROR_PATTERNS = [
-	"invalid_grant",
-	"revoked",
-];
+const TERMINAL_REFRESH_ERROR_PATTERNS = ["invalid_grant", "revoked"];
 
 const DEFAULT_IGNORE_PATTERNS = [
 	"context overflow",
@@ -471,18 +481,9 @@ const DEFAULT_ANTHROPIC_MODELS = [
 	"claude-haiku-4-5",
 ];
 
-const DEFAULT_OLLAMA_MODELS = [
-	"glm-5.2:cloud",
-];
-const DEFAULT_QWEN_MODELS = [
-	"qwen3.7-max",
-	"qwen-max",
-	"qwen-plus",
-];
-const DEFAULT_CURSOR_MODELS = [
-	"composer-2.5",
-];
-
+const DEFAULT_OLLAMA_MODELS = ["glm-5.2:cloud"];
+const DEFAULT_QWEN_MODELS = ["qwen3.7-max", "qwen-max", "qwen-plus"];
+const DEFAULT_CURSOR_MODELS = ["composer-2.5"];
 
 const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	enabled: true,
@@ -572,7 +573,6 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		includeOllama: raw.includeOllama ?? true,
 		includeCursor: raw.includeCursor ?? true,
 		providerOrder: order.filter(
-
 			(f): f is ProviderFamily =>
 				f === "anthropic" ||
 				f === "openai-codex" ||
@@ -728,7 +728,8 @@ function saveState(state: ProviderFailoverState) {
 // Set from the extension closure once config is known. Module-level so the writer
 // (a plain function) can be called from anywhere without threading config through.
 let debugLogEnabled = false;
-const DEBUG_TOKENISH = /(sk-[\w-]{8,}|ey[A-Za-z0-9._-]{12,}|Bearer\s+\S+|[A-Za-z0-9_-]{40,})/g;
+const DEBUG_TOKENISH =
+	/(sk-[\w-]{8,}|ey[A-Za-z0-9._-]{12,}|Bearer\s+\S+|[A-Za-z0-9_-]{40,})/g;
 
 // Redact anything that smells like a token/JWT/api key so the log is always safe to
 // share. We never deliberately log credentials, but error strings from providers can
@@ -1008,9 +1009,17 @@ function classifyProvider(
 		return "anthropic";
 	if (id === CODEX_BASE || /^openai-codex-account-\d+$/.test(id))
 		return "openai-codex";
-	if (id === qwenProvider || new RegExp(`^${escapeRegex(qwenProvider)}-account-\\d+$`).test(id) || /^qwen/i.test(id))
+	if (
+		id === qwenProvider ||
+		new RegExp(`^${escapeRegex(qwenProvider)}-account-\\d+$`).test(id) ||
+		/^qwen/i.test(id)
+	)
 		return "qwen";
-	if (id === OLLAMA_BASE || /^ollama-account-\d+$/.test(id) || /^ollama/i.test(id))
+	if (
+		id === OLLAMA_BASE ||
+		/^ollama-account-\d+$/.test(id) ||
+		/^ollama/i.test(id)
+	)
 		return "ollama";
 	if (isCursorProviderId(id)) return "cursor";
 	return undefined;
@@ -1220,7 +1229,13 @@ const QWEN_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 		input: ["text"],
 		cost: ZERO_COST,
 		reasoning: true,
-		thinkingLevelMap: { high: "high", low: null, medium: null, minimal: null, xhigh: "max" },
+		thinkingLevelMap: {
+			high: "high",
+			low: null,
+			medium: null,
+			minimal: null,
+			xhigh: "max",
+		},
 	},
 	"qwen-max": {
 		id: "qwen-max",
@@ -1281,16 +1296,11 @@ function registerApiKeySlot(
 			? entry.key
 			: undefined;
 	if (!key) return;
-	const baseUrl =
-		family === "ollama"
-			? OLLAMA_CLOUD_BASE_URL
-			: QWEN_BASE_URL;
+	const baseUrl = family === "ollama" ? OLLAMA_CLOUD_BASE_URL : QWEN_BASE_URL;
 	const preferred =
 		family === "ollama" ? DEFAULT_OLLAMA_MODELS : DEFAULT_QWEN_MODELS;
 	const models = preferred.map((m) =>
-		family === "ollama"
-			? ollamaModelDef(m, id)
-			: qwenModelDef(m, id),
+		family === "ollama" ? ollamaModelDef(m, id) : qwenModelDef(m, id),
 	);
 	pi.registerProvider(id, {
 		name: `${family === "ollama" ? "Ollama" : "Alibaba/Qwen"} (${id})`,
@@ -1745,8 +1755,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let configuredFallbacks = config.fallbacks.slice();
 	let persistedState = loadState();
 
+	// Clamp any persisted far-future cooldown on load: a pre-fix (or mis-parsed long-window) state
+	// could carry a weeks-away reset that would keep evicting a live account until it expired. Cap it
+	// so the account is re-probed within MAX_LIVE_COOLDOWN_MS and usage reconciliation takes over.
+	const clampCooldownUntil = (until: number, now = Date.now()): number =>
+		Number.isFinite(until) ? Math.min(until, now + MAX_LIVE_COOLDOWN_MS) : until;
 	const exhaustedUntilByProvider = new Map<string, number>(
-		Object.entries(persistedState.exhaustedUntilByProvider ?? {}),
+		Object.entries(persistedState.exhaustedUntilByProvider ?? {}).map(
+			([provider, until]) => [provider, clampCooldownUntil(until)],
+		),
 	);
 	const exhaustedUntilByModel = new Map<string, number>(
 		Object.entries(persistedState.exhaustedUntilByModel ?? {}),
@@ -1899,11 +1916,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// Fire-and-forget an async background task (timer callbacks) without ever leaking
 	// an unhandled rejection that would abort the Node process.
-	function runBackground(
-		where: string,
-		ctx: any,
-		fn: () => Promise<unknown>,
-	) {
+	function runBackground(where: string, ctx: any, fn: () => Promise<unknown>) {
 		try {
 			void fn().catch((error) => reportExtensionError(where, error, ctx));
 		} catch (error) {
@@ -2265,10 +2278,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				const distinct = (prev.distinct ?? 0) + 1;
 				if (distinct >= MAX_SAME_KEY_AUTH_FAILURES) {
 					authFailures.delete(provider);
-					markInvalid(
-						provider,
-						`${reason} (after ${distinct} same-key 401s)`,
-					);
+					markInvalid(provider, `${reason} (after ${distinct} same-key 401s)`);
 					return true;
 				}
 				authFailures.set(provider, { hash, distinct });
@@ -2297,9 +2307,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function pruneCooldowns() {
 		const now = Date.now();
 		let changed = false;
+		const ceiling = now + MAX_LIVE_COOLDOWN_MS;
 		for (const [provider, until] of exhaustedUntilByProvider) {
 			if (until <= now && !isInvalidated(provider)) {
 				exhaustedUntilByProvider.delete(provider);
+				changed = true;
+			} else if (until > ceiling) {
+				// A far-future cooldown (mis-parsed long/rolling reset) never gets re-probed on its
+				// own — cooling-down accounts are skipped. Clamp it so the account is retried at the
+				// ceiling and usage reconciliation can free it the moment its short window has headroom.
+				exhaustedUntilByProvider.set(provider, ceiling);
 				changed = true;
 			}
 		}
@@ -2324,9 +2341,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// Reasons where the source model is healthy and must be resumed as-is — never downgraded.
 	function isSameModelResumeReason(reason: string) {
-		return (
-			isTransientPendingReason(reason) || isBusyRetryPendingReason(reason)
-		);
+		return isTransientPendingReason(reason) || isBusyRetryPendingReason(reason);
 	}
 
 	function isAuthPendingReason(reason: string) {
@@ -2405,11 +2420,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (snapshot) {
 			applyUsageToCooldown(provider, snapshot, Date.now());
 			const usageMs = cooldownMsFromUsage(snapshot);
+			// Fresh usage is GROUND TRUTH. If it says the account is available right now (primary
+			// window has headroom → usageMs === 0), trust it over any pessimistic error-text estimate:
+			// a maxed long/rolling window must not evict an account whose short window has already freed.
+			// (Before this the 0 was dropped by the `> 0` filter and a stale 30-day `resets_at` won the
+			// Math.max — the bogus weeks-long cooldown.)
+			if (usageMs === 0) return 0;
 			if (usageMs !== undefined && usageMs > 0) hintedCooldowns.push(usageMs);
 		}
-		return hintedCooldowns.length > 0
-			? Math.max(...hintedCooldowns)
-			: config.cooldownMs;
+		if (hintedCooldowns.length === 0) return config.cooldownMs;
+		// Backstop: never let a single live estimate lock an account beyond the ceiling.
+		return Math.min(Math.max(...hintedCooldowns), MAX_LIVE_COOLDOWN_MS);
 	}
 
 	function providersSharingAccount(provider: string): string[] {
@@ -2427,7 +2448,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function markExhausted(provider: string, cooldownMs: number) {
 		if (cooldownMs <= 0) return; // killed accounts are in invalidatedByProvider, not cooldowns
-		const until = Date.now() + Math.max(cooldownMs, 1000);
+		// Invariant backstop: no LIVE cooldown may exceed the ceiling, regardless of caller. A
+		// far-future reset from a long/rolling limit window must never evict an account for weeks —
+		// it is re-probed at the cap and usage reconciliation shortens it further if truly free.
+		const until = Date.now() + Math.min(Math.max(cooldownMs, 1000), MAX_LIVE_COOLDOWN_MS);
 		for (const candidate of providersSharingAccount(provider)) {
 			exhaustedUntilByProvider.set(
 				candidate,
@@ -2570,8 +2594,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		].sort((a, b) => slotIndex(a) - slotIndex(b));
 		await setupCursorSubscription(pi, {
 			readAuth: readAuthFile,
-			rejectDuplicateLogin: (slot, creds) =>
-				rejectDuplicateLogin(slot, creds),
+			rejectDuplicateLogin: (slot, creds) => rejectDuplicateLogin(slot, creds),
 			slotIds,
 			notify: (message, level) => ctx?.ui?.notify?.(message, level),
 		});
@@ -2620,10 +2643,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (registeredSlots.has(id)) continue;
 				if (family === "anthropic") registerAnthropicSlot(pi, id);
 				else if (family === "openai-codex") registerCodexSlot(pi, id);
-				else if (family === "ollama")
-					registerApiKeySlot(pi, id, "ollama");
-				else if (family === "qwen")
-					registerApiKeySlot(pi, id, "qwen");
+				else if (family === "ollama") registerApiKeySlot(pi, id, "ollama");
+				else if (family === "qwen") registerApiKeySlot(pi, id, "qwen");
 				registeredSlots.add(id);
 			}
 		}
@@ -2797,8 +2818,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// A per-family config override (preferredModels) wins, so a new flagship model can be
 		// pinned without a code change. Order is newest-first either way.
 		const preferred = familyPreferredModels(family);
-		const keepCurrent =
-			sameFamily && currentModel?.id ? [currentModel.id] : [];
+		const keepCurrent = sameFamily && currentModel?.id ? [currentModel.id] : [];
 		const registryModels = preferredOnly
 			? []
 			: ctx.modelRegistry
@@ -3069,7 +3089,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		});
 		if (candidates.length === 0) {
 			const cooldowns = [...exhaustedUntilByProvider.entries()]
-				.filter(([provider, until]) => until > Date.now() && !isInvalidated(provider))
+				.filter(
+					([provider, until]) => until > Date.now() && !isInvalidated(provider),
+				)
 				.map(([provider, until]) => `${provider}: ${formatUntil(until)}`)
 				.join(", ");
 			const invalids = [...invalidatedByProvider.keys()].join(", ");
@@ -3157,7 +3179,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// Reject a promise that does not settle within `ms`. Used to bound every network-bound
 	// hand-off (compaction summary) so a wedged provider call can never hang the session.
-	function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+	function withTimeout<T>(
+		p: Promise<T>,
+		ms: number,
+		label: string,
+	): Promise<T> {
 		return new Promise<T>((resolve, reject) => {
 			const timer = setTimeout(
 				() => reject(new Error(`${label} timed out after ${formatDelay(ms)}`)),
@@ -3308,7 +3334,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// A wedge is a failed recovery — feed the circuit breaker so repeated wedges drop us
 			// to advisory mode instead of aborting/re-resuming forever.
 			noteRecoveryFailure(ctx);
-			if (config.autoRecoverStuck !== false && typeof ctx?.abort === "function") {
+			if (
+				config.autoRecoverStuck !== false &&
+				typeof ctx?.abort === "function"
+			) {
 				ctx?.ui?.notify?.(
 					`Provider failover [v${VERSION}]: the resumed turn on ${where} has been silent for ${formatDelay(silentMs)} — auto-cancelling it and will resume automatically when an account is free${recovery}. (/multi-account stop to cancel, /multi-account status to inspect.)`,
 					"warning",
@@ -3382,8 +3411,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const model = pickCompactionModel(ctx);
 			if (
 				!model ||
-				(model.provider === ctx.model?.provider &&
-					model.id === ctx.model?.id)
+				(model.provider === ctx.model?.provider && model.id === ctx.model?.id)
 			) {
 				// No account is free right now. Don't make it worse — let Pi try its default; the
 				// pending-resume machinery pauses the session until an account recovers.
@@ -3498,9 +3526,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			await continueAgent({ stripErrorAssistant: true });
 			autoContinuesThisPrompt++;
 			logEvent("resume_ok", {
-				model: ctx.model
-					? `${ctx.model.provider}/${ctx.model.id}`
-					: "unknown",
+				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown",
 			});
 			return true;
 		} catch (error) {
@@ -3533,11 +3559,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				) {
 					const to =
 						currentPromptSwitch.to ??
-						(ctx.model ? ref(ctx.model.provider, ctx.model.id) : "the active account");
+						(ctx.model
+							? ref(ctx.model.provider, ctx.model.id)
+							: "the active account");
 					const prompt = config.continuationPrompt
-						.replaceAll("{from}", String(currentPromptSwitch.from ?? "the previous account"))
+						.replaceAll(
+							"{from}",
+							String(currentPromptSwitch.from ?? "the previous account"),
+						)
 						.replaceAll("{to}", String(to))
-						.replaceAll("{reason}", currentPromptSwitch.reason ?? "provider failover");
+						.replaceAll(
+							"{reason}",
+							currentPromptSwitch.reason ?? "provider failover",
+						);
 					try {
 						expectingInjectedContinuation = true;
 						pi.sendUserMessage(prompt);
@@ -3644,7 +3678,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const now = Date.now();
 		const providers = pendingWakeProviders();
 		if (providers.length === 0) return undefined;
-		const nextAt = Math.min(...providers.map((p) => providerRecoveryAt(p, now)));
+		const nextAt = Math.min(
+			...providers.map((p) => providerRecoveryAt(p, now)),
+		);
 		return Math.max(MIN_PENDING_WAKE_MS, nextAt - now);
 	}
 
@@ -3729,17 +3765,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					automaticModelTarget = same;
 					try {
 						await pi.setModel(
-							ctx.modelRegistry.find(
-								sourceModel.provider,
-								sourceModel.id,
-							) ?? {
+							ctx.modelRegistry.find(sourceModel.provider, sourceModel.id) ?? {
 								provider: sourceModel.provider,
 								id: sourceModel.id,
 							},
 						);
 					} finally {
-						if (automaticModelTarget === same)
-							automaticModelTarget = undefined;
+						if (automaticModelTarget === same) automaticModelTarget = undefined;
 					}
 				}
 				await resumeWithExistingContext(ctx);
@@ -4038,7 +4070,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				config = { ...config, debugLog: false };
 				debugLogEnabled = false;
 				ctx.ui.notify(
-					"pi-multi-account: debug logging disabled for this session. Set \"debugLog\": true in the config to re-enable permanently.",
+					'pi-multi-account: debug logging disabled for this session. Set "debugLog": true in the config to re-enable permanently.',
 					"info",
 				);
 				return;
@@ -4197,110 +4229,108 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if (command === "revive") {
-		const target = arg1?.trim();
-		if (!target) {
+			const target = arg1?.trim();
+			if (!target) {
+				ctx.ui.notify(
+					"pi-multi-account: usage: /multi-account revive <provider|all>",
+					"warning",
+				);
+				return;
+			}
+			const targets =
+				target === "all" ? [...invalidatedByProvider.keys()] : [target];
+			let revived = 0;
+			for (const p of targets) {
+				if (invalidatedByProvider.delete(p)) revived++;
+				exhaustedUntilByProvider.delete(p);
+				authFailures.delete(p);
+			}
+			if (revived > 0) persist();
+			refreshDiscovery(true, ctx);
 			ctx.ui.notify(
-				"pi-multi-account: usage: /multi-account revive <provider|all>",
-				"warning",
+				`pi-multi-account: revived ${revived} account(s)${target === "all" ? "" : ` (${target})`}. They are back in rotation.`,
+				"info",
 			);
 			return;
 		}
-		const targets =
-			target === "all"
-				? [...invalidatedByProvider.keys()]
-				: [target];
-		let revived = 0;
-		for (const p of targets) {
-			if (invalidatedByProvider.delete(p)) revived++;
-			exhaustedUntilByProvider.delete(p);
-			authFailures.delete(p);
-		}
-		if (revived > 0) persist();
-		refreshDiscovery(true, ctx);
-		ctx.ui.notify(
-			`pi-multi-account: revived ${revived} account(s)${target === "all" ? "" : ` (${target})`}. They are back in rotation.`,
-			"info",
-		);
-		return;
-	}
-	if (command === "clear") {
-		// Wipe EVERYTHING: fallbacks config, rotation state, cooldowns,
-		// invalidations, usage, pending work, AND alias slots from auth.json —
-		// so the user can rebuild the fallback list from scratch starting at
-		// account-2. Base providers (anthropic, openai-codex, ollama, alibaba)
-		// stay in auth.json; only numbered alias slots are removed.
-		configuredFallbacks = [];
-		config = { ...config, fallbacks: [] };
-		try {
-			const raw = existsSync(CONFIG_PATH)
-				? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
-				: {};
-			raw.fallbacks = [];
-			writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
-				encoding: "utf8",
-				mode: 0o600,
-			});
-		} catch {
-			// non-fatal: in-memory state is still cleared
-		}
-		// Remove all numbered alias slots from auth.json so /multi-account add
-		// starts fresh at account-2. Keep base providers (no -account-N suffix)
-		// and keep unrelated providers (openrouter, deepseek, zai, etc.).
-		const removedSlots: string[] = [];
-		try {
-			const auth = readAuthFile();
-			const kept: Record<string, AuthEntry> = {};
-			for (const [id, entry] of Object.entries(auth)) {
-				if (/-account-\d+$/.test(id)) {
-					removedSlots.push(id);
-				} else {
-					kept[id] = entry;
-				}
-			}
-			if (removedSlots.length > 0) {
-				writeFileSync(AUTH_PATH, `${JSON.stringify(kept, null, "\t")}\n`, {
+		if (command === "clear") {
+			// Wipe EVERYTHING: fallbacks config, rotation state, cooldowns,
+			// invalidations, usage, pending work, AND alias slots from auth.json —
+			// so the user can rebuild the fallback list from scratch starting at
+			// account-2. Base providers (anthropic, openai-codex, ollama, alibaba)
+			// stay in auth.json; only numbered alias slots are removed.
+			configuredFallbacks = [];
+			config = { ...config, fallbacks: [] };
+			try {
+				const raw = existsSync(CONFIG_PATH)
+					? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
+					: {};
+				raw.fallbacks = [];
+				writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
 					encoding: "utf8",
 					mode: 0o600,
 				});
+			} catch {
+				// non-fatal: in-memory state is still cleared
 			}
-		} catch {
-			// non-fatal: auth.json may be locked by a concurrent Pi process
+			// Remove all numbered alias slots from auth.json so /multi-account add
+			// starts fresh at account-2. Keep base providers (no -account-N suffix)
+			// and keep unrelated providers (openrouter, deepseek, zai, etc.).
+			const removedSlots: string[] = [];
+			try {
+				const auth = readAuthFile();
+				const kept: Record<string, AuthEntry> = {};
+				for (const [id, entry] of Object.entries(auth)) {
+					if (/-account-\d+$/.test(id)) {
+						removedSlots.push(id);
+					} else {
+						kept[id] = entry;
+					}
+				}
+				if (removedSlots.length > 0) {
+					writeFileSync(AUTH_PATH, `${JSON.stringify(kept, null, "\t")}\n`, {
+						encoding: "utf8",
+						mode: 0o600,
+					});
+				}
+			} catch {
+				// non-fatal: auth.json may be locked by a concurrent Pi process
+			}
+			// Forget every alias slot we ever registered with Pi — they no longer
+			// have credentials, so re-discovery will not pick them up.
+			registeredSlots.clear();
+			exhaustedUntilByProvider.clear();
+			exhaustedUntilByModel.clear();
+			invalidatedByProvider.clear();
+			authFailures.clear();
+			usageByProvider.clear();
+			usageErrors.clear();
+			responseCooldownHints.clear();
+			handledAssistantErrors.clear();
+			currentPromptSwitch = undefined;
+			autoContinuesThisPrompt = 0;
+			userAbortedChain = false;
+			clearPendingContinuation();
+			clearQueuedInputs();
+			persistedState = {
+				stateVersion: STATE_VERSION,
+				exhaustedUntilByProvider: {},
+				exhaustedUntilByModel: {},
+				lastProbeAtByProvider: {},
+				invalidatedByProvider: {},
+				usageByProvider: {},
+				lastSwitches: [],
+			};
+			saveState(persistedState);
+			rotation = [];
+			duplicateSlots = [];
+			reloadHostAuth(ctx);
+			ctx.ui.notify(
+				`pi-multi-account: cleared all fallbacks, state and ${removedSlots.length} alias slot(s)${removedSlots.length ? ` (${removedSlots.join(", ")})` : ""}. Run /multi-account add <family> then /login to rebuild.`,
+				"info",
+			);
+			return;
 		}
-		// Forget every alias slot we ever registered with Pi — they no longer
-		// have credentials, so re-discovery will not pick them up.
-		registeredSlots.clear();
-		exhaustedUntilByProvider.clear();
-		exhaustedUntilByModel.clear();
-		invalidatedByProvider.clear();
-		authFailures.clear();
-		usageByProvider.clear();
-		usageErrors.clear();
-		responseCooldownHints.clear();
-		handledAssistantErrors.clear();
-		currentPromptSwitch = undefined;
-		autoContinuesThisPrompt = 0;
-		userAbortedChain = false;
-		clearPendingContinuation();
-		clearQueuedInputs();
-		persistedState = {
-			stateVersion: STATE_VERSION,
-			exhaustedUntilByProvider: {},
-			exhaustedUntilByModel: {},
-			lastProbeAtByProvider: {},
-			invalidatedByProvider: {},
-			usageByProvider: {},
-			lastSwitches: [],
-		};
-		saveState(persistedState);
-		rotation = [];
-		duplicateSlots = [];
-		reloadHostAuth(ctx);
-		ctx.ui.notify(
-			`pi-multi-account: cleared all fallbacks, state and ${removedSlots.length} alias slot(s)${removedSlots.length ? ` (${removedSlots.join(", ")})` : ""}. Run /multi-account add <family> then /login to rebuild.`,
-			"info",
-		);
-		return;
-	}
 		if (command === "reset") {
 			exhaustedUntilByProvider.clear();
 			currentPromptSwitch = undefined;
@@ -4512,7 +4542,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		try {
 			return await handleCommand(args, ctx);
 		} catch (error) {
-			reportExtensionError(`/multi-account ${args.trim().split(/\s+/)[0] || "status"}`, error, ctx);
+			reportExtensionError(
+				`/multi-account ${args.trim().split(/\s+/)[0] || "status"}`,
+				error,
+				ctx,
+			);
 			return undefined;
 		}
 	};
@@ -4555,16 +4589,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				? entry.key
 				: undefined;
 		if (!key) return; // nothing to register — no real credential
-		const baseUrl =
-		family === "ollama"
-			? OLLAMA_CLOUD_BASE_URL
-			: QWEN_BASE_URL;
+		const baseUrl = family === "ollama" ? OLLAMA_CLOUD_BASE_URL : QWEN_BASE_URL;
 		const preferred =
 			family === "ollama" ? DEFAULT_OLLAMA_MODELS : DEFAULT_QWEN_MODELS;
 		const models = preferred.map((m) =>
-			family === "ollama"
-				? ollamaModelDef(m, baseId)
-				: qwenModelDef(m, baseId),
+			family === "ollama" ? ollamaModelDef(m, baseId) : qwenModelDef(m, baseId),
 		);
 		pi.registerProvider(baseId, {
 			name: family === "ollama" ? "Ollama" : "Alibaba/Qwen",
@@ -4583,7 +4612,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			| Record<string, unknown>
 			| undefined;
 		const provider = ctx?.model?.provider;
-		if (payload && typeof provider === "string" && isCursorProviderId(provider)) {
+		if (
+			payload &&
+			typeof provider === "string" &&
+			isCursorProviderId(provider)
+		) {
 			payload.pi_session_id = ctx?.sessionManager?.getSessionId?.();
 		}
 		return shaped;
@@ -4937,25 +4970,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				killed = markAuthFailure(provider, errorText);
 			}
 			if (killed) {
-			ctx.ui.notify(
-				`Provider failover: ${provider} authorization is invalid. Run /login, choose "Use a subscription", then select ${provider}.`,
-				"warning",
+				ctx.ui.notify(
+					`Provider failover: ${provider} authorization is invalid. Run /login, choose "Use a subscription", then select ${provider}.`,
+					"warning",
+				);
+			}
+			// A killed account is already in invalidatedByProvider (no cooldown entry needed —
+			// that was the v1.8.x "8696h cooldown" bug). A transient auth failure gets the brief
+			// TRANSIENT_AUTH_COOLDOWN_MS so selection skips it for a moment and Pi can refresh.
+			const cooldownMs = killed ? 0 : TRANSIENT_AUTH_COOLDOWN_MS;
+			await switchToFallback(
+				ctx,
+				failedModel,
+				killed
+					? `auth invalid: ${reason.slice(0, 100)}`
+					: `transient auth failure: ${reason.slice(0, 100)}`,
+				cooldownMs,
 			);
+			return;
 		}
-		// A killed account is already in invalidatedByProvider (no cooldown entry needed —
-		// that was the v1.8.x "8696h cooldown" bug). A transient auth failure gets the brief
-		// TRANSIENT_AUTH_COOLDOWN_MS so selection skips it for a moment and Pi can refresh.
-		const cooldownMs = killed ? 0 : TRANSIENT_AUTH_COOLDOWN_MS;
-		await switchToFallback(
-			ctx,
-			failedModel,
-			killed
-				? `auth invalid: ${reason.slice(0, 100)}`
-				: `transient auth failure: ${reason.slice(0, 100)}`,
-			cooldownMs,
-		);
-		return;
-	}
 		if (isLimitError(errorText)) {
 			const cooldownMs = await resolveLimitCooldownMs(ctx, provider, errorText);
 			responseCooldownHints.delete(provider);

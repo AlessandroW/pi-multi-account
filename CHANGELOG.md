@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.7] - 2026-07-04
+
+### Fixed
+
+- **Bogus weeks-long cooldowns no longer evict a live account from rotation.** When a
+  Codex account maxed a long *rolling* limit window (weekly/monthly), the reset time
+  of that window (or a mis-parsed `resets_at`) was recorded literally as the account's
+  cooldown — e.g. `openai-codex-account-2` was locked until **2026-08-03 (30 days)** and
+  `openai-codex-account-3` until 2026-07-21. Because cooling-down accounts are never
+  re-probed, the estimate was a dead end: a perfectly healthy account (its short/primary
+  window already free) sat out of rotation for weeks, producing "no immediately available
+  fallback" even though fallbacks existed. Three-layer fix:
+  - `resolveLimitCooldownMs` now treats **fresh usage as ground truth**: if the usage probe
+    says the primary window has headroom (`usageMs === 0`), the account is available *now* and
+    the pessimistic error-text estimate is discarded (previously the `> 0` filter dropped the
+    `0` and a stale 30-day `resets_at` won the `Math.max`).
+  - New `MAX_LIVE_COOLDOWN_MS` (6h) caps **any** live-parsed cooldown at record time
+    (`markExhausted`) — no single estimate can lock an account longer than one re-probe cycle.
+  - Persisted far-future cooldowns are **clamped on load and in `pruneCooldowns`**, so an
+    already-poisoned state file self-heals on the next restart without `/multi-account reset`.
+- **`VERSION` constant was stuck at `1.13.5`.** It was never bumped for the 1.13.6 release, so
+  every on-screen `[v1.13.5]` failover tag under-reported the actually-running code — defeating
+  the version stamp whose entire purpose is to tell a live window from a stale one. Now `1.13.7`.
+
 ## [1.13.6] - 2026-07-04
 
 ### Fixed

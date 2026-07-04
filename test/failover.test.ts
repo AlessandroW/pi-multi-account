@@ -392,8 +392,16 @@ test("failover resumes with existing context instead of injecting a user message
 		prompt: "Refactor the auth module and add tests",
 	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
-	assert.equal(t.rec.continueCalls.length, 1, "must resume on the new provider");
-	assert.equal(t.rec.sent.length, 0, "must not inject a continuation user message");
+	assert.equal(
+		t.rec.continueCalls.length,
+		1,
+		"must resume on the new provider",
+	);
+	assert.equal(
+		t.rec.sent.length,
+		0,
+		"must not inject a continuation user message",
+	);
 });
 
 test("the failed assistant provider is authoritative even if ctx.model changed", async () => {
@@ -550,7 +558,9 @@ test("no-fallback warning reports invalidated accounts separately from cooldowns
 	);
 	assert.ok(warning);
 	assert.ok(warning.includes("openai-codex-account-3"));
-	assert.ok(warning.includes("Invalidated (need re-login): openai-codex-account-2"));
+	assert.ok(
+		warning.includes("Invalidated (need re-login): openai-codex-account-2"),
+	);
 	assert.ok(!warning.includes("Cooldowns: openai-codex-account-2"));
 });
 
@@ -1297,9 +1307,16 @@ test("resume fires on whichever account recovers first, not rotation order", asy
 	});
 	await t.fire("session_start");
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
-	assert.ok(t.readState().pendingFrom && t.readState().pendingReason, "pending must be armed");
+	assert.ok(
+		t.readState().pendingFrom && t.readState().pendingReason,
+		"pending must be armed",
+	);
 	await wait(1400);
-	assert.equal(t.rec.continueCalls.length, 1, "work resumes when codex-2 recovers first");
+	assert.equal(
+		t.rec.continueCalls.length,
+		1,
+		"work resumes when codex-2 recovers first",
+	);
 	assert.equal(t.rec.sent.length, 0);
 	assert.equal(
 		t.rec.setModels.at(-1),
@@ -1347,6 +1364,64 @@ test("a long over-estimated cooldown is corrected by fresh usage and resumes", a
 		t.rec.continueCalls.length,
 		1,
 		"must resume once fresh usage shows the account recovered",
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Bogus far-future cooldowns must never evict a live account for weeks (v1.13.7)
+// Regression: a maxed long/rolling limit window (or a mis-parsed reset) recorded a
+// weeks-away cooldown; the account was skipped forever because cooling-down accounts
+// are never re-probed. openai-codex-account-2 was locked until Aug 3 in the wild.
+// ---------------------------------------------------------------------------
+
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+
+test("a persisted far-future cooldown is clamped to the live ceiling on load", async () => {
+	const now = Date.now();
+	const provider = "openai-codex-account-2";
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			// 30 days away — the exact class of value seen in the wild (until 2026-08-03).
+			exhaustedUntilByProvider: { [provider]: now + 30 * 24 * 60 * 60 * 1000 },
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	// Force a persist of the clamped map via a normal failover cycle.
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	const until = t.readState().exhaustedUntilByProvider?.[provider];
+	assert.ok(until, "the cooldown is clamped, not deleted");
+	assert.ok(
+		until <= now + SIX_HOURS_MS + 60_000,
+		`far-future cooldown must be clamped to <= 6h, got ${(until - now) / 3600000}h`,
+	);
+});
+
+test("a 429 whose error body carries a weeks-away resets_at is capped at the ceiling", async () => {
+	const now = Date.now();
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	// resets_at is unix SECONDS; 30 days out. Taken literally this evicts the account for a month.
+	const resetsAt = Math.floor(now / 1000) + 30 * 24 * 60 * 60;
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		`429 rate limit {"resets_at": ${resetsAt}}`,
+	);
+	const until = t.readState().exhaustedUntilByProvider?.anthropic;
+	assert.ok(until, "a cooldown is recorded");
+	assert.ok(
+		until <= now + SIX_HOURS_MS + 60_000,
+		`live cooldown must be capped at 6h, got ${(until - now) / 3600000}h`,
 	);
 });
 
@@ -1447,12 +1522,7 @@ test("invalidation no longer writes a 365-day cooldown entry", async () => {
 		config: { autoContinue: false },
 	});
 	// Force a terminal invalidation: "invalid api key" matches TERMINAL_AUTH_ERROR_PATTERNS.
-	await finishError(
-		t,
-		"anthropic",
-		"claude-opus-4-8",
-		"invalid api key",
-	);
+	await finishError(t, "anthropic", "claude-opus-4-8", "invalid api key");
 	assert.ok(t.readState().invalidatedByProvider?.anthropic);
 	// The cooldown map must NOT contain an ~365-day entry for the invalidated account.
 	const until = t.readState().exhaustedUntilByProvider?.anthropic;
@@ -1547,14 +1617,9 @@ test("Ollama alias slots (ollama-account-2) join the rotation", async () => {
 		`expected 3 accounts in rotation, got: ${startup}`,
 	);
 	// And a real failover lands on an ollama-family provider.
-	await finishError(
-		t,
-		"anthropic",
-		"claude-opus-4-8",
-		"429 rate_limit_error",
-	);
-	const switchedToOllama = t.rec.setModels.some((m) =>
-		m.startsWith("ollama") || m.startsWith("ollama-account-"),
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	const switchedToOllama = t.rec.setModels.some(
+		(m) => m.startsWith("ollama") || m.startsWith("ollama-account-"),
 	);
 	assert.ok(
 		switchedToOllama,
@@ -1585,14 +1650,9 @@ test("Alibaba/Qwen alias slots (alibaba-account-2) join the rotation", async () 
 		/3 account\(s\) in rotation/.test(startup),
 		`expected 3 accounts in rotation, got: ${startup}`,
 	);
-	await finishError(
-		t,
-		"anthropic",
-		"claude-opus-4-8",
-		"429 rate_limit_error",
-	);
-	const switchedToQwen = t.rec.setModels.some((m) =>
-		m.startsWith("alibaba") || m.startsWith("alibaba-account-"),
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	const switchedToQwen = t.rec.setModels.some(
+		(m) => m.startsWith("alibaba") || m.startsWith("alibaba-account-"),
 	);
 	assert.ok(
 		switchedToQwen,
@@ -1777,10 +1837,21 @@ test("transient overload retries the same account instead of rotating siblings",
 		0,
 		"transient overload must not switch to a sibling account",
 	);
-	assert.ok(t.readState().pendingFrom && t.readState().pendingReason, "pending retry must be armed");
+	assert.ok(
+		t.readState().pendingFrom && t.readState().pendingReason,
+		"pending retry must be armed",
+	);
 	await wait(1300);
-	assert.equal(t.rec.setModels.length, 0, "retry must stay on the same account");
-	assert.equal(t.rec.continueCalls.length, 1, "resume must fire after cooldown");
+	assert.equal(
+		t.rec.setModels.length,
+		0,
+		"retry must stay on the same account",
+	);
+	assert.equal(
+		t.rec.continueCalls.length,
+		1,
+		"resume must fire after cooldown",
+	);
 	assert.equal(t.rec.sent.length, 0);
 });
 
@@ -1880,7 +1951,11 @@ test("does not re-resume from a successful assistant turn (the 'Cannot continue 
 	// internal dispatch flag.
 	const ok = okAssistant("openai-codex-account-2", "gpt-5.5");
 	await t.fire("agent_end", { messages: [ok] });
-	assert.equal(t.rec.continueCalls.length, 1, "a successful turn is never resumed");
+	assert.equal(
+		t.rec.continueCalls.length,
+		1,
+		"a successful turn is never resumed",
+	);
 
 	// A LATER agent_end (e.g. the agent ran another tool loop) with a successful tail. The old
 	// bug re-dispatched a resume here because currentPromptSwitch was still set, and
@@ -1903,7 +1978,11 @@ test("an un-continuable resume (e.g. tail aborted by the watchdog) recovers by i
 	await t.fire("message_end", { message: err });
 	t.setIdle(true);
 	await t.fire("agent_end", { messages: [err] });
-	assert.equal(t.rec.continueCalls.length, 1, "it tries the seamless resume first");
+	assert.equal(
+		t.rec.continueCalls.length,
+		1,
+		"it tries the seamless resume first",
+	);
 	assert.ok(
 		!t.rec.notifies.some((n) =>
 			/could not resume with existing context/i.test(n),
@@ -1918,7 +1997,9 @@ test("an un-continuable resume (e.g. tail aborted by the watchdog) recovers by i
 });
 
 test("session_before_compact: leaves Pi's default compaction alone when the active account is healthy", async () => {
-	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
 	const result = await t.fire("session_before_compact", {
 		reason: "threshold",
 		preparation: {
@@ -2152,12 +2233,7 @@ test("after repeated resume failures the breaker opens and auto-continue stops (
 		continueThrows: "network exploded mid-resume",
 	});
 	for (let i = 0; i < 3; i++) {
-		await finishError(
-			t,
-			"anthropic",
-			"claude-opus-4-8",
-			"429 rate limit",
-		);
+		await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
 	}
 	assert.ok(
 		t.rec.notifies.some((n) => /safe mode|auto-continue/i.test(n)),
@@ -2208,7 +2284,9 @@ function faultyAssistantMessage() {
 }
 
 test("an unexpected internal fault in an event handler is contained, not propagated to the host", async () => {
-	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
 	// Must resolve cleanly — the extension must never throw out into Pi.
 	await t.fire("message_end", { message: faultyAssistantMessage() });
 	assert.ok(
@@ -2218,7 +2296,9 @@ test("an unexpected internal fault in an event handler is contained, not propaga
 });
 
 test("repeated identical internal faults are reported once, not spammed", async () => {
-	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
 	await t.fire("message_end", { message: faultyAssistantMessage() });
 	await t.fire("message_end", { message: faultyAssistantMessage() });
 	await t.fire("message_end", { message: faultyAssistantMessage() });
@@ -2250,7 +2330,9 @@ test("a quota error on the ACTIVE unmanaged provider (e.g. plain openai API) sti
 });
 
 test("a limit error on an unmanaged provider that is NOT the active model is ignored (no hijack)", async () => {
-	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
 	// Background error from some unrelated provider the user is NOT on → must be ignored.
 	await finishError(t, "deepseek", "deepseek-chat", "429 quota exceeded");
 	assert.equal(
@@ -2281,7 +2363,12 @@ test("failover prefers the latest model: a turn stuck on gpt-5.4 is upgraded bac
 		accounts,
 		current: { provider: "openai-codex-account-2", id: "gpt-5.4" },
 	});
-	await finishError(t, "openai-codex-account-2", "gpt-5.4", "429 rate_limit_error");
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.4",
+		"429 rate_limit_error",
+	);
 	assert.ok(
 		t.rec.setModels.some((m) => m.endsWith("/gpt-5.5")),
 		`must upgrade to the latest model, got: ${t.rec.setModels.join(", ")}`,
@@ -2362,12 +2449,12 @@ test("preferredModels config override pins the newest model per provider without
 });
 
 test("failover messages are stamped with the running version so a stale (un-restarted) Pi window is obvious at a glance", async () => {
-	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
 	assert.ok(
-		t.rec.notifies.some((n) =>
-			/Provider failover \[v\d+\.\d+\.\d+\]:/.test(n),
-		),
+		t.rec.notifies.some((n) => /Provider failover \[v\d+\.\d+\.\d+\]:/.test(n)),
 		"the switch message carries [vX.Y.Z]; its ABSENCE in a window means that window runs old code",
 	);
 });
@@ -2384,7 +2471,11 @@ test("a real failover writes a structured switch + assistant_error to the debug 
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
 	const events = readDebugLog();
 	const classified = events.find((e) => e.kind === "assistant_error");
-	assert.equal(classified?.classified, "limit", "the error is logged and classified");
+	assert.equal(
+		classified?.classified,
+		"limit",
+		"the error is logged and classified",
+	);
 	const sw = events.find((e) => e.kind === "switch");
 	assert.ok(sw, "the actual account switch is recorded");
 	assert.match(
@@ -2396,7 +2487,9 @@ test("a real failover writes a structured switch + assistant_error to the debug 
 
 test("the debug log never contains token-like material (defensive redaction)", async () => {
 	rmSync(DEBUG_LOG, { force: true });
-	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
 	// An error string that embeds a JWT/token-shaped blob must be redacted in the log.
 	await finishError(
 		t,
@@ -2421,7 +2514,9 @@ test("the debug log never contains token-like material (defensive redaction)", a
 
 test("/multi-account log shows recent events and reports the file path", async () => {
 	rmSync(DEBUG_LOG, { force: true });
-	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
 	t.rec.notifies.length = 0;
 	await t.command("log 20");
@@ -2434,7 +2529,9 @@ test("/multi-account log shows recent events and reports the file path", async (
 });
 
 test("/multi-account log off then on toggles recording without crashing", async () => {
-	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
 	await t.command("log off");
 	rmSync(DEBUG_LOG, { force: true });
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
@@ -2445,10 +2542,7 @@ test("/multi-account log off then on toggles recording without crashing", async 
 	);
 	await t.command("log on");
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
-	assert.ok(
-		readDebugLog().length > 0,
-		"with logging on again, events resume",
-	);
+	assert.ok(readDebugLog().length > 0, "with logging on again, events resume");
 });
 
 // ---------------------------------------------------------------------------
@@ -2503,12 +2597,20 @@ test("api_key provider: repeated same-key 401s eventually invalidate (no infinit
 test("oauth provider: repeated same-token 401s do NOT invalidate (refresh-fault tolerant)", async () => {
 	const accounts = {
 		anthropic: { type: "oauth", access: "static-tok", refresh: "static-ref" },
-		"openai-codex-account-2": { type: "oauth", access: "c", refresh: "cr", accountId: "c2" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "c",
+			refresh: "cr",
+			accountId: "c2",
+		},
 	};
 	const t = setup({
 		accounts,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
-		config: { autoContinue: false, fallbacks: ["anthropic", "openai-codex-account-2"] },
+		config: {
+			autoContinue: false,
+			fallbacks: ["anthropic", "openai-codex-account-2"],
+		},
 	});
 	// 10 repeated 401s on the SAME token (same hash) — must NEVER invalidate.
 	for (let i = 0; i < 10; i++) {
