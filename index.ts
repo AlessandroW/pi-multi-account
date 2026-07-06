@@ -243,7 +243,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.7";
+const VERSION = "1.13.8";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -2881,36 +2881,51 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const seen = new Set<string>();
 
 		for (let i = 0; i < fallbacks.length; i++) {
-			for (const model of resolveTargets(ctx, fallbacks[i], currentModel)) {
-				if (options.excludeProviders?.has(model.provider)) continue;
-				if (
-					!options.includeCurrent &&
-					model.provider === currentModel?.provider &&
-					model.id === currentModel?.id
-				)
-					continue;
-				if (
-					isInvalidated(model.provider) ||
-					!providerHasUsableAuth(ctx, model.provider)
-				)
-					continue;
-				const key = `${model.provider}/${model.id}`;
-				if (seen.has(key)) continue;
-				seen.add(key);
+			// HARD RULE (never auto-downgrade the model): each account contributes exactly ONE
+			// candidate — its newest/flagship model. We must NOT enumerate an account's older or
+			// "mini" models as separate rotation targets, or `/multi-account next` ping-pongs
+			// between e.g. gpt-5.4 ↔ gpt-5.4-mini and one chatty provider drowns out the others.
+			// resolveTargets returns this account's models newest-first, so models[0] is the flagship.
+			const models = resolveTargets(ctx, fallbacks[i], currentModel).filter(
+				(model: any) =>
+					!options.excludeProviders?.has(model.provider) &&
+					!isInvalidated(model.provider) &&
+					providerHasUsableAuth(ctx, model.provider),
+			);
+			if (models.length === 0) continue;
+			// Prefer the newest model that is not itself on a MODEL-level cooldown (a genuine
+			// "model unavailable" error is the only sanctioned reason to fall to an older model).
+			// A provider-level usage limit never demotes the model here: the flagship stays the
+			// representative and the whole account simply cools — so we resume at the flagship, on
+			// another account, instead of quietly dropping to a weaker model of the same account.
+			const pick =
+				models.find(
+					(model: any) =>
+						(exhaustedUntilByModel.get(`${model.provider}/${model.id}`) ?? 0) <=
+						now,
+				) ?? models[0];
+			// Leaving the current account: skip it (we only ever re-offer it via the round-robin
+			// wrap-around below). Excluding by the *representative* — never by the raw current
+			// model — is what stops a weaker same-account model from bubbling up as a downgrade.
+			if (
+				!options.includeCurrent &&
+				pick.provider === currentModel?.provider &&
+				pick.id === currentModel?.id
+			)
+				continue;
+			if (seen.has(pick.provider)) continue;
+			seen.add(pick.provider);
 
-				const providerUntil = providerRecoveryAt(model.provider, now);
-				const modelUntil = exhaustedUntilByModel.get(key) ?? 0;
-				const remaining = Math.max(
-					0,
-					Math.max(providerUntil, modelUntil) - now,
-				);
-				scored.push({
-					model,
-					remaining,
-					rotIndex: i,
-					rank: modelRecencyRank(model),
-				});
-			}
+			const key = `${pick.provider}/${pick.id}`;
+			const providerUntil = providerRecoveryAt(pick.provider, now);
+			const modelUntil = exhaustedUntilByModel.get(key) ?? 0;
+			const remaining = Math.max(0, Math.max(providerUntil, modelUntil) - now);
+			scored.push({
+				model: pick,
+				remaining,
+				rotIndex: i,
+				rank: modelRecencyRank(pick),
+			});
 		}
 		if (scored.length === 0) return [];
 
@@ -3087,7 +3102,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			manualRoundRobin: options.manual,
 			excludeProviders,
 		});
+		// No OTHER account to move to. Because each account now offers only its flagship (the
+		// never-downgrade rule), a single-account session with a just-cleared cooldown lands here
+		// instead of enumerating a weaker sibling model — so this is the path that must resume the
+		// current account when usage shows it actually recovered, rather than downgrading.
 		if (candidates.length === 0) {
+			if (armSameAccountResumeIfReady(ctx, failedModel, reason, options))
+				return false;
 			const cooldowns = [...exhaustedUntilByProvider.entries()]
 				.filter(
 					([provider, until]) => until > Date.now() && !isInvalidated(provider),
@@ -3122,21 +3143,33 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			{ armContinuation: !options.manual },
 		);
 		if (!switched && !options.manual && config.autoContinue) {
-			reconcileCooldownsFromUsage(ctx);
-			pruneCooldowns();
-			if (isCurrentModelReady(ctx)) {
-				const target = ref(failedModel.provider, failedModel.id);
-				currentPromptSwitch = {
-					from: target,
-					to: target,
-					reason: `${reason} (same account recovered)`,
-					at: Date.now(),
-				};
-			} else {
+			if (!armSameAccountResumeIfReady(ctx, failedModel, reason, options))
 				setPendingContinuation(ctx, failedModel, reason);
-			}
 		}
 		return switched;
+	}
+
+	// If the account we just failed off is actually READY again (usage reconciliation cleared its
+	// cooldown), arm a same-account resume instead of demoting the model or parking a pending wait.
+	// Returns true when it armed the resume. Never fires for manual switches.
+	function armSameAccountResumeIfReady(
+		ctx: any,
+		failedModel: any,
+		reason: string,
+		options: { manual?: boolean } = {},
+	): boolean {
+		if (options.manual || !config.autoContinue) return false;
+		reconcileCooldownsFromUsage(ctx);
+		pruneCooldowns();
+		if (!isCurrentModelReady(ctx)) return false;
+		const target = ref(failedModel.provider, failedModel.id);
+		currentPromptSwitch = {
+			from: target,
+			to: target,
+			reason: `${reason} (same account recovered)`,
+			at: Date.now(),
+		};
+		return true;
 	}
 
 	function isCurrentModelReady(ctx: any) {
@@ -4463,11 +4496,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (command === "next") {
 			if (ctx.model) {
 				currentPromptSwitch = undefined;
+				// Manual rotation is a user override, NOT a rate-limit event: cooling the account
+				// we're leaving (the old 5-minute cooldown) drained the pool — after one lap every
+				// provider was "cooling" and the round-robin collapsed onto whatever was left. Pass
+				// 0 so we only record lastLeftProvider (anti-ping-pong) and keep every account
+				// selectable, so repeated /multi-account next truly cycles through them all.
 				await switchToFallback(
 					ctx,
 					ctx.model,
 					"manual /multi-account next",
-					5 * 60 * 1000,
+					0,
 					{ manual: true },
 				);
 				currentPromptSwitch = undefined;

@@ -1289,6 +1289,90 @@ test("manual next cycles through every account instead of ping-ponging between t
 	);
 });
 
+test("manual next never downgrades to a weaker model of the same account (no mini flap)", async () => {
+	// Real report: on gpt-5.4 with gpt-5.5 momentarily unavailable, repeated /multi-account next
+	// flapped gpt-5.4 ↔ gpt-5.4-mini. HARD RULE: failover switches the ACCOUNT, never demotes the
+	// model. With only one account whose flagship is unavailable, next must NOT drop to a weaker
+	// model — it holds the current model and reports that there is nothing better to move to.
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.4" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			// The flagship gpt-5.5 is individually unavailable for a while; only weaker models
+			// (gpt-5.4-mini, spark) are "free" — exactly the trap that produced the flap.
+			exhaustedUntilByModel: {
+				"openai-codex-account-2/gpt-5.5": now + 2 * 60 * 60 * 1000,
+			},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	for (let i = 0; i < 5; i++) await t.command("next");
+	assert.ok(
+		t.rec.setModels.every((m) => !/mini|spark/.test(m)),
+		`next must never select a weaker model; setModels=${t.rec.setModels.join(",")}`,
+	);
+	assert.equal(
+		t.ctx.model.id,
+		"gpt-5.4",
+		"the model must stay put rather than be auto-downgraded",
+	);
+});
+
+test("manual next keeps every account selectable and always at its flagship model", async () => {
+	// Real report: after pressing /multi-account next enough times, only openai stayed in the
+	// queue. Cause: manual next cooled the account it left for 5 min, so after one lap every
+	// account was "cooling" and the rotation collapsed. Manual rotation is a user override, not a
+	// rate-limit event, so it must NOT record a cooldown — every account stays selectable.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"anthropic-account-2": { type: "oauth", access: "a2", refresh: "a2r" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "b",
+				refresh: "br",
+				accountId: "b",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+	});
+	await t.fire("session_start");
+	const seen: string[] = [];
+	for (let i = 0; i < 6; i++) {
+		await t.command("next");
+		seen.push(`${t.ctx.model.provider}/${t.ctx.model.id}`);
+	}
+	const live = Object.entries(
+		t.readState().exhaustedUntilByProvider ?? {},
+	).filter(([, until]) => (until as number) > Date.now());
+	assert.equal(
+		live.length,
+		0,
+		`manual next must not cool the account it leaves; live cooldowns=${JSON.stringify(live)}`,
+	);
+	assert.ok(
+		new Set(seen.map((s) => s.split("/")[0])).size >= 3,
+		`next must keep cycling through every account; visited=${seen.join(",")}`,
+	);
+	assert.ok(
+		seen.every((s) => s.endsWith("/gpt-5.5") || s.endsWith("/claude-opus-4-8")),
+		`every account must be offered at its flagship model; visited=${seen.join(",")}`,
+	);
+});
+
 test("resume fires on whichever account recovers first, not rotation order", async () => {
 	const accounts: Account = {
 		anthropic: { type: "oauth", access: "a", refresh: "ar" },

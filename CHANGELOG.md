@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.8] - 2026-07-06
+
+### Fixed
+
+- **Failover never silently downgrades the model, and `/multi-account next` cycles
+  through every account.** Two related bugs made the rotation misbehave:
+  - **Model flap / silent downgrade.** Each account was expanded into *one candidate per
+    model* it exposes (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, …). So a failover could drop
+    to a weaker model of the *same* account, and repeated `/multi-account next` ping-ponged
+    e.g. `gpt-5.4 ↔ gpt-5.4-mini`. Now each account contributes exactly **one candidate —
+    its newest/flagship model**. The model is only ever demoted when the flagship is
+    *individually* unavailable (a genuine "model unavailable" error), never to dodge a
+    provider-level usage limit and never to fill the rotation. The most powerful model of
+    every provider is always the one offered. A single-account session whose flagship is
+    unavailable now holds its model and reports "nothing better to move to" instead of
+    flapping down to a mini model.
+  - **Rotation collapsed onto one provider.** Manual `/multi-account next` recorded a
+    **5-minute cooldown on the account it left**. After one lap every account was "cooling"
+    and the round-robin collapsed onto whatever remained (typically the one openai slot).
+    Manual rotation is a user override, not a rate-limit event, so it no longer records any
+    cooldown — every account stays selectable and repeated `next` truly cycles through all
+    of them.
+  - As a consequence of one-candidate-per-account, the "same account just recovered → resume
+    on it" path now also covers the empty-candidate case, so a single-account session still
+    resumes immediately when fresh usage shows its cooldown was over-estimated (it no longer
+    depended on a weaker sibling model being in the queue).
+
 ## [1.13.7] - 2026-07-04
 
 ### Fixed
