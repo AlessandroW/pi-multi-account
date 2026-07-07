@@ -907,6 +907,34 @@ test("a temporary forced-refresh failure cools the slot without permanently inva
 	assert.deepEqual(t.rec.setModels, ["openai-codex-account-4/gpt-5.5"]);
 });
 
+test("Qwen shows live availability / rate-limit status (it has no quota API)", async () => {
+	// Alibaba publishes no usage/quota endpoint, so instead of a useless "no usage endpoint" the
+	// status must show the account's real live state: available now, or rate-limited until recovery.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			alibaba: { type: "api_key", key: "sk-qwen" },
+		},
+		current: { provider: "alibaba", id: "qwen3.7-max" },
+	});
+	await t.fire("session_start");
+	await t.command("status");
+	assert.ok(
+		t.rec.notifies.some((m) => m.includes("Qwen/Alibaba | available")),
+		`available before any limit; notifies=${t.rec.notifies.join(" | ")}`,
+	);
+
+	// A caught 429 cools alibaba → its status must now read rate-limited, not "available".
+	await finishError(t, "alibaba", "qwen3.7-max", "usage limit reached");
+	t.setCurrent("alibaba", "qwen3.7-max");
+	t.rec.notifies.length = 0;
+	await t.command("status");
+	assert.ok(
+		t.rec.notifies.some((m) => /Qwen\/Alibaba \| rate-limited/.test(m)),
+		`rate-limited after a 429; notifies=${t.rec.notifies.join(" | ")}`,
+	);
+});
+
 test("Qwen requests rewrite the OpenAI-only 'developer' role to 'system'", async () => {
 	// Real report: with a WORKING alibaba key, turns routed to Qwen failed with
 	// `400 invalid_parameter_error: developer is not one of ['system',...]`. Pi sends the system

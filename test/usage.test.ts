@@ -6,6 +6,7 @@ import {
 	parseAnthropicUsageBody,
 	parseCodexUsageBody,
 	parseCodexUsageHeaders,
+	parseOllamaMeBody,
 } from "../usage.ts";
 
 const NOW = Date.UTC(2026, 5, 13, 12, 0, 0);
@@ -37,6 +38,37 @@ test("parses Codex 5h and weekly usage response", () => {
 	assert.equal(snapshot.primary?.usedPercent, 100);
 	assert.equal(snapshot.secondary?.usedPercent, 58);
 	assert.equal(formatUsageCompact(snapshot, NOW), "Codex A2 | 5h 0% left/1h | 7d 42% left/2d");
+});
+
+test("Ollama /api/me surfaces plan tier, renewal date, and suspended status", () => {
+	// Ollama exposes no token counters, but /api/me carries the plan, billing-period end, and a
+	// suspended flag — fold them into the plan line so the footer shows something real.
+	const active = parseOllamaMeBody(
+		"ollama",
+		{
+			Plan: "pro",
+			SubscriptionPeriodEnd: { Time: "2026-07-16T06:31:51Z", Valid: true },
+			SuspendedAt: { Time: null, Valid: false },
+		},
+		NOW,
+		"cred",
+	);
+	assert.equal(active.plan, "pro · renews 2026-07-16");
+	assert.equal(
+		formatUsageCompact(active, NOW),
+		"Ollama | pro · renews 2026-07-16 · no session/weekly API",
+	);
+
+	const suspended = parseOllamaMeBody(
+		"ollama",
+		{ Plan: "pro", SuspendedAt: { Time: "2026-07-01T00:00:00Z", Valid: true } },
+		NOW,
+		"cred",
+	);
+	assert.ok(
+		suspended.plan?.includes("SUSPENDED"),
+		`suspended plan should flag it, got ${suspended.plan}`,
+	);
 });
 
 test("parses case-insensitive Codex response headers", () => {

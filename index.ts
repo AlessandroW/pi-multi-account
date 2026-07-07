@@ -53,6 +53,7 @@ import {
 	formatUsageCompact,
 	formatUsageDetails,
 	parseCodexUsageHeaders,
+	providerUsageLabel,
 	usageColor,
 	usageFamily,
 	UsageFetchError,
@@ -255,7 +256,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.12";
+const VERSION = "1.13.13";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -2158,6 +2159,26 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return config.usageRefreshMs;
 	}
 
+	// Qwen/Alibaba publishes NO live quota endpoint (verified: every usage/billing path 404s and no
+	// rate-limit headers come back), so a real "% left" is impossible. The honest, useful thing to
+	// show instead is the account's live operational state from OUR OWN tracking: available now,
+	// rate-limited until a known time (recorded from a caught 429), or needs re-login.
+	function qwenLiveStatus(provider: string): string {
+		if (isInvalidated(provider))
+			return "needs re-login (/login → subscription → alibaba)";
+		const now = Date.now();
+		const until = providerRecoveryAt(provider, now);
+		if (until > now) return `rate-limited · retry in ${formatDelay(until - now)}`;
+		return "available · Alibaba exposes no quota API";
+	}
+
+	// For display only: Qwen carries no usage windows, so swap its plan text for the live status.
+	function displayUsageSnapshot(snapshot: UsageSnapshot): UsageSnapshot {
+		return snapshot.family === "qwen"
+			? { ...snapshot, plan: qwenLiveStatus(snapshot.provider) }
+			: snapshot;
+	}
+
 	function updateUsageStatus(ctx: any, provider = ctx?.model?.provider) {
 		if (typeof ctx?.ui?.setStatus !== "function") return;
 		// Footer rendering touches host UI + formatting helpers; never let a render hiccup
@@ -2167,13 +2188,32 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				ctx.ui.setStatus("multi-account-quota", undefined);
 				return;
 			}
-			const snapshot = cachedUsage(provider);
+			// Qwen may have no cached snapshot (nothing to fetch) — synthesize a bare one so its live
+			// availability/rate-limit status still shows in the footer instead of nothing.
+			const snapshot =
+				cachedUsage(provider) ??
+				(usageFamily(provider) === "qwen"
+					? {
+							provider,
+							family: "qwen" as const,
+							fetchedAt: Date.now(),
+							plan: "",
+						}
+					: undefined);
 			if (!snapshot) {
 				ctx.ui.setStatus("multi-account-quota", undefined);
 				return;
 			}
-			const text = formatUsageCompact(snapshot);
-			const color = usageColor(snapshot);
+			const display = displayUsageSnapshot(snapshot);
+			const text = formatUsageCompact(display);
+			const color =
+				snapshot.family === "qwen"
+					? isInvalidated(provider)
+						? "error"
+						: providerRecoveryAt(provider) > Date.now()
+							? "warning"
+							: "success"
+					: usageColor(display);
 			ctx.ui.setStatus(
 				"multi-account-quota",
 				ctx.ui.theme?.fg ? ctx.ui.theme.fg(color, text) : text,
@@ -4552,7 +4592,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(
-				`${formatUsageDetails(snapshot)}${warning ? `\nRefresh warning: ${warning}` : ""}`,
+				`${formatUsageDetails(displayUsageSnapshot(snapshot))}${warning ? `\nRefresh warning: ${warning}` : ""}`,
 				warning ? "warning" : "info",
 			);
 			return;
@@ -4700,7 +4740,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			[
 				`pi-multi-account v${VERSION}: ${config.enabled ? "enabled" : "disabled"}${config.autoDiscover ? " · auto-discover ON" : " · auto-discover OFF"}`,
 				`Current: ${current}`,
-				`Current limits: ${currentUsage ? formatUsageCompact(currentUsage) : "not loaded"}`,
+				`Current limits: ${
+					currentUsage
+						? formatUsageCompact(displayUsageSnapshot(currentUsage))
+						: ctx.model && usageFamily(ctx.model.provider) === "qwen"
+							? `${providerUsageLabel(ctx.model.provider)} | ${qwenLiveStatus(ctx.model.provider)}`
+							: "not loaded"
+				}`,
 				`Rotation (${rotation.length}): ${rotation.join(" → ") || "none — log in to an account"}`,
 				`Duplicate slots skipped: ${duplicateSlots.length ? duplicateSlots.map(({ duplicate, primary }) => `${duplicate} = ${primary}`).join(", ") : "none"}`,
 				`Registered login slots: ${[...registeredSlots].join(", ") || "(base accounts only)"}`,

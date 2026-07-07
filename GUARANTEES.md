@@ -1,7 +1,7 @@
 # What "working" means — and what locks it
 
 This file is the contract. Each row is a promise the extension makes, written in plain language,
-next to the automated test that will FAIL the moment that promise breaks. `pnpm test` (95 tests)
+next to the automated test that will FAIL the moment that promise breaks. `pnpm test` (101 tests)
 runs them all; CI blocks any change that violates a promise. If you hit a behaviour that feels
 broken and it is **not** on this list, that is a missing guarantee — it should become a new row +
 test, not a one-off patch.
@@ -25,6 +25,7 @@ test, not a one-off patch.
 | 13 | **A stuck/silent resumed turn self-heals** — the watchdog cancels it and re-arms resume, but never interrupts a running build/test. | `a silent resumed turn is AUTO-cancelled and auto-resume armed ...` · `the watchdog never aborts a resumed turn while a tool (build/test) is running` |
 | 14 | **Repeated failures open a breaker** and drop to manual mode instead of looping forever. | `after repeated resume failures the breaker opens and auto-continue stops (advisory mode)` |
 | 15 | **Each provider gets requests in a shape it accepts.** Qwen/Alibaba never receives the OpenAI-only `developer` role (it is rewritten to `system`); OpenAI/Codex keeps it. | `Qwen requests rewrite the OpenAI-only 'developer' role to 'system'` |
+| 16 | **Every provider shows the most useful status it can.** Qwen (no quota API) shows live available / rate-limited / needs-login; Ollama shows plan + renewal date + suspended; Codex/Claude show real % windows. | `Qwen shows live availability / rate-limit status (it has no quota API)` · `Ollama /api/me surfaces plan tier, renewal date, and suspended status` |
 
 ## How to keep this honest
 

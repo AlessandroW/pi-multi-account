@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.13] - 2026-07-07
+
+### Added
+
+- **Qwen/Alibaba now shows a live status instead of "no usage endpoint".** Alibaba publishes no
+  usage/quota API (verified: every usage/billing path 404s and no rate-limit headers come back),
+  so a real "% left" is impossible. Instead the footer and `/multi-account status` now show the
+  account's real operational state from our own tracking: `available`, `rate-limited · retry in
+  <time>` (from a caught 429), or `needs re-login` — colour-coded green/yellow/red.
+- **Ollama status now includes the plan tier, renewal date, and suspended flag.** `/api/me`
+  carries `Plan`, `SubscriptionPeriodEnd`, and `SuspendedAt`; these are surfaced (e.g. `Ollama |
+  pro · renews 2026-07-16`). Ollama still exposes no session/weekly token counters, so those
+  remain unavailable — that limit is Ollama's, not ours.
+
 ## [1.13.12] - 2026-07-07
 
 ### Fixed

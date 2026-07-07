@@ -192,12 +192,30 @@ export function parseOllamaMeBody(
 	credentialHash?: string,
 ): UsageSnapshot {
 	const source = record(body);
-	const plan =
+	const planName =
 		typeof source.Plan === "string"
 			? source.Plan
 			: typeof source.plan === "string"
 				? source.plan
 				: undefined;
+	// Ollama's /api/me exposes NO session/weekly token counters, but it DOES carry the plan tier,
+	// the billing-period end (when the monthly allowance renews) and a suspended flag — all worth
+	// surfacing. Fold them into the plan string since UsageSnapshot has no dedicated field.
+	const nullableTime = (value: unknown): string | undefined => {
+		if (!value || typeof value !== "object") return undefined;
+		const v = value as { Time?: unknown; Valid?: unknown };
+		return v.Valid === true && typeof v.Time === "string" ? v.Time : undefined;
+	};
+	const planParts: string[] = [];
+	if (planName) planParts.push(planName);
+	if (nullableTime(source.SuspendedAt)) planParts.push("SUSPENDED");
+	const periodEnd = nullableTime(source.SubscriptionPeriodEnd);
+	if (periodEnd) {
+		const d = new Date(periodEnd);
+		if (!Number.isNaN(d.getTime()))
+			planParts.push(`renews ${d.toISOString().slice(0, 10)}`);
+	}
+	const plan = planParts.length > 0 ? planParts.join(" · ") : planName;
 	const sessionSource =
 		source.session ??
 		source.Session ??
