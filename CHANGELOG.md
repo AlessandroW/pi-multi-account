@@ -5,6 +5,44 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.9] - 2026-07-07
+
+### Fixed
+
+- **Failover now actually resumes on hosts without `pi.continueAgent()` — no more dead-end
+  "Update @earendil-works/pi-coding-agent" error.** The seamless in-place resume relies on
+  `pi.continueAgent()`, but the shipped runtime (`@earendil-works/pi-coding-agent` 0.80.3) does
+  not expose it to extensions. The old code detected the missing method and gave up with a red
+  error, so after every provider switch the turn stalled and the user had to reload by hand — the
+  switch happened but the work never continued. It now degrades gracefully: when `continueAgent`
+  is unavailable it injects the continuation prompt as a fresh user turn (the same fallback already
+  used when the transcript tail is a completed assistant message), so the session keeps moving by
+  itself on the account it just switched to. Factored the injection into one `injectContinuationPrompt`
+  helper shared by both paths.
+- **Genuinely spent monthly Codex accounts are benched for their REAL reset, so rotation advances
+  to Qwen/Ollama instead of ping-ponging between exhausted Codex slots.** `providerRecoveryAt` now
+  treats fresh usage-endpoint data as authoritative ground truth in BOTH directions: a maxed
+  long/rolling window (e.g. a free-tier Codex monthly limit at 100%) reports a real far-out reset,
+  and we trust it rather than letting the 6h re-probe cap keep un-benching the account every 6h.
+  That cap kept exhausted accounts looking "available soon", so auto-failover cycled
+  `account-3 ↔ account-4` forever and never reached a healthy Alibaba/Ollama account. The 6h clamp
+  still guards *error-text* estimates (`markExhausted` / `pruneCooldowns`); only the recovery time
+  computed for selection from live usage is affected.
+- **Startup host-capability preflight — the recurring "pi changed its API from under us" class is
+  now caught loudly at load instead of weeks later under fire.** Every session start probes the REAL
+  `pi` object for the methods failover depends on (`setModel`, `sendUserMessage`, `continueAgent`,
+  `registerProvider`, …), records them in the debug log (`host_capabilities`, dated, with the running
+  version), and — once per process — tells the user in plain terms if switching is impossible
+  (`setModel` gone → error), if auto-continue is impossible (neither resume method → warning), or if
+  only the seamless path is missing (continueAgent gone → info: failover still works via injection).
+  Unit tests mock `pi` and always implement every method, so they can NEVER catch this drift; the
+  preflight is what turns a silent boundary regression into an immediate, self-diagnosing message.
+- Regression tests added (fail on the old code, pass on the new): a host with no `pi.continueAgent`
+  still auto-continues via prompt injection; a session whose two Codex accounts are both at 100%
+  monthly fails over to the healthy Qwen account instead of ping-ponging; and the preflight flags a
+  continueAgent-less host as an expected fallback, warns when no resume path exists, and stays silent
+  on a fully-capable host.
+
 ## [1.13.8] - 2026-07-06
 
 ### Fixed

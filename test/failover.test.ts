@@ -90,6 +90,8 @@ function setup(opts: {
 	};
 	continueThrows?: string;
 	continueBlocks?: () => Promise<void>;
+	omitContinueAgent?: boolean;
+	omitSendUserMessage?: boolean;
 }) {
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
@@ -225,6 +227,13 @@ function setup(opts: {
 		getThinkingLevel: () => "high",
 		setThinkingLevel: () => {},
 	};
+
+	// Simulate a host Pi build that predates pi.continueAgent() (seamless in-place resume). The
+	// extension must degrade to injecting the continuation prompt, never dead-end with a red error.
+	if (opts.omitContinueAgent) delete pi.continueAgent;
+	// Simulate a host with no prompt-injection fallback either — the worst case, where the extension
+	// can still switch accounts but cannot auto-continue at all.
+	if (opts.omitSendUserMessage) delete pi.sendUserMessage;
 
 	piMultiAccount(pi);
 
@@ -2077,6 +2086,152 @@ test("an un-continuable resume (e.g. tail aborted by the watchdog) recovers by i
 		t.rec.sent.length,
 		1,
 		"it falls back to injecting the continuation prompt so the work keeps moving by itself",
+	);
+});
+
+test("host build WITHOUT pi.continueAgent still auto-resumes the failover (inject continuation prompt) instead of dead-ending with a red 'Update @earendil-works/pi-coding-agent' error", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		omitContinueAgent: true,
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	// The account switch itself still happens.
+	assert.deepEqual(t.rec.setModels, ["openai-codex-account-2/gpt-5.5"]);
+	// There is no pi.continueAgent to call on this host build...
+	assert.equal(
+		t.rec.continueCalls.length,
+		0,
+		"there is no continueAgent on this host build",
+	);
+	// ...so the extension MUST degrade to injecting the continuation prompt so the work resumes by
+	// itself on the new account — the exact scenario the user hit (repeated reloads that never continued).
+	assert.equal(
+		t.rec.sent.length,
+		1,
+		"it injects the continuation prompt so the session keeps moving without a manual reload",
+	);
+	assert.ok(
+		!t.rec.notifies.some((n) => /requires pi\.continueAgent/i.test(n)),
+		"the old dead-end 'seamless resume requires pi.continueAgent()' error must be gone",
+	);
+});
+
+test("a genuinely maxed monthly Codex account is benched for its REAL reset, so failover advances to a healthy Qwen/Alibaba account instead of ping-ponging between spent Codex slots", async () => {
+	const now = Date.now();
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "c2",
+			refresh: "r2",
+			accountId: "codex-2",
+		},
+		"openai-codex-account-3": {
+			type: "oauth",
+			access: "c3",
+			refresh: "r3",
+			accountId: "codex-3",
+		},
+		alibaba: { type: "api_key", key: "qwen-key" },
+	};
+	// Both Codex accounts report their PRIMARY (monthly, 30-day) window at 100% with a far-out reset —
+	// authoritative "spent" straight from the account's own usage endpoint. The 6h re-probe cap used
+	// to keep un-benching them every 6h, so auto-failover ping-ponged account-2 ↔ account-3 forever
+	// and NEVER advanced to the healthy Qwen account. It must now bench them for the real reset.
+	const monthly = {
+		usedPercent: 100,
+		resetAt: now + 30 * 24 * 60 * 60 * 1000,
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-2": {
+					provider: "openai-codex-account-2",
+					family: "codex",
+					fetchedAt: now,
+					primary: monthly,
+				},
+				"openai-codex-account-3": {
+					provider: "openai-codex-account-3",
+					family: "codex",
+					fetchedAt: now,
+					primary: monthly,
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"usage limit has been reached",
+	);
+	assert.ok(
+		t.rec.setModels.some((m) => m.startsWith("alibaba/")),
+		`should fail over to the healthy Qwen/Alibaba account, got ${JSON.stringify(t.rec.setModels)}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-3/")),
+		"must NOT ping-pong onto the equally-spent Codex account-3",
+	);
+});
+
+test("startup capability preflight: a host missing pi.continueAgent is flagged ONCE as an expected fallback (info), not a scary error", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		omitContinueAgent: true,
+	});
+	await t.fire("session_start");
+	assert.ok(
+		t.rec.notifies.some((n) =>
+			/seamless in-place resume .*not available/i.test(n),
+		),
+		"it states seamless resume is unavailable but failover still switches + auto-continues",
+	);
+	assert.ok(
+		!t.rec.notifies.some((n) =>
+			/IMPOSSIBLE|cannot auto-continue|does not expose pi\.setModel/i.test(n),
+		),
+		"switching and the injection fallback both work, so no error/warning is raised",
+	);
+});
+
+test("startup capability preflight: a host missing BOTH continueAgent and sendUserMessage warns up front that auto-continue is impossible", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		omitContinueAgent: true,
+		omitSendUserMessage: true,
+	});
+	await t.fire("session_start");
+	assert.ok(
+		t.rec.notifies.some((n) =>
+			/neither pi\.continueAgent.*nor pi\.sendUserMessage|cannot auto-continue/i.test(
+				n,
+			),
+		),
+		"the user is warned up front they must re-send the prompt after a switch on this host",
+	);
+});
+
+test("startup capability preflight: a fully-capable host raises NO capability notice (only the normal 'loaded' line)", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	assert.ok(
+		!t.rec.notifies.some((n) =>
+			/seamless in-place resume|IMPOSSIBLE|neither pi\.continueAgent|does not expose pi\.setModel/i.test(
+				n,
+			),
+		),
+		"nothing is degraded on a normal host, so no capability warning appears",
 	);
 });
 

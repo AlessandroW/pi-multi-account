@@ -243,7 +243,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.8";
+const VERSION = "1.13.9";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -1789,6 +1789,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// Discovered, authed, deduped provider ids in rotation order.
 	let rotation: string[] = [];
 	let duplicateSlots: Array<{ duplicate: string; primary: string }> = [];
+	// Whether the one-time host-capability notice has already been shown this process.
+	let preflightNotified = false;
 	// Slot ids registered as targets in the interactive /login provider picker.
 	const registeredSlots = new Set<string>();
 	let lastAuthMtime = -1;
@@ -2361,7 +2363,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (cached && now - cached.fetchedAt < usageCacheTtl(provider)) {
 			const usageMs = cooldownMsFromUsage(cached, now);
 			if (usageMs === 0) return now;
-			if (usageMs !== undefined) at = Math.min(at, now + usageMs);
+			// Fresh usage from the account's OWN endpoint is authoritative ground truth — in BOTH
+			// directions. A maxed long/rolling window (e.g. a free-tier Codex monthly limit sitting at
+			// 100%) reports a real, far-out reset. Trust it and bench the account for real instead of
+			// letting the 6h re-probe cap keep un-benching a genuinely spent account every 6h — that
+			// cap kept exhausted Codex slots looking "available soon", so the rotation ping-ponged
+			// between them (account-3 ↔ account-4) and never advanced to a healthy Qwen/Ollama account.
+			// The 6h clamp still guards *error-text* estimates (markExhausted / pruneCooldowns); this
+			// only affects the recovery time we COMPUTE for selection, and only from live usage data.
+			if (usageMs !== undefined) return now + usageMs;
 		}
 		return at;
 	}
@@ -3510,6 +3520,47 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
+	// Graceful degradation when a seamless in-place resume is not possible — either the host build
+	// predates pi.continueAgent(), or the transcript tail is a completed assistant message that
+	// continueAgent() cannot pick up. Inject the continuation prompt as a fresh USER turn so the
+	// session keeps moving on the account we just switched to, WITHOUT the user re-typing anything.
+	// Bounded by maxAutoContinuesPerPrompt. Returns true when it started a continuation turn.
+	function injectContinuationPrompt(ctx: any): boolean {
+		if (
+			!currentPromptSwitch ||
+			!config.autoContinue ||
+			userAbortedChain ||
+			ctx.signal?.aborted ||
+			autoContinuesThisPrompt >= config.maxAutoContinuesPerPrompt ||
+			typeof pi.sendUserMessage !== "function"
+		)
+			return false;
+		const to =
+			currentPromptSwitch.to ??
+			(ctx.model
+				? ref(ctx.model.provider, ctx.model.id)
+				: "the active account");
+		const prompt = config.continuationPrompt
+			.replaceAll(
+				"{from}",
+				String(currentPromptSwitch.from ?? "the previous account"),
+			)
+			.replaceAll("{to}", String(to))
+			.replaceAll(
+				"{reason}",
+				currentPromptSwitch.reason ?? "provider failover",
+			);
+		try {
+			expectingInjectedContinuation = true;
+			pi.sendUserMessage(prompt);
+			autoContinuesThisPrompt++;
+			return true;
+		} catch {
+			expectingInjectedContinuation = false;
+			return false;
+		}
+	}
+
 	async function resumeWithExistingContext(ctx: any): Promise<boolean> {
 		if (userAbortedChain || ctx.signal?.aborted) return false;
 		const continueAgent = (
@@ -3520,9 +3571,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 		).continueAgent;
 		if (typeof continueAgent !== "function") {
+			// Host build predates pi.continueAgent() (seamless in-place resume was added in a later
+			// @earendil-works/pi-coding-agent). Do NOT dead-end the failover with a red error that
+			// leaves the user reloading by hand: fall back to injecting the continuation prompt so the
+			// work resumes by itself on the account we just switched to.
+			if (injectContinuationPrompt(ctx)) return true;
 			ctx.ui.notify(
-				"Provider failover: seamless resume requires pi.continueAgent(). Update @earendil-works/pi-coding-agent.",
-				"error",
+				"Provider failover: switched account, but this Pi build cannot auto-resume the turn (needs pi.continueAgent, or the previous turn to be idle). Send your message to continue on the new account.",
+				"warning",
 			);
 			return false;
 		}
@@ -3582,39 +3638,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// continuation prompt as a user message instead. That always starts a turn, so the
 				// session keeps moving by itself (this is how auto-recovery after a watchdog abort
 				// continues without the user re-typing anything). Bounded by maxAutoContinuesPerPrompt.
-				if (
-					currentPromptSwitch &&
-					config.autoContinue &&
-					!userAbortedChain &&
-					!ctx.signal?.aborted &&
-					autoContinuesThisPrompt < config.maxAutoContinuesPerPrompt &&
-					typeof pi.sendUserMessage === "function"
-				) {
-					const to =
-						currentPromptSwitch.to ??
-						(ctx.model
-							? ref(ctx.model.provider, ctx.model.id)
-							: "the active account");
-					const prompt = config.continuationPrompt
-						.replaceAll(
-							"{from}",
-							String(currentPromptSwitch.from ?? "the previous account"),
-						)
-						.replaceAll("{to}", String(to))
-						.replaceAll(
-							"{reason}",
-							currentPromptSwitch.reason ?? "provider failover",
-						);
-					try {
-						expectingInjectedContinuation = true;
-						pi.sendUserMessage(prompt);
-						autoContinuesThisPrompt++;
-						return true;
-					} catch {
-						expectingInjectedContinuation = false;
-						/* fall through to give up cleanly */
-					}
-				}
+				if (injectContinuationPrompt(ctx)) return true;
 				// Nothing to continue (spurious) or injection unavailable — drop stale state quietly.
 				currentPromptSwitch = undefined;
 				clearPendingContinuation();
@@ -4664,7 +4688,60 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	refreshDiscovery(true);
 
+	// Runtime capability preflight. The RECURRING class of breakage in this extension is the
+	// pi↔extension BOUNDARY drifting: a host method the failover depends on gets renamed or removed
+	// (e.g. pi.continueAgent() vanished in @earendil-works/pi-coding-agent 0.80.3), and the failure
+	// only surfaces weeks later as a cryptic error the instant a real limit hits. Unit tests can
+	// never catch this — they mock `pi` and always implement every method. So we probe the REAL host
+	// object at every session start: record which capabilities are present (dated, in the debug log
+	// for instant diagnosis) and, ONCE per process, tell the user in plain terms if switching is
+	// impossible or resume is degraded — instead of letting them discover it under fire.
+	function preflightHostCapabilities(ctx: any) {
+		const has = (name: string) =>
+			typeof (pi as unknown as Record<string, unknown>)[name] === "function";
+		const caps = {
+			setModel: has("setModel"), // switch accounts at all
+			registerProvider: has("registerProvider"), // register extra account slots
+			sendUserMessage: has("sendUserMessage"), // fallback resume (inject prompt)
+			continueAgent: has("continueAgent"), // seamless in-place resume
+			on: has("on"),
+			registerCommand: has("registerCommand"),
+		};
+		const canSwitch = caps.setModel;
+		const canResume = caps.continueAgent || caps.sendUserMessage;
+		const seamlessResume = caps.continueAgent;
+		logEvent("host_capabilities", {
+			version: VERSION,
+			...caps,
+			canSwitch,
+			canResume,
+			seamlessResume,
+		});
+		// One notice per process — informative, never nagging on every session.
+		if (!preflightNotified) {
+			preflightNotified = true;
+			if (!canSwitch) {
+				ctx.ui?.notify?.(
+					`pi-multi-account v${VERSION}: this Pi build does not expose pi.setModel() — automatic account switching is IMPOSSIBLE on this host, so failover cannot work until it is restored. Check your @earendil-works/pi-coding-agent version.`,
+					"error",
+				);
+			} else if (!canResume) {
+				ctx.ui?.notify?.(
+					`pi-multi-account v${VERSION}: this Pi build exposes neither pi.continueAgent() nor pi.sendUserMessage() — after a switch the task cannot auto-continue; you will have to re-send your prompt on the new account.`,
+					"warning",
+				);
+			} else if (!seamlessResume) {
+				ctx.ui?.notify?.(
+					`pi-multi-account v${VERSION}: seamless in-place resume (pi.continueAgent) is not available on this Pi build — failover WILL still switch accounts and auto-continue by re-injecting your task as a fresh turn. This is the expected fallback, not an error.`,
+					"info",
+				);
+			}
+		}
+		return { canSwitch, canResume, seamlessResume };
+	}
+
 	safeOn("session_start", async (_event, ctx) => {
+		preflightHostCapabilities(ctx);
 		refreshDiscovery(true, ctx);
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
 		pruneCooldowns();
