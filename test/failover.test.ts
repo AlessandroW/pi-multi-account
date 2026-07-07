@@ -2110,6 +2110,14 @@ test("host build WITHOUT pi.continueAgent still auto-resumes the failover (injec
 		1,
 		"it injects the continuation prompt so the session keeps moving without a manual reload",
 	);
+	// The injection MUST carry deliverAs:"followUp" — without it the host throws "Agent is already
+	// processing. Specify streamingBehavior..." when the previous turn is still streaming, which is
+	// exactly the race that fires right after a failover switch, and the continuation is silently lost.
+	assert.equal(
+		t.rec.sent[0].options?.deliverAs,
+		"followUp",
+		"the continuation must queue as a follow-up so it isn't rejected while the turn is still streaming",
+	);
 	assert.ok(
 		!t.rec.notifies.some((n) => /requires pi\.continueAgent/i.test(n)),
 		"the old dead-end 'seamless resume requires pi.continueAgent()' error must be gone",
@@ -2180,6 +2188,66 @@ test("a genuinely maxed monthly Codex account is benched for its REAL reset, so 
 	assert.ok(
 		!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-3/")),
 		"must NOT ping-pong onto the equally-spent Codex account-3",
+	);
+});
+
+test("a spent account known ONLY from a STALE usage snapshot (100%, no recorded cooldown, never threw an error) is still benched — failover does not land on it", async () => {
+	const now = Date.now();
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "c2",
+			refresh: "r2",
+			accountId: "codex-2",
+		},
+		"openai-codex-account-3": {
+			type: "oauth",
+			access: "c3",
+			refresh: "r3",
+			accountId: "codex-3",
+		},
+		alibaba: { type: "api_key", key: "qwen-key" },
+	};
+	// account-3 is genuinely maxed (primary 100%, reset 14 days out) but its usage snapshot is an
+	// HOUR OLD and it has NO recorded cooldown — exactly the state that made real failover land on a
+	// dead account: at the instant account-2 errored, account-3 looked "available". A maxed 30-day
+	// window cannot have recovered in an hour, so the snapshot is authoritative regardless of age.
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {}, // <- account-3 has NO cooldown recorded
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-3": {
+					provider: "openai-codex-account-3",
+					family: "codex",
+					fetchedAt: now - 60 * 60 * 1000, // STALE (an hour old)
+					primary: {
+						usedPercent: 100,
+						resetAt: now + 14 * 24 * 60 * 60 * 1000,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"usage limit has been reached",
+	);
+	assert.ok(
+		t.rec.setModels.some((m) => m.startsWith("alibaba/")),
+		`must fail over to the live Qwen account, got ${JSON.stringify(t.rec.setModels)}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-3/")),
+		"must NOT land on account-3 whose stale usage already proves it is spent",
 	);
 });
 

@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.10] - 2026-07-07
+
+### Fixed
+
+- **Auto-continue after a switch no longer silently dies with "Agent is already processing".** The
+  continuation-prompt injection called `pi.sendUserMessage(prompt)` with no delivery option, so when
+  it fired while the previous turn was still streaming — exactly the race right after a failover
+  switch — the host rejected it with *"Agent is already processing. Specify streamingBehavior
+  ('steer' or 'followUp')"* and the continuation was lost. It now passes `{ deliverAs: "followUp" }`
+  (the extension-facing option the host maps to `streamingBehavior`), so the continuation is QUEUED
+  to run after the current turn settles. Locked with a test asserting the option is present.
+- **A genuinely-spent account is benched from its usage endpoint even if it never threw an error.**
+  Selection used to treat an account with no *recorded* cooldown as available, so right after one
+  account hit its limit, failover would hop to the next Codex slot that was *also* maxed (its 100%
+  state known only from usage, not from a cooldown) and burn a request there instead of jumping
+  straight to a live account. Two changes: `providerRecoveryAt` now trusts a hard block (a usage
+  window ≥100% with a future reset) as authoritative *regardless of snapshot age* — a maxed 30-day
+  window cannot recover in the minutes since the last probe — and `storeUsage` records the cooldown
+  proactively the moment any probe reports the block. "Available now" is still only trusted while the
+  snapshot is fresh, so a stale pre-limit reading can never clear a real cooldown early.
+- **A valid Qwen/Alibaba key is no longer misread as invalid (false 401 → wrongful eviction).** The
+  default Qwen endpoint was `token-plan.ap-southeast-1.maas.aliyuncs.com`, a promo "token plan"
+  endpoint that accepts the key on `/models` but returns `401 invalid_api_key` on `/chat/completions`
+  once the plan lapses — so a perfectly good key looked invalid and the account was dropped from
+  rotation ("worked yesterday, fails today"). Switched the default to the standard International
+  endpoint `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`, verified with a live request
+  returning 200 for the same key.
+
 ## [1.13.9] - 2026-07-07
 
 ### Fixed

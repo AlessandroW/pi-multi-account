@@ -243,7 +243,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.9";
+const VERSION = "1.13.10";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -1218,8 +1218,12 @@ function ollamaModelDef(id: string, providerId: string) {
 	return { ...def, provider: providerId, baseUrl: ollamaBaseUrlForModel(id) };
 }
 
-const QWEN_BASE_URL =
-	"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+// Alibaba Model Studio (Qwen), OpenAI-compatible International endpoint. The old default pointed at
+// a `token-plan.*.maas.aliyuncs.com` promo endpoint that ACCEPTS the key on /models but returns
+// 401 invalid_api_key on /chat/completions once the token plan lapses — so a perfectly valid Qwen
+// key looked "invalid" and the account was wrongly dropped from rotation. Verified with a live
+// request: the same key 200s on dashscope-intl for completions.
+const QWEN_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 	"qwen3.7-max": {
 		id: "qwen3.7-max",
@@ -2135,6 +2139,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function storeUsage(ctx: any, snapshot: UsageSnapshot) {
 		usageByProvider.set(snapshot.provider, snapshot);
 		usageErrors.delete(snapshot.provider);
+		// AUTHORITATIVE PROACTIVE BENCH. If the account's own usage endpoint reports a hard block (a
+		// window at >=100% with a future reset), record the cooldown NOW — even if the account never
+		// threw a limit error and had no prior cooldown. Without this, a known-spent account (a
+		// free-tier Codex slot maxed on its monthly window) stayed fully "available" for selection
+		// until it was actively tried and failed, so failover kept landing on dead accounts one after
+		// another instead of jumping straight to a live one. markExhausted caps the STORED value at the
+		// live ceiling and fans it out to sibling slots on the same account; providerRecoveryAt still
+		// reports the real reset from the live snapshot. Never benches an account with headroom
+		// (cooldownMsFromUsage returns 0 while the primary window is < 100%).
+		const blockMs = cooldownMsFromUsage(snapshot);
+		if (blockMs !== undefined && blockMs > 0) {
+			markExhausted(snapshot.provider, blockMs);
+		}
 		persist();
 		updateUsageStatus(ctx);
 	}
@@ -2360,18 +2377,21 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function providerRecoveryAt(provider: string, now = Date.now()): number {
 		let at = Math.max(now, exhaustedUntilByProvider.get(provider) ?? now);
 		const cached = usageByProvider.get(provider);
-		if (cached && now - cached.fetchedAt < usageCacheTtl(provider)) {
+		if (cached) {
+			const fresh = now - cached.fetchedAt < usageCacheTtl(provider);
 			const usageMs = cooldownMsFromUsage(cached, now);
-			if (usageMs === 0) return now;
-			// Fresh usage from the account's OWN endpoint is authoritative ground truth — in BOTH
-			// directions. A maxed long/rolling window (e.g. a free-tier Codex monthly limit sitting at
-			// 100%) reports a real, far-out reset. Trust it and bench the account for real instead of
-			// letting the 6h re-probe cap keep un-benching a genuinely spent account every 6h — that
-			// cap kept exhausted Codex slots looking "available soon", so the rotation ping-ponged
-			// between them (account-3 ↔ account-4) and never advanced to a healthy Qwen/Ollama account.
-			// The 6h clamp still guards *error-text* estimates (markExhausted / pruneCooldowns); this
-			// only affects the recovery time we COMPUTE for selection, and only from live usage data.
-			if (usageMs !== undefined) return now + usageMs;
+			// A HARD BLOCK — a usage window at >=100% whose reset is still in the future — is
+			// authoritative ground truth REGARDLESS of snapshot age: a maxed 30-day (or 5h) window
+			// cannot have "un-maxed" itself in the minutes since we last probed, and cooldownMsFromUsage
+			// already drops any window whose reset has passed. So we trust it even when stale. This is
+			// the fix for the real failure mode: a genuinely-spent account (e.g. a free-tier Codex slot
+			// maxed on its monthly window) that never threw an error yet and had no recorded cooldown
+			// was treated as "available" and selected as the failover target — so failover kept landing
+			// on dead accounts instead of advancing to a live Qwen/Ollama one.
+			if (usageMs !== undefined && usageMs > 0) return now + usageMs;
+			// "Available now" (usageMs === 0) is only trusted while FRESH — a stale pre-limit reading
+			// must never clear a real cooldown early.
+			if (fresh && usageMs === 0) return now;
 		}
 		return at;
 	}
@@ -3552,7 +3572,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 		try {
 			expectingInjectedContinuation = true;
-			pi.sendUserMessage(prompt);
+			// The host throws "Agent is already processing. Specify streamingBehavior ('steer' or
+			// 'followUp')" if we inject while the previous turn is still streaming (exactly the race
+			// that fires right after a failover switch). The extension-facing option is `deliverAs`
+			// (the host maps deliverAs → streamingBehavior internally — see the queued-input resume
+			// path below which already uses it). "followUp" QUEUES the continuation to run after the
+			// current turn settles instead of being rejected; the host ignores it when not streaming.
+			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 			autoContinuesThisPrompt++;
 			return true;
 		} catch {
