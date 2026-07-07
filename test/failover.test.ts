@@ -907,6 +907,56 @@ test("a temporary forced-refresh failure cools the slot without permanently inva
 	assert.deepEqual(t.rec.setModels, ["openai-codex-account-4/gpt-5.5"]);
 });
 
+test("usage footer survives an OAuth token rotation instead of blanking", async () => {
+	// Real report: the quota footer showed nothing for the current Codex account even though fresh
+	// usage was stored. One cause: the OAuth access token rotates, so the snapshot's credentialHash
+	// no longer matches and cachedUsage() rejected it — leaving the footer blank. For DISPLAY we now
+	// fall back to the last stored snapshot: a slightly stale "% left" beats an empty footer.
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "rotated-live-token",
+				refresh: "r",
+				accountId: "c2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { showUsage: true },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+			usageByProvider: {
+				"openai-codex-account-2": {
+					provider: "openai-codex-account-2",
+					family: "codex",
+					fetchedAt: now,
+					// Hash from the PREVIOUS token — no longer matches the rotated one above.
+					credentialHash: "stale-hash-from-old-token",
+					primary: { usedPercent: 98, resetAt: now + 3_600_000 },
+					secondary: { usedPercent: 32, resetAt: now + 7 * 86_400_000 },
+					plan: "plus",
+				},
+			},
+		},
+	});
+	await t.fire("agent_start");
+	const footer = t.rec.statuses
+		.filter((s) => s.key === "multi-account-quota")
+		.map((s) => s.value);
+	assert.ok(
+		footer.some(
+			(v) => typeof v === "string" && v.includes("Codex") && v.includes("left"),
+		),
+		`footer must still show usage after a token rotation; got ${JSON.stringify(footer)}`,
+	);
+});
+
 test("Qwen shows live availability / rate-limit status (it has no quota API)", async () => {
 	// Alibaba publishes no usage/quota endpoint, so instead of a useless "no usage endpoint" the
 	// status must show the account's real live state: available now, or rate-limited until recovery.

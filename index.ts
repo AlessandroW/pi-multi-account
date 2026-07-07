@@ -256,7 +256,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.13";
+const VERSION = "1.13.14";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -2188,10 +2188,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				ctx.ui.setStatus("multi-account-quota", undefined);
 				return;
 			}
-			// Qwen may have no cached snapshot (nothing to fetch) — synthesize a bare one so its live
-			// availability/rate-limit status still shows in the footer instead of nothing.
+			// Prefer the hash-verified snapshot, but for DISPLAY fall back to the last stored one even
+			// if the OAuth token has since rotated (hash mismatch) — a slightly stale "% left" beats a
+			// blank footer, which is what the user saw when Codex's token rotated between usage fetches.
+			// Qwen may have no snapshot at all (nothing to fetch) — synthesize a bare one so its live
+			// availability/rate-limit status still shows.
 			const snapshot =
 				cachedUsage(provider) ??
+				usageByProvider.get(provider) ??
 				(usageFamily(provider) === "qwen"
 					? {
 							provider,
@@ -2214,10 +2218,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							? "warning"
 							: "success"
 					: usageColor(display);
-			ctx.ui.setStatus(
-				"multi-account-quota",
-				ctx.ui.theme?.fg ? ctx.ui.theme.fg(color, text) : text,
-			);
+			// A theme.fg that throws (host theme API drift) must not blank the whole footer — always
+			// fall back to plain text so setStatus is still called with something visible.
+			let rendered: string = text;
+			try {
+				if (ctx.ui.theme?.fg) rendered = ctx.ui.theme.fg(color, text);
+			} catch {
+				rendered = text;
+			}
+			ctx.ui.setStatus("multi-account-quota", rendered);
 		} catch {
 			/* footer is cosmetic — a render error must not affect failover */
 		}

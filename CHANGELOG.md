@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.14] - 2026-07-07
+
+### Fixed
+
+- **The quota footer no longer blanks out for the current account.** Two causes: (1) the OAuth
+  access token rotates, so the stored usage snapshot's credential hash stopped matching and the
+  footer was rejected as stale → for DISPLAY it now falls back to the last stored snapshot (a
+  slightly stale "% left" beats an empty footer); (2) a `theme.fg` exception (host theme API drift)
+  was silently swallowed by the render guard, wiping the footer → the colouring is now wrapped so
+  it always falls back to plain text and still renders. If the footer is still empty after this,
+  the info is always available via `/multi-account status` and `/multi-account limits`.
+
 ## [1.13.13] - 2026-07-07
 
 ### Added
