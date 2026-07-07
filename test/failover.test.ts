@@ -907,6 +907,54 @@ test("a temporary forced-refresh failure cools the slot without permanently inva
 	assert.deepEqual(t.rec.setModels, ["openai-codex-account-4/gpt-5.5"]);
 });
 
+test("Qwen requests rewrite the OpenAI-only 'developer' role to 'system'", async () => {
+	// Real report: with a WORKING alibaba key, turns routed to Qwen failed with
+	// `400 invalid_parameter_error: developer is not one of ['system',...]`. Pi sends the system
+	// instructions as the OpenAI-only `developer` role; Qwen's compatible-mode API rejects it.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			alibaba: { type: "api_key", key: "sk-qwen" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "alibaba", id: "qwen3.7-max" },
+	});
+	await t.fire("session_start");
+
+	const qwenPayload = {
+		messages: [
+			{ role: "developer", content: "You are helpful." },
+			{ role: "user", content: "hi" },
+		],
+	};
+	t.beforeReq(qwenPayload);
+	assert.equal(
+		qwenPayload.messages[0].role,
+		"system",
+		"Qwen must never receive the `developer` role",
+	);
+
+	// Codex/OpenAI DOES support `developer` — it must be left untouched there.
+	t.setCurrent("openai-codex-account-2", "gpt-5.5");
+	const codexPayload = {
+		messages: [
+			{ role: "developer", content: "You are helpful." },
+			{ role: "user", content: "hi" },
+		],
+	};
+	t.beforeReq(codexPayload);
+	assert.equal(
+		codexPayload.messages[0].role,
+		"developer",
+		"non-Qwen providers keep the developer role",
+	);
+});
+
 test("manual switch revives a stuck invalidation and selects the account", async () => {
 	// Real report: `/multi-account switch alibaba` answered "no usable model, make sure it is logged
 	// in" for a freshly-keyed account. Cause: the slot was invalidated earlier (e.g. by the wrong

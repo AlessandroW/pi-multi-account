@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.12] - 2026-07-07
+
+### Fixed
+
+- **Qwen/Alibaba turns no longer fail with `400: developer is not one of [...]`.** Pi sends the
+  system instructions using the OpenAI-only `developer` role (the o1+/Codex convention), but
+  Qwen's OpenAI-compatible endpoint only accepts `system`, `assistant`, `user`, `tool`,
+  `function`. A `before_provider_request` shaper now rewrites `developer` → `system` for
+  qwen-family providers only (Codex/OpenAI, which DO support `developer`, are left untouched).
+  With a valid Model Studio (International/Singapore) key, Qwen now completes turns normally.
+
 ## [1.13.11] - 2026-07-07
 
 ### Fixed

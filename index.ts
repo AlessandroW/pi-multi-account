@@ -255,7 +255,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.11";
+const VERSION = "1.13.12";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -1746,6 +1746,32 @@ function shapeAnthropicOAuthPayload(payload: unknown): unknown {
 		: payload.system;
 	const finalSystem = prependBillingHeader(shapedSystem, normalizedMessages);
 	return { ...payload, messages: normalizedMessages, system: finalSystem };
+}
+
+/**
+ * before_provider_request shaper for Qwen/Alibaba (OpenAI-compatible). Pi sends the system
+ * instructions with the OpenAI-only `developer` role (the o1+/Codex convention), but Qwen's
+ * compatible-mode API rejects it with `400 invalid_parameter_error: developer is not one of
+ * ['system','assistant','user','tool','function']`. Rewrite that role to `system` (which Qwen
+ * accepts) in place. Idempotent and role-only — content is untouched. Returns whether it changed
+ * anything, so callers/tests can assert it fired.
+ */
+function rewriteDeveloperRoleToSystem(payload: unknown): boolean {
+	if (!payload || typeof payload !== "object") return false;
+	const messages = (payload as { messages?: unknown }).messages;
+	if (!Array.isArray(messages)) return false;
+	let changed = false;
+	for (const message of messages) {
+		if (
+			message &&
+			typeof message === "object" &&
+			(message as { role?: unknown }).role === "developer"
+		) {
+			(message as { role?: unknown }).role = "system";
+			changed = true;
+		}
+	}
+	return changed;
 }
 
 /** OAuth override enabling Claude Pro/Max login on a provider (base or alias). */
@@ -4770,12 +4796,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			| Record<string, unknown>
 			| undefined;
 		const provider = ctx?.model?.provider;
-		if (
-			payload &&
-			typeof provider === "string" &&
-			isCursorProviderId(provider)
-		) {
-			payload.pi_session_id = ctx?.sessionManager?.getSessionId?.();
+		if (payload && typeof provider === "string") {
+			if (isCursorProviderId(provider)) {
+				payload.pi_session_id = ctx?.sessionManager?.getSessionId?.();
+			}
+			// Qwen/Alibaba rejects the OpenAI-only `developer` role — normalize it to `system`.
+			if (classifyProvider(provider, config.qwenProvider) === "qwen") {
+				rewriteDeveloperRoleToSystem(payload);
+			}
 		}
 		return shaped;
 	});
