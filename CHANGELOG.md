@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.11] - 2026-07-07
+
+### Fixed
+
+- **A session/rate limit the usage-% window can't see is no longer hot-retried every second.**
+  The usage endpoint reports an account's QUOTA window; it does not reflect session or rate
+  limits. So a session-limited account kept returning 429 "usage limit has been reached" while
+  usage still showed headroom. Because v1.13.7 made usage "ground truth", the account was
+  reported *free now* — the pending resume scheduled a ~1s retry, got 429 again, and looped,
+  while the displayed cooldown said hours (`retry automatically in ~1s` next to `Cooldowns:
+  openai-codex: 2h 3m`). Now a **repeat** limit error (two in a row, no success between) marks
+  that account's usage reading as untrusted for a while, so its real recorded cooldown sticks
+  instead of being cleared — the session waits for the true recovery and polls, rather than
+  hammering a maxed account. The genuine "over-estimated cooldown, usage shows the window really
+  reset" fast-path is preserved (it only takes effect on the FIRST error).
+- **`/multi-account switch <provider>` now revives a stuck invalidation instead of refusing.**
+  An account could stay invalidated long after its cause was gone — e.g. it was killed by the
+  wrong Qwen endpoint (fixed in 1.13.10), and because `markInvalid` records the key's hash, the
+  hash-based auto-revive never fires while the key is unchanged. `switch alibaba` then answered
+  "no usable model … make sure it is logged in" for a perfectly good key. A manual switch is an
+  explicit user override: it now clears any stale invalidation and cooldown for the target,
+  reloads auth, forces re-discovery, and selects the account — with a clearer message that
+  distinguishes "logged in but the host exposes no model yet" from "no credentials in auth.json".
+
 ## [1.13.10] - 2026-07-07
 
 ### Fixed

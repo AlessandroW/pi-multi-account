@@ -907,6 +907,40 @@ test("a temporary forced-refresh failure cools the slot without permanently inva
 	assert.deepEqual(t.rec.setModels, ["openai-codex-account-4/gpt-5.5"]);
 });
 
+test("manual switch revives a stuck invalidation and selects the account", async () => {
+	// Real report: `/multi-account switch alibaba` answered "no usable model, make sure it is logged
+	// in" for a freshly-keyed account. Cause: the slot was invalidated earlier (e.g. by the wrong
+	// Qwen endpoint, since fixed). markInvalid stored the CURRENT key's hash, so the hash-based
+	// auto-revive never fires while the key is unchanged — the invalidation is permanent even though
+	// its cause is gone. An explicit switch is the user overriding that: it must revive and select.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			alibaba: { type: "api_key", key: "fresh-qwen-key" },
+		},
+		current: { provider: "alibaba", id: "qwen3.7-max" },
+	});
+	await t.fire("session_start");
+	// Terminally invalidate alibaba WITHOUT changing its key → the invalidation sticks across
+	// discovery (currentHash === record.tokenHash), reproducing the stuck state.
+	await finishError(t, "alibaba", "qwen3.7-max", "invalid api key");
+	assert.ok(
+		t.readState().invalidatedByProvider?.alibaba,
+		"precondition: alibaba is stuck-invalidated with its current key",
+	);
+	t.rec.setModels.length = 0;
+	t.setCurrent("anthropic", "claude-opus-4-8");
+	await t.command("switch alibaba");
+	assert.ok(
+		!t.readState().invalidatedByProvider?.alibaba,
+		"explicit switch must clear the stuck invalidation",
+	);
+	assert.ok(
+		t.rec.setModels.some((m) => m.startsWith("alibaba/")),
+		`explicit switch must actually select alibaba; setModels=${t.rec.setModels.join(",")}`,
+	);
+});
+
 test("a second account failure in the same agent chain is not hidden by the previous switch", async () => {
 	const accounts: Account = {
 		"openai-codex-account-2": {
@@ -1457,6 +1491,56 @@ test("a long over-estimated cooldown is corrected by fresh usage and resumes", a
 		t.rec.continueCalls.length,
 		1,
 		"must resume once fresh usage shows the account recovered",
+	);
+});
+
+test("a session limit the usage window can't see is not hot-retried every second", async () => {
+	// Real report: an account 429'd "usage limit has been reached", but its usage-% window still
+	// showed headroom (session/rate limits aren't in that window). The code trusted usage, reported
+	// the account "free now", scheduled a ~1s retry, got 429 again, and looped — while the displayed
+	// cooldown said hours. After the SECOND limit error the usage reading must be distrusted so the
+	// account is benched (a real future recovery), not hot-retried.
+	const now = Date.now();
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 40 },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			// Usage claims the account is free (primary window at 50%, reset far away) even though the
+			// API keeps rejecting it — the exact "usage lies about a session limit" shape.
+			usageByProvider: {
+				anthropic: {
+					provider: "anthropic",
+					family: "anthropic",
+					fetchedAt: now,
+					primary: { usedPercent: 50, resetAt: now + 5 * 60 * 60 * 1000 },
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	await finishError(t, "anthropic", "claude-opus-4-8", "usage limit has been reached");
+	await finishError(t, "anthropic", "claude-opus-4-8", "usage limit has been reached");
+	// Let several poll cycles elapse. The lying "usage says free" must no longer wipe the recorded
+	// cooldown, so the account stays benched with a real FUTURE recovery instead of being cleared and
+	// hot-retried. (Old code deleted the cooldown via applyUsageToCooldown → state was empty.)
+	await wait(260);
+	const until = t.readState().exhaustedUntilByProvider?.anthropic;
+	assert.ok(
+		typeof until === "number" && until > Date.now() + 60_000,
+		`a repeatedly session-limited account must stay benched with a real cooldown, got ${JSON.stringify(until)}`,
+	);
+	// And the paused session must wait for that real recovery, never announce a ~seconds retry.
+	assert.ok(
+		t.rec.notifies.some((m) => /retry automatically in ~\d+[hm]\b/.test(m)) &&
+			!t.rec.notifies.some((m) => /retry automatically in ~\d+s\b/.test(m)),
+		`must schedule the retry for the real recovery, not ~seconds; notifies=${t.rec.notifies.join(" | ")}`,
 	);
 });
 

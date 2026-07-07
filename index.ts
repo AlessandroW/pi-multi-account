@@ -225,6 +225,18 @@ const MAX_MIGRATED_COOLDOWN_MS = 8 * 24 * 60 * 60 * 1000;
 // without this cap the far-future estimate is a dead end (the "bogus cooldown" bug, open since v1.13.1).
 const MAX_LIVE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const MIN_PENDING_WAKE_MS = 1000;
+// The usage-% endpoint tracks an account's QUOTA window; it does NOT reflect session/rate limits.
+// So a session-limited account keeps 429ing "usage limit reached" while usage still reports
+// headroom. Trusting usage as ground truth then reports the account "free now", schedules a ~1s
+// retry, gets 429 again, and loops. Once a provider limit-errors TWICE within this window (no
+// success in between), the usage reading is proven a liar for this account and is distrusted.
+const LIMIT_STREAK_WINDOW_MS = 15 * 60 * 1000;
+// How long to ignore "usage says free" for a provider after usage has been proven wrong, so the
+// recorded cooldown from the real error sticks instead of being cleared on the next poll.
+const USAGE_UNTRUSTED_MS = 30 * 60 * 1000;
+// Minimum backoff to record for a session/rate limit the usage window cannot see, so the wake
+// timer polls (every PENDING_POLL_MS) instead of hot-retrying a maxed account every second.
+const SESSION_LIMIT_FLOOR_MS = 5 * 60 * 1000;
 const AUTH_CHANGE_POLL_MS = 5000;
 // While a session is paused waiting for ANY account to recover, never sleep longer than this
 // between availability checks. A single multi-hour timer would miss an account that recovers
@@ -243,7 +255,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.10";
+const VERSION = "1.13.11";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -1789,6 +1801,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// never switch accounts from that early hook: Pi may still be retrying the same HTTP request.
 	const responseCooldownHints = new Map<string, number>();
 	const handledAssistantErrors = new Set<string>();
+	// Consecutive limit-error accounting per provider (in-memory, reset on any success). Two limit
+	// errors in a row prove the usage-% window is not seeing this account's real limit, so usage is
+	// distrusted until `usageUntrustedUntilByProvider` expires — this is what stops the ~1s
+	// retry-loop against a session-limited account whose quota window still shows headroom.
+	const limitStreakByProvider = new Map<
+		string,
+		{ count: number; lastAt: number }
+	>();
+	const usageUntrustedUntilByProvider = new Map<string, number>();
 
 	// Discovered, authed, deduped provider ids in rotation order.
 	let rotation: string[] = [];
@@ -2249,6 +2270,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	/** A successful response → this account's auth is fine; clear its 401 streak. */
 	function noteAuthSuccess(provider: string, modelId?: string) {
+		// A real success proves the account works right now → the usage reading was not lying; reset
+		// the limit-error streak and re-trust usage for this provider.
+		limitStreakByProvider.delete(provider);
+		usageUntrustedUntilByProvider.delete(provider);
 		let changed = authFailures.delete(provider);
 		changed = exhaustedUntilByProvider.delete(provider) || changed;
 		changed = invalidatedByProvider.delete(provider) || changed;
@@ -2374,6 +2399,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	/** When does this provider become usable again? Uses recorded cooldown AND fresh usage. */
+	// True while a provider's usage-% reading is distrusted because a repeat limit error proved it
+	// does not reflect the account's real (session/rate) limit. See LIMIT_STREAK_WINDOW_MS.
+	function usageUntrusted(provider: string, now = Date.now()): boolean {
+		return (usageUntrustedUntilByProvider.get(provider) ?? 0) > now;
+	}
+
+	// Record a limit error for a provider and return the consecutive streak. A second error within
+	// LIMIT_STREAK_WINDOW_MS (no success reset in between) flips the account's usage reading to
+	// "distrusted" so its real cooldown can no longer be cleared by a lying "usage says free".
+	function noteLimitError(provider: string, now = Date.now()): number {
+		const prev = limitStreakByProvider.get(provider);
+		const count =
+			prev && now - prev.lastAt < LIMIT_STREAK_WINDOW_MS ? prev.count + 1 : 1;
+		limitStreakByProvider.set(provider, { count, lastAt: now });
+		if (count >= 2)
+			usageUntrustedUntilByProvider.set(provider, now + USAGE_UNTRUSTED_MS);
+		return count;
+	}
+
 	function providerRecoveryAt(provider: string, now = Date.now()): number {
 		let at = Math.max(now, exhaustedUntilByProvider.get(provider) ?? now);
 		const cached = usageByProvider.get(provider);
@@ -2390,8 +2434,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// on dead accounts instead of advancing to a live Qwen/Ollama one.
 			if (usageMs !== undefined && usageMs > 0) return now + usageMs;
 			// "Available now" (usageMs === 0) is only trusted while FRESH — a stale pre-limit reading
-			// must never clear a real cooldown early.
-			if (fresh && usageMs === 0) return now;
+			// must never clear a real cooldown early — AND only while usage is still trusted for this
+			// provider. A session/rate-limited account keeps 429ing while its quota window shows
+			// headroom; once that has been proven (usageUntrusted), we respect the recorded cooldown
+			// (`at`) instead of falsely reporting "recovered now" and hot-looping a ~1s retry.
+			if (fresh && usageMs === 0) return usageUntrusted(provider, now) ? at : now;
 		}
 		return at;
 	}
@@ -2440,6 +2487,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		provider: string,
 		errorText: string,
 	): Promise<number> {
+		const now = Date.now();
+		// Count this limit error. A repeat within the streak window flips usage to "distrusted".
+		const streak = noteLimitError(provider, now);
 		const hintedCooldowns = [
 			responseCooldownHints.get(provider),
 			cooldownFromErrorText(errorText),
@@ -2448,15 +2498,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		);
 		const snapshot = await refreshUsage(ctx, provider, true);
 		if (snapshot) {
-			applyUsageToCooldown(provider, snapshot, Date.now());
+			applyUsageToCooldown(provider, snapshot, now);
 			const usageMs = cooldownMsFromUsage(snapshot);
-			// Fresh usage is GROUND TRUTH. If it says the account is available right now (primary
-			// window has headroom → usageMs === 0), trust it over any pessimistic error-text estimate:
-			// a maxed long/rolling window must not evict an account whose short window has already freed.
-			// (Before this the 0 was dropped by the `> 0` filter and a stale 30-day `resets_at` won the
-			// Math.max — the bogus weeks-long cooldown.)
-			if (usageMs === 0) return 0;
-			if (usageMs !== undefined && usageMs > 0) hintedCooldowns.push(usageMs);
+			// Fresh usage is normally GROUND TRUTH. If it says the account is available right now
+			// (primary window has headroom → usageMs === 0), trust it over any pessimistic error-text
+			// estimate: a maxed long/rolling window must not evict an account whose short window has
+			// already freed. BUT the usage-% window does not see session/rate limits — so once the
+			// account has limit-errored twice in a row while usage claimed "free", we stop believing
+			// the 0 and record a real floor cooldown instead of returning 0 and hot-looping a retry.
+			if (usageMs === 0) {
+				if (streak < 2) return 0;
+				hintedCooldowns.push(SESSION_LIMIT_FLOOR_MS);
+			} else if (usageMs !== undefined && usageMs > 0) {
+				hintedCooldowns.push(usageMs);
+			}
 		}
 		if (hintedCooldowns.length === 0) return config.cooldownMs;
 		// Backstop: never let a single live estimate lock an account beyond the ceiling.
@@ -2513,7 +2568,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const recorded = exhaustedUntilByProvider.get(provider) ?? 0;
 		if (realMs <= 0) {
 			// Usage says the account is free again — drop the cooldown so resume can pick it up,
-			// even if our original estimate hasn't expired yet.
+			// even if our original estimate hasn't expired yet. But NOT when usage has been proven
+			// unreliable for this account (a session/rate limit the quota window can't see): clearing
+			// there would immediately re-select a still-maxed account and loop.
+			if (usageUntrusted(provider, now)) return;
 			if (exhaustedUntilByProvider.delete(provider)) persist();
 			return;
 		}
@@ -4497,30 +4555,42 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				);
 				return;
 			}
-			refreshDiscovery(false, ctx);
-			// Manual override: clear the target's cooldown so a cooling-down account can
-			// be selected directly. The user is explicitly overriding the cooldown here.
-			if (exhaustedUntilByProvider.has(parsed.provider)) {
-				exhaustedUntilByProvider.delete(parsed.provider);
-			}
+			// Manual switch is an EXPLICIT override, so give the target a clean slate:
+			//  - clear any cooldown (the user is overriding a rate-limit wait), AND
+			//  - clear a STALE invalidation. An account can stay invalidated long after its real
+			//    cause is gone — e.g. it was killed by a since-fixed provider bug (the wrong Qwen
+			//    endpoint), or the key was replaced but its hash-based auto-revive never ran because
+			//    the auth-file mtime hadn't changed. Refusing the user's own switch in that state was
+			//    the "fresh key still says: not logged in" bug. Revive, reload auth, force
+			//    re-discovery, and let the account prove itself on the real request instead.
+			const wasInvalid = invalidatedByProvider.delete(parsed.provider);
+			authFailures.delete(parsed.provider);
+			exhaustedUntilByProvider.delete(parsed.provider);
 			for (const key of [...exhaustedUntilByModel.keys()]) {
 				if (key.startsWith(`${parsed.provider}/`)) {
 					exhaustedUntilByModel.delete(key);
 				}
 			}
 			persist();
+			refreshDiscovery(true, ctx);
 			const candidates = resolveTargets(ctx, target, ctx.model, true).filter(
-				(model: any) =>
-					!isInvalidated(model.provider) &&
-					providerHasUsableAuth(ctx, model.provider),
+				(model: any) => providerHasUsableAuth(ctx, model.provider),
 			);
 			if (candidates.length === 0) {
+				const hasAuth = providerHasUsableAuth(ctx, parsed.provider);
 				ctx.ui.notify(
-					`pi-multi-account: no usable model for "${target}". Make sure it is logged in. Rotation: ${rotation.join(", ") || "none"}`,
+					hasAuth
+						? `pi-multi-account: "${target}" is logged in but the host exposes no model for it yet. Run /multi-account rediscover, or restart Pi if you just logged in.`
+						: `pi-multi-account: no credentials for "${target}" in auth.json — run /login and pick it. Rotation: ${rotation.join(", ") || "none"}`,
 					"warning",
 				);
 				return;
 			}
+			if (wasInvalid)
+				ctx.ui.notify(
+					`pi-multi-account: cleared a stale invalidation on "${parsed.provider}" and is retrying it now.`,
+					"info",
+				);
 			currentPromptSwitch = undefined;
 			const switched = await activateFallback(
 				ctx,
