@@ -6,13 +6,44 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
+// The Cursor provider lives in a separate, optional repo. Point the bridge at a directory we
+// control so a test can toggle "installed" / "not installed" — the default is NOT installed,
+// which is what the overwhelming majority of users run.
+const CURSOR_ROOT = join(AGENT_DIR, "cursor-provider");
+process.env.PI_CURSOR_PROVIDER_ROOT = CURSOR_ROOT;
+
+const CURSOR_PROVIDER_STUB = `export const FALLBACK_MODELS = [
+	{ id: "composer-2.5", name: "Composer 2.5", reasoning: true, input: ["text"] },
+];
+export async function ensureCursorProxy() {
+	return 41999;
+}
+export function registerCursorProvider(pi, id, _port, models) {
+	pi.registerProvider(id, { name: \`Cursor (\${id})\`, models });
+}
+`;
+
+function installCursorProvider() {
+	mkdirSync(CURSOR_ROOT, { recursive: true });
+	writeFileSync(join(CURSOR_ROOT, "cursor-shared.ts"), CURSOR_PROVIDER_STUB);
+}
+
+function uninstallCursorProvider() {
+	rmSync(CURSOR_ROOT, { recursive: true, force: true });
+}
 
 const { default: piMultiAccount, mergeRefreshedCredentials } = (await import(
 	"../index.ts"
@@ -92,6 +123,8 @@ function setup(opts: {
 	continueBlocks?: () => Promise<void>;
 	omitContinueAgent?: boolean;
 	omitSendUserMessage?: boolean;
+	/** Models the HOST (Pi) itself publishes for the base Codex provider. */
+	hostCodexModels?: string[];
 }) {
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
@@ -101,6 +134,7 @@ function setup(opts: {
 			enabled: true,
 			autoContinue: true,
 			autoDiscover: true,
+			autoDiscoverModels: false,
 			showUsage: false,
 			fallbacks: [],
 			...(opts.config ?? {}),
@@ -130,6 +164,7 @@ function setup(opts: {
 	}
 
 	const known = new Set<string>(Object.keys(accounts));
+	const registeredModels = new Map<string, any[]>();
 	const mkModel = (provider: string, id: string) => ({ provider, id });
 	const rec = {
 		sent: [] as Array<{ prompt: string; options?: Record<string, unknown> }>,
@@ -138,6 +173,7 @@ function setup(opts: {
 		notifies: [] as string[],
 		statuses: [] as Array<{ key: string; value: string | undefined }>,
 		compactionAuthFor: [] as string[],
+		thinkingLevels: [] as string[],
 		aborts: 0,
 		authReloads: 0,
 	};
@@ -162,10 +198,22 @@ function setup(opts: {
 				rec.statuses.push({ key, value }),
 		},
 		modelRegistry: {
-			find: (provider: string, id: string) =>
-				known.has(provider) ? mkModel(provider, id) : undefined,
+			find: (provider: string, id: string) => {
+				const models = registeredModels.get(provider);
+				if (models) return models.find((model) => model.id === id);
+				return known.has(provider) ? mkModel(provider, id) : undefined;
+			},
 			getAll: () =>
-				[...known].map((provider) => mkModel(provider, "claude-opus-4-8")),
+				[...known].flatMap((provider) => {
+					if (opts.hostCodexModels && provider === "openai-codex") {
+						return opts.hostCodexModels.map((id) => mkModel(provider, id));
+					}
+					return (
+						registeredModels.get(provider) ?? [
+							mkModel(provider, "claude-opus-4-8"),
+						]
+					);
+				}),
 			authStorage: {
 				reload: () => {
 					rec.authReloads++;
@@ -194,7 +242,15 @@ function setup(opts: {
 	};
 
 	const pi: any = {
-		registerProvider: (name: string) => known.add(name),
+		registerProvider: (name: string, providerConfig?: { models?: any[] }) => {
+			known.add(name);
+			if (providerConfig?.models) {
+				registeredModels.set(
+					name,
+					providerConfig.models.map((model) => ({ ...model, provider: name })),
+				);
+			}
+		},
 		registerCommand: (
 			name: string,
 			options: { handler: (args: string, ctx: any) => any },
@@ -225,7 +281,7 @@ function setup(opts: {
 		},
 		appendEntry: () => {},
 		getThinkingLevel: () => "high",
-		setThinkingLevel: () => {},
+		setThinkingLevel: (level: string) => rec.thinkingLevels.push(level),
 	};
 
 	// Simulate a host Pi build that predates pi.continueAgent() (seamless in-place resume). The
@@ -336,6 +392,121 @@ test("usage footer countdown refreshes while the session is idle", async () => {
 	assert.equal(t.rec.statuses.at(-1)?.value, "Codex A2 | 5h 99% left/1m");
 	await t.fire("session_shutdown");
 });
+
+test(
+	"background usage refresh discovers an early Codex reset or plan upgrade on every benched account",
+	{ concurrency: false },
+	async () => {
+		const now = Date.now();
+		const accounts: Account = {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "codex-access-2",
+				refresh: "codex-refresh-2",
+				accountId: "codex-account-2",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: "codex-access-3",
+				refresh: "codex-refresh-3",
+				accountId: "codex-account-3",
+			},
+			alibaba: { type: "api_key", key: "qwen-key" },
+		};
+		const hash = (value: string) =>
+			createHash("sha256").update(value).digest("hex").slice(0, 12);
+		const staleBlocked = (provider: string, access: string) => ({
+			provider,
+			family: "codex",
+			fetchedAt: now - 60_000,
+			credentialHash: hash(access),
+			plan: "free",
+			primary: {
+				usedPercent: 100,
+				resetAt: now + 30 * 24 * 60 * 60 * 1000,
+			},
+		});
+		const seenAccountIds: string[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+			const headers = new Headers(init?.headers);
+			seenAccountIds.push(headers.get("ChatGPT-Account-Id") ?? "missing");
+			return new Response(
+				JSON.stringify({
+					plan_type: "pro",
+					rate_limit: {
+						primary_window: {
+							used_percent: 10,
+							reset_at: Math.floor((now + 60 * 60 * 1000) / 1000),
+						},
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof fetch;
+
+		const t = setup({
+			accounts,
+			current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+			config: {
+				showUsage: true,
+				usageRefreshMs: 20,
+				usageStatusRefreshMs: 60_000,
+			},
+			seedState: {
+				stateVersion: 5,
+				exhaustedUntilByProvider: {
+					"openai-codex-account-2": now + 6 * 60 * 60 * 1000,
+					"openai-codex-account-3": now + 6 * 60 * 60 * 1000,
+				},
+				exhaustedUntilByModel: {},
+				lastProbeAtByProvider: {},
+				invalidatedByProvider: {},
+				usageByProvider: {
+					"openai-codex-account-2": staleBlocked(
+						"openai-codex-account-2",
+						"codex-access-2",
+					),
+					"openai-codex-account-3": staleBlocked(
+						"openai-codex-account-3",
+						"codex-access-3",
+					),
+				},
+				lastSwitches: [],
+			},
+		});
+
+		try {
+			await t.fire("session_start");
+			assert.deepEqual(seenAccountIds.sort(), [
+				"codex-account-2",
+				"codex-account-3",
+			]);
+			const state = t.readState();
+			assert.equal(
+				state.usageByProvider["openai-codex-account-2"].primary.usedPercent,
+				10,
+			);
+			assert.equal(
+				state.usageByProvider["openai-codex-account-3"].plan,
+				"pro",
+			);
+			assert.deepEqual(
+				t.rec.setModels,
+				[],
+				"startup must refresh the upgraded current account before switching away from it",
+			);
+			assert.ok(
+				!state.exhaustedUntilByProvider?.["openai-codex-account-2"] &&
+					!state.exhaustedUntilByProvider?.["openai-codex-account-3"],
+				"fresh headroom after a plan change must clear both stale cooldowns",
+			);
+		} finally {
+			await t.fire("session_shutdown");
+			globalThis.fetch = originalFetch;
+		}
+	},
+);
 
 // ---------------------------------------------------------------------------
 // One final error -> one decision
@@ -1458,6 +1629,84 @@ test("manual next cycles through every account instead of ping-ponging between t
 	);
 });
 
+test("high reasoning is the baseline and is restored across every provider rotation", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "anthropic", refresh: "anthropic-refresh" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "codex",
+				refresh: "codex-refresh",
+				accountId: "codex-account",
+			},
+			alibaba: { type: "api_key", key: "qwen-key" },
+			ollama: { type: "api_key", key: "ollama-key" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	for (let i = 0; i < 4; i++) await t.command("next");
+
+	assert.deepEqual(
+		new Set(t.rec.setModels.map((model) => model.split("/")[0])),
+		new Set(["openai-codex-account-2", "alibaba", "ollama", "anthropic"]),
+	);
+	assert.ok(
+		t.rec.thinkingLevels.length >= 5,
+		`high must be applied at turn start and after every switch: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+	assert.ok(
+		t.rec.thinkingLevels.every((level) => level === "high"),
+		`no provider may escalate reasoning above high by default: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+});
+
+test("manual next reaches an account blocked only by stale usage while free providers remain", async () => {
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "codex-access",
+				refresh: "codex-refresh",
+				accountId: "codex-account",
+			},
+			alibaba: { type: "api_key", key: "qwen-key" },
+			ollama: { type: "api_key", key: "ollama-key" },
+		},
+		current: { provider: "alibaba", id: "qwen3.7-max" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-2": {
+					provider: "openai-codex-account-2",
+					family: "codex",
+					fetchedAt: now - 7 * 24 * 60 * 60 * 1000,
+					primary: {
+						usedPercent: 100,
+						resetAt: now + 30 * 24 * 60 * 60 * 1000,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+
+	await t.fire("session_start");
+	await t.command("next");
+	await t.command("next");
+	assert.deepEqual(t.rec.setModels.slice(-2), [
+		"ollama/glm-5.2:cloud",
+		"openai-codex-account-2/gpt-5.5",
+	]);
+});
+
 test("manual next never downgrades to a weaker model of the same account (no mini flap)", async () => {
 	// Real report: on gpt-5.4 with gpt-5.5 momentarily unavailable, repeated /multi-account next
 	// flapped gpt-5.4 ↔ gpt-5.4-mini. HARD RULE: failover switches the ACCOUNT, never demotes the
@@ -2044,12 +2293,74 @@ test("disable blocks automatic failover and enable restores it", async () => {
 });
 
 test("add cursor guides the user through subscription login, not API-key setup", async () => {
-	const t = setup({ accounts: ONE_ACCOUNT });
-	await t.command("add cursor");
-	const notice = t.rec.notifies.at(-1) ?? "";
-	assert.match(notice, /authenticate your Cursor subscription in the browser/);
-	assert.doesNotMatch(notice, /api[_ -]?key/i);
+	installCursorProvider();
+	try {
+		const t = setup({ accounts: ONE_ACCOUNT });
+		await t.command("add cursor");
+		const notice = t.rec.notifies.at(-1) ?? "";
+		assert.match(notice, /authenticate your Cursor subscription in the browser/);
+		assert.doesNotMatch(notice, /api[_ -]?key/i);
+	} finally {
+		uninstallCursorProvider();
+	}
 });
+
+// ---------------------------------------------------------------------------
+// Cursor is optional: nothing about it may leak into a session that never asked
+// ---------------------------------------------------------------------------
+
+test(
+	"includeCursor default-on never registers a phantom cursor slot nor warns while the Cursor provider is not installed",
+	{ concurrency: false },
+	async () => {
+		uninstallCursorProvider();
+		const t = setup({ accounts: ONE_ACCOUNT, config: { includeCursor: true } });
+
+		await t.fire("session_start");
+		await wait(120);
+		await t.command("status");
+
+		const status = t.rec.notifies.find((message) =>
+			message.includes("Registered login slots"),
+		);
+		// A cursor slot backed by nothing would be offered by /login and could never work.
+		assert.ok(status, "status output should be produced");
+		assert.doesNotMatch(status, /cursor-account-\d/);
+		// And no unsolicited `git clone` instructions for a provider the user never asked for.
+		assert.equal(
+			t.rec.notifies.some((message) =>
+				message.includes("Cursor subscription support not found"),
+			),
+			false,
+		);
+		await t.fire("session_shutdown");
+	},
+);
+
+test(
+	"cloning the Cursor provider is enough: the spare cursor slot appears on the next rediscover",
+	{ concurrency: false },
+	async () => {
+		uninstallCursorProvider();
+		const t = setup({ accounts: ONE_ACCOUNT, config: { includeCursor: true } });
+		await t.fire("session_start");
+		await wait(120);
+
+		installCursorProvider();
+		try {
+			await t.command("rediscover");
+			await wait(120);
+			await t.command("status");
+			const status = t.rec.notifies
+				.filter((message) => message.includes("Registered login slots"))
+				.at(-1);
+			assert.match(status ?? "", /cursor-account-2/);
+		} finally {
+			uninstallCursorProvider();
+			await t.fire("session_shutdown");
+		}
+	},
+);
 
 test("remove codex drops the highest numbered authed alias slot", async () => {
 	const accounts: Account = {
@@ -2846,6 +3157,52 @@ test("a quota error on the ACTIVE unmanaged provider (e.g. plain openai API) sti
 	);
 });
 
+test("neverFailoverProviders leaves an unmanaged provider's own retry logic alone", async () => {
+	const t = setup({
+		// Same situation as the test above — an actionable error on the ACTIVE unmanaged
+		// provider — except the user has told us this provider owns its retries.
+		current: { provider: "self-retrying", id: "some-model" },
+		config: { neverFailoverProviders: ["self-retrying"] },
+	});
+	await finishError(
+		t,
+		"self-retrying",
+		"some-model",
+		"You exceeded your current quota, please check your plan and billing details. insufficient_quota",
+	);
+	assert.equal(
+		t.rec.setModels.length,
+		0,
+		`must not switch underneath a provider that retries itself, got: ${t.rec.setModels.join(", ")}`,
+	);
+	const log = readDebugLog();
+	assert.ok(
+		log.some(
+			(entry) =>
+				entry.kind === "failover_suppressed" &&
+				entry.provider === "self-retrying",
+		),
+		"the suppression must be visible in the black-box log, not silent",
+	);
+});
+
+test("neverFailoverProviders does not disable failover for other providers", async () => {
+	const t = setup({
+		current: { provider: "openai", id: "gpt-5.5" },
+		config: { neverFailoverProviders: ["some-other-provider"] },
+	});
+	await finishError(
+		t,
+		"openai",
+		"gpt-5.5",
+		"You exceeded your current quota, please check your plan and billing details. insufficient_quota",
+	);
+	assert.ok(
+		t.rec.setModels.length > 0,
+		"an unrelated pin must not suppress a normal rescue",
+	);
+});
+
 test("a limit error on an unmanaged provider that is NOT the active model is ignored (no hijack)", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
@@ -2894,6 +3251,73 @@ test("failover prefers the latest model: a turn stuck on gpt-5.4 is upgraded bac
 		!t.rec.setModels.some((m) => m.endsWith("/gpt-5.4")),
 		"must not carry the downgraded gpt-5.4 forward",
 	);
+});
+
+// ---------------------------------------------------------------------------
+// A new OpenAI generation must not require a release of this extension (issue #2)
+// ---------------------------------------------------------------------------
+
+test("a Codex generation only the HOST knows about (gpt-5.6) wins without a release: no silent fallback to gpt-5.5", async () => {
+	const accounts: Account = {
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "c",
+			refresh: "cr",
+			accountId: "codex-2",
+		},
+	};
+	// Pi already ships gpt-5.6; this extension's static list stops at gpt-5.5. Before the fix
+	// the static list was consulted first, so failover landed on gpt-5.5 — a silent downgrade
+	// that needed a new release for every OpenAI generation.
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		hostCodexModels: ["gpt-5.6", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+	});
+
+	await t.fire("session_start");
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+
+	assert.ok(
+		t.rec.setModels.some((m) => m.endsWith("/gpt-5.6")),
+		`must select the newest generation the host knows, got: ${t.rec.setModels.join(", ")}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.endsWith("/gpt-5.5")),
+		`must not fall back to the older generation, got: ${t.rec.setModels.join(", ")}`,
+	);
+	await t.fire("session_shutdown");
+});
+
+test("an unreleased Codex generation is also selectable on a numbered account alias, not just the base provider", async () => {
+	const accounts: Account = {
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "c",
+			refresh: "cr",
+			accountId: "codex-2",
+		},
+		"openai-codex-account-3": {
+			type: "oauth",
+			access: "d",
+			refresh: "dr",
+			accountId: "codex-3",
+		},
+	};
+	// Alias slots are registered from the extension's static model list, so a host-only model
+	// would not be *findable* on them even once it was ranked first.
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.6" },
+		hostCodexModels: ["gpt-5.6", "gpt-5.5"],
+	});
+
+	await t.fire("session_start");
+	await finishError(t, "openai-codex-account-2", "gpt-5.6", "429 rate_limit_error");
+
+	assert.equal(t.rec.setModels.at(-1), "openai-codex-account-3/gpt-5.6");
+	await t.fire("session_shutdown");
 });
 
 test("failover never downgrades across accounts: gpt-5.5 on a healthy account beats gpt-5.4 on a nearer account", async () => {
@@ -2975,6 +3399,76 @@ test("failover messages are stamped with the running version so a stale (un-rest
 		"the switch message carries [vX.Y.Z]; its ABSENCE in a window means that window runs old code",
 	);
 });
+
+test(
+	"live OpenAI catalog adds an unseen flagship to account aliases and failover selects it at high",
+	{ concurrency: false },
+	async (testContext) => {
+		testContext.mock.method(globalThis, "fetch", async () =>
+			new Response(
+				JSON.stringify({
+					models: [
+						{
+							slug: "gpt-5.6-luna",
+							display_name: "5.6 Luna",
+							visibility: "list",
+							priority: 30,
+							supported_reasoning_levels: [{ effort: "high" }],
+						},
+						{
+							slug: "gpt-5.6-sol",
+							display_name: "5.6 Sol",
+							visibility: "list",
+							priority: 10,
+							supported_reasoning_levels: [
+								{ effort: "low" },
+								{ effort: "medium" },
+								{ effort: "high" },
+								{ effort: "xhigh" },
+							],
+						},
+						{
+							slug: "gpt-5.6-terra",
+							display_name: "5.6 Terra",
+							visibility: "list",
+							priority: 20,
+							supported_reasoning_levels: [{ effort: "high" }],
+						},
+					],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			),
+		);
+		const t = setup({
+			accounts: {
+				anthropic: { type: "oauth", access: "anthropic-access", refresh: "anthropic-refresh" },
+				"openai-codex-account-2": {
+					type: "oauth",
+					access: "codex-access",
+					refresh: "codex-refresh",
+					accountId: "codex-account",
+				},
+			},
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+			config: { autoDiscoverModels: true, reasoningLevel: "high" },
+		});
+
+		await t.fire("session_start");
+		await t.fire("agent_start");
+		await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+
+		assert.ok(
+			t.rec.setModels.includes("openai-codex-account-2/gpt-5.6-sol"),
+			`new flagship must be selectable without a static extension edit: ${JSON.stringify(t.rec.setModels)}`,
+		);
+		assert.ok(t.rec.thinkingLevels.includes("high"));
+		assert.ok(
+			!t.rec.thinkingLevels.includes("xhigh"),
+			"xhigh is an extreme opt-in level and must never be selected by default",
+		);
+		await t.fire("session_shutdown");
+	},
+);
 
 // ---------------------------------------------------------------------------
 // v1.13.0 black box: every decision is recorded so real bugs become reproducible

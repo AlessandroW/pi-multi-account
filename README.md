@@ -8,12 +8,13 @@ When the account you are using hits a quota or rate limit, `pi-multi-account` tr
 
 - **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
 - **Grows the rotation on login.** Run `/login`, choose **Use a subscription**, then select a numbered slot such as `anthropic-account-3` or `openai-codex-account-5`. The next discovery sweep adds it to the rotation automatically.
+- **Auto-discovers new Codex models per account.** At session start (and on `reload` / `rediscover`) it reads OpenAI's authenticated model catalog, mirrors each account's actually available models onto its Pi alias, and follows OpenAI's server priority. A new flagship can therefore win immediately without an extension release or a hard-coded model id.
 - **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
 - **Fails over on quota / rate-limit** (429 / 402 / 403 and friends): the exhausted account goes on cooldown (parsed from the provider's own reset metadata when available) and Pi switches to the next available account/model.
 - **Optional auto-continue**: queues a safe continuation prompt after a switch so the agent keeps going from the last safe point.
 - **Session-bound overnight resume**: if every account is cooling down, the live Pi session waits for the earliest recovery and continues automatically. A new user message, `/multi-account stop`, session exit, or Esc during a running turn cancels the chain.
 - **Deduplicates provably identical accounts** so duplicate Codex `accountId` values and identical credentials do not consume multiple rotation slots or get separate cooldowns. New provable duplicate logins are rejected before the redundant slot is saved.
-- **Keeps your thinking level** stable across switches instead of letting it drift downward.
+- **Uses `high` reasoning by default on every provider/model** and restores it after every switch instead of letting it drift downward. Extreme levels such as `xhigh` / Max / Ultra are never forced; `xhigh` remains an explicit opt-in.
 - **Shows live limits for the active account** in Pi's footer: remaining 5-hour and 7-day allowance plus reset countdowns for Codex and Anthropic OAuth accounts.
 
 ## Install
@@ -23,6 +24,12 @@ pi install npm:pi-multi-account
 ```
 
 Restart Pi or run `/reload` after installation.
+
+Requires Node 22+ and `@earendil-works/pi-ai` 0.78 or newer — it is installed automatically as a
+dependency. Both the pre-0.80 OAuth API and the 0.80+ provider-factory API are supported, so the
+extension keeps working across pi-ai upgrades. If a pi-ai it cannot adapt is ever encountered, the
+extension still loads and API-key accounts keep rotating; only subscription login is unavailable,
+and it says so at session start.
 
 > **Anthropic (Claude Pro/Max) works out of the box.** OAuth login and request
 > shaping for the base `anthropic` provider and every `anthropic-account-*` alias
@@ -85,7 +92,7 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 |---|---|
 | `status` (default) | Show enabled state, current model, rotation, login slots, cooldowns, invalidations, pending resume. |
 | `limits [refresh]` | Show active-account 5h/7d limits; `refresh` bypasses the cache. Aliases: `usage`, `quota`. |
-| `rediscover` | Force a re-scan of `auth.json` and rebuild the rotation now. |
+| `rediscover` | Force a re-scan of `auth.json`, rebuild the rotation, and refresh Codex model catalogs now. |
 | `add [anthropic\|codex\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. |
 | `remove [anthropic\|codex\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
 | `next` | Manually switch to the next fallback, deliberately overriding recorded cooldowns. |
@@ -117,13 +124,16 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `enabled` | `true` | Master switch. |
 | `autoContinue` | `true` | Queue a continuation prompt after a switch. |
 | `autoDiscover` | `true` | Auto-discover accounts from `auth.json`. |
+| `autoDiscoverModels` | `true` | Fetch OpenAI's authenticated model catalog for every Codex account and register new models on that account's alias automatically. |
 | `includeQwen` | `true` | Include Qwen / Alibaba accounts. |
 | `includeOllama` | `true` | Include Ollama (local) accounts. |
+| `neverFailoverProviders` | `[]` | Provider ids to never fail away from, e.g. `["my-provider"]`. For **unmanaged** providers that run their own retry logic (typically a companion extension owning retries for that provider) — switching accounts underneath it would fight those retries. Managed accounts still cool and rotate normally. |
+| `includeCursor` | `true` | Include Cursor subscription accounts. The Cursor provider is a separate, optional repo — until it is cloned this setting does nothing at all: no cursor login slot is offered and no warning is printed. Run `/multi-account add cursor` to get the install instructions. |
 | `providerOrder` | `["anthropic","openai-codex","qwen","ollama"]` | Preferred family order in the rotation. |
 | `cooldownMs` | 6 h | Default cooldown when no reset metadata is provided. |
 | `showUsage` | `true` | Show active Codex/Claude limits in Pi's footer. |
-| `usageRefreshMs` | 5 min | Provider usage cache TTL; Anthropic is clamped to at least 10 min to avoid endpoint throttling. |
-| `usageStatusRefreshMs` | 1 min | Re-render the footer countdown periodically; stale caches are refreshed according to `usageRefreshMs`. |
+| `usageRefreshMs` | 5 min | Per-account usage cache TTL; every authenticated rotation account is refreshed independently, and Anthropic is clamped to at least 10 min to avoid endpoint throttling. |
+| `usageStatusRefreshMs` | 1 min | Re-render the footer and sweep idle sessions for stale usage/model catalogs; network refreshes remain limited by their five-minute (Anthropic: ten-minute) TTLs. |
 | `maxAutoContinuesPerPrompt` | `8` | Cap on auto-resume hops per task. |
 | `continuationPrompt` | (built-in) | Template; supports `{from}`, `{to}`, `{reason}`. |
 | `routeCompactionToHealthyAccount` | `true` | When the active account is rate-limited/invalid and Pi needs to compact (context overflow or threshold), generate the summary on a healthy fallback account instead of letting it hang on the dead one. |
@@ -131,8 +141,11 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `stuckWatchdogMs` | 180 s | A resumed turn silent for this long (with no tool running) is treated as wedged. |
 | `autoRecoverStuck` | `true` | When a resume wedges, auto-cancel it and auto-resume when an account frees, instead of only notifying. Set `false` for notify-only. |
 | `debugLog` | `true` | Write a structured "black box" decision log to `provider-failover-debug.log` (no credentials — only provider/model ids and truncated reasons). View with `/multi-account log`. |
+| `preferLatestModel` | `true` | Rank the strongest/current model ahead of older siblings during automatic failover. |
+| `reasoningLevel` | `"high"` | Reasoning effort applied at the start of every turn and restored after switches. Set `"xhigh"` only when you explicitly want the extreme level. |
+| `preferredModels` | `{}` | Optional manual strongest-first override per family; when present it wins over live catalog priority. |
 
-State (cooldowns, invalidations, recent switches, and an in-session pending resume marker) is persisted to `~/.pi/agent/provider-failover-state.json`. Pending work is deliberately discarded when the session closes or a different session starts.
+State (cooldowns, invalidations, recent switches, credential-free Codex model catalogs, and an in-session pending resume marker) is persisted to `~/.pi/agent/provider-failover-state.json`. Pending work is deliberately discarded when the session closes or a different session starts.
 
 ## Staying unstuck (resilience)
 
@@ -146,7 +159,7 @@ A failover is only useful if the agent actually keeps working afterward. These g
 
 ## Privacy & security
 
-`pi-multi-account` **reads** `auth.json` but never writes credentials itself and never stores credentials in its state. Account/token values are reduced to a short irreversible SHA-256 fingerprint for re-login detection and deduplication. To display limits, the active OAuth access token is sent only to its own provider's usage endpoint (`chatgpt.com/backend-api/wham/usage` or `api.anthropic.com/api/oauth/usage`); cached state contains percentages, reset times, plan/credit metadata, and the fingerprint, never the token. Config, state, and the debug log are written with `0600` permissions. The debug log records only provider/model ids, decisions, and truncated reasons — token-shaped material is redacted defensively — so it is safe to share when reporting an issue. Disable it with `"debugLog": false` or `/multi-account log off`.
+`pi-multi-account` **reads** `auth.json` but never writes credentials itself and never stores credentials in its state. Account/token values are reduced to a short irreversible SHA-256 fingerprint for re-login detection and deduplication. OAuth access tokens are sent only to their own provider: the usage endpoint (`chatgpt.com/backend-api/wham/usage` or `api.anthropic.com/api/oauth/usage`) and, for Codex, OpenAI's authenticated `chatgpt.com/backend-api/codex/models` catalog. Cached state contains percentages, reset times, plan/credit metadata, model metadata, and the fingerprint, never the token. Config, state, and the debug log are written with `0600` permissions. The debug log records only provider/model ids, decisions, and truncated reasons — token-shaped material is redacted defensively — so it is safe to share when reporting an issue. Disable it with `"debugLog": false` or `/multi-account log off`.
 
 ## License
 

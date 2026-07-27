@@ -15,6 +15,19 @@ export function isCursorProviderId(id: string): boolean {
 	return id === CURSOR_BASE || /^cursor-account-\d+$/.test(id);
 }
 
+/**
+ * Whether the (separately cloned) Cursor provider is present on disk.
+ *
+ * `includeCursor` defaults to true, but the provider itself is an optional external
+ * repo. Without this check the extension registered a `cursor-account-2` login slot
+ * backed by nothing and warned about a `git clone` at every start — noise for the
+ * majority of users who never asked for Cursor. Cheap enough (one existsSync) to call
+ * on every discovery pass, and it picks up a later clone without a restart.
+ */
+export function isCursorProviderInstalled(): boolean {
+	return existsSync(join(CURSOR_PROVIDER_ROOT, "cursor-shared.ts"));
+}
+
 type CursorShared = {
 	ensureCursorProxy: (
 		resolve: (providerId: string) => Promise<string>,

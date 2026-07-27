@@ -36,18 +36,328 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getModel } from "@earendil-works/pi-ai";
-import {
-	loginAnthropic,
-	openaiCodexOAuthProvider,
-	refreshAnthropicToken,
-} from "@earendil-works/pi-ai/oauth";
 import {
 	CURSOR_BASE,
 	isCursorProviderId,
+	isCursorProviderInstalled,
 	setupCursorSubscription,
 } from "./cursor-bridge.ts";
+
+// ---------------------------------------------------------------------------
+// pi-ai OAuth bridge (version-agnostic)
+// ---------------------------------------------------------------------------
+//
+// This is the single most fragile boundary in the extension, and it has now broken
+// twice in the field:
+//
+//   * pi-coding-agent's extension loader aliases `@earendil-works/pi-ai/oauth` to an
+//     empty stub in its own node_modules, so a plain static import yields undefined —
+//     the `undefined is not an object (evaluating
+//     '_oauth.openaiCodexOAuthProvider.usesCallbackServer')` crash at startup.
+//   * pi-ai 0.80 REMOVED the runtime OAuth surface: `dist/oauth.js` is now literally
+//     `export {}` (types only), `getModel` moved to `dist/compat.js`, and the OAuth
+//     implementations live behind provider factories
+//     (`anthropicProvider().auth.oauth`) with a new `login(interaction)` /
+//     `refresh(credential)` shape.
+//
+// So we resolve pi-ai on disk ourselves and normalize BOTH eras behind one internal
+// surface. Everything here is best-effort: a pi-ai we cannot adapt degrades to
+// "subscription logins unavailable" and the extension still loads, so API-key
+// accounts keep rotating instead of the whole extension dying at load time.
+//
+// The 0.80+ adaptation follows the approach contributed by @lfoscari in PR #4.
+
+/** Normalized OAuth surface — identical for every supported pi-ai version. */
+type PiAiOauthBridge = {
+	/** pi-ai release line this was adapted from, for the debug log. */
+	era: "legacy-oauth-entry" | "provider-factories";
+	anthropic: {
+		login: (callbacks: any) => Promise<any>;
+		refresh: (credentials: any) => Promise<any>;
+	};
+	codex: {
+		usesCallbackServer: boolean;
+		login: (callbacks: any) => Promise<any>;
+		refresh: (credentials: any) => Promise<any>;
+		getApiKey: (credentials: any) => string;
+	};
+};
+
+let piAiOauthBridge: PiAiOauthBridge | undefined;
+let piAiOauthLoadError: string | undefined;
+let piAiPackageRoot: string | undefined | null; // null = searched, not found
+
+/**
+ * Locate the `@earendil-works/pi-ai` package directory, nearest-first.
+ *
+ * A git checkout keeps pi-ai in the extension's OWN node_modules, but `npm i` /
+ * `pi install` HOIST it next to the package instead
+ * (`~/.pi/agent/npm/node_modules/pi-multi-account` +
+ * `~/.pi/agent/npm/node_modules/@earendil-works/pi-ai`), and pnpm hides it behind a
+ * symlinked store. Probing only the nested path made the extension fail to load on
+ * every hoisted install, so walk ancestors the way Node's own resolver does and fall
+ * back to require.resolve().
+ */
+export function piAiRootCandidates(
+	fromFile: string,
+	resolver?: (specifier: string) => string,
+): string[] {
+	const candidates: string[] = [];
+	let dir = dirname(fromFile);
+	for (let depth = 0; depth < 16; depth++) {
+		candidates.push(join(dir, "node_modules", "@earendil-works", "pi-ai"));
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	if (resolver) {
+		try {
+			// Resolves through "exports"/symlinks even when no ancestor path matched.
+			candidates.push(dirname(resolver("@earendil-works/pi-ai/package.json")));
+		} catch {
+			// Not resolvable from here — the ancestor paths above may still hit.
+		}
+	}
+	return [...new Set(candidates)];
+}
+
+function findPiAiRoot(): string | undefined {
+	if (piAiPackageRoot !== undefined) return piAiPackageRoot ?? undefined;
+	const here = fileURLToPath(import.meta.url);
+	const localRequire = createRequire(import.meta.url);
+	for (const candidate of piAiRootCandidates(here, (specifier) =>
+		localRequire.resolve(specifier),
+	)) {
+		if (existsSync(join(candidate, "package.json"))) {
+			piAiPackageRoot = candidate;
+			return candidate;
+		}
+	}
+	piAiPackageRoot = null;
+	return undefined;
+}
+
+/**
+ * Bridge Pi's legacy extension OAuth callbacks (`onAuth`/`onDeviceCode`/`onPrompt`/
+ * `onSelect`) to pi-ai 0.80+'s `AuthInteraction` (`notify(event)`/`prompt(prompt)`).
+ * Pi still hands us the legacy callbacks, so without this the browser login throws
+ * `interaction.notify is not a function`.
+ */
+function toAuthInteraction(callbacks: any) {
+	return {
+		signal: callbacks?.signal,
+		notify(event: any) {
+			if (!event || typeof event !== "object") {
+				callbacks?.onProgress?.(String(event ?? ""));
+				return;
+			}
+			if (event.type === "auth_url") {
+				callbacks?.onAuth?.({ url: event.url, instructions: event.instructions });
+				return;
+			}
+			if (event.type === "device_code") {
+				callbacks?.onDeviceCode?.({
+					userCode: event.userCode,
+					verificationUri: event.verificationUri,
+					intervalSeconds: event.intervalSeconds,
+					expiresInSeconds: event.expiresInSeconds,
+				});
+				return;
+			}
+			// "info" and "progress" both carry a human-readable message.
+			callbacks?.onProgress?.(
+				typeof event.message === "string" ? event.message : JSON.stringify(event),
+			);
+		},
+		prompt(prompt: any) {
+			if (prompt?.type === "select") return callbacks.onSelect(prompt);
+			if (prompt?.type === "manual_code" && callbacks?.onManualCodeInput) {
+				return callbacks.onManualCodeInput();
+			}
+			return callbacks.onPrompt({
+				message: prompt?.message ?? "",
+				placeholder: prompt?.placeholder,
+				allowEmpty: prompt?.allowEmpty,
+			});
+		},
+	};
+}
+
+/** pi-ai <= 0.79: runtime OAuth helpers exported straight from `dist/oauth.js`. */
+function adaptLegacyOauthEntry(mod: any): PiAiOauthBridge | undefined {
+	const codex = mod?.openaiCodexOAuthProvider;
+	if (
+		typeof mod?.loginAnthropic !== "function" ||
+		typeof mod?.refreshAnthropicToken !== "function" ||
+		typeof codex?.login !== "function" ||
+		typeof codex?.refreshToken !== "function"
+	) {
+		return undefined;
+	}
+	return {
+		era: "legacy-oauth-entry",
+		anthropic: {
+			login: (callbacks) => mod.loginAnthropic(callbacks),
+			// This era exchanges the bare refresh token, not the whole credential.
+			refresh: (credentials) => mod.refreshAnthropicToken(credentials.refresh),
+		},
+		codex: {
+			usesCallbackServer: codex.usesCallbackServer ?? true,
+			login: (callbacks) => codex.login(callbacks),
+			refresh: (credentials) => codex.refreshToken(credentials),
+			getApiKey: (credentials) =>
+				typeof codex.getApiKey === "function"
+					? codex.getApiKey(credentials)
+					: credentials.access,
+		},
+	};
+}
+
+/** pi-ai >= 0.80: OAuth lives behind provider factories, with an AuthInteraction API. */
+function adaptProviderFactories(
+	anthropicMod: any,
+	codexMod: any,
+): PiAiOauthBridge | undefined {
+	const anthropicOauth = anthropicMod?.anthropicProvider?.()?.auth?.oauth;
+	const codexOauth = codexMod?.openaiCodexProvider?.()?.auth?.oauth;
+	if (
+		typeof anthropicOauth?.login !== "function" ||
+		typeof anthropicOauth?.refresh !== "function" ||
+		typeof codexOauth?.login !== "function" ||
+		typeof codexOauth?.refresh !== "function"
+	) {
+		return undefined;
+	}
+	return {
+		era: "provider-factories",
+		anthropic: {
+			login: (callbacks) => anthropicOauth.login(toAuthInteraction(callbacks)),
+			refresh: (credentials) => anthropicOauth.refresh(credentials),
+		},
+		codex: {
+			// The flag is gone from the new shape; both eras of pi-ai's Codex flow use a
+			// local callback server, and Pi only reads this to decide how to present login.
+			usesCallbackServer: true,
+			login: (callbacks) => codexOauth.login(toAuthInteraction(callbacks)),
+			refresh: (credentials) => codexOauth.refresh(credentials),
+			// Identical to what pi-ai <= 0.79's getApiKey did (verified in its source).
+			getApiKey: (credentials) => credentials.access,
+		},
+	};
+}
+
+/**
+ * Best-effort load + normalization of pi-ai's OAuth surface. NEVER throws.
+ *
+ * Uses a synchronous require() (Node >= 22 supports require() of ESM without
+ * top-level await, and pi-ai qualifies) because providers are registered
+ * synchronously — `usesCallbackServer` is read while Pi merely LISTS providers.
+ */
+function tryLoadPiAiOauth(): PiAiOauthBridge | undefined {
+	if (piAiOauthBridge) return piAiOauthBridge;
+	const root = findPiAiRoot();
+	if (!root) {
+		piAiOauthLoadError = `@earendil-works/pi-ai was not found near ${fileURLToPath(import.meta.url)}. Install @earendil-works/pi-ai alongside pi-multi-account.`;
+		return undefined;
+	}
+	const localRequire = createRequire(import.meta.url);
+	const load = (relative: string): any => {
+		const file = join(root, "dist", relative);
+		if (!existsSync(file)) return undefined;
+		try {
+			return localRequire(file);
+		} catch (error) {
+			tried.push(
+				`${relative}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return undefined;
+		}
+	};
+	const tried: string[] = [];
+
+	const legacy = adaptLegacyOauthEntry(load("oauth.js"));
+	if (legacy) {
+		piAiOauthBridge = legacy;
+		piAiOauthLoadError = undefined;
+		return legacy;
+	}
+	tried.push("dist/oauth.js exports no runtime OAuth helpers (pi-ai >= 0.80)");
+
+	const modern = adaptProviderFactories(
+		load(join("providers", "anthropic.js")),
+		load(join("providers", "openai-codex.js")),
+	);
+	if (modern) {
+		piAiOauthBridge = modern;
+		piAiOauthLoadError = undefined;
+		return modern;
+	}
+	tried.push("dist/providers/{anthropic,openai-codex}.js exposed no auth.oauth");
+
+	piAiOauthLoadError = `the @earendil-works/pi-ai at ${root} exposes no OAuth surface this extension can use. ${tried.join("; ")}`;
+	return undefined;
+}
+
+/** Load reason, or undefined when OAuth is available. */
+function piAiOauthUnavailableReason(): string | undefined {
+	tryLoadPiAiOauth();
+	return piAiOauthBridge ? undefined : piAiOauthLoadError;
+}
+
+function requirePiAiOauth(): PiAiOauthBridge {
+	const bridge = tryLoadPiAiOauth();
+	if (!bridge) {
+		throw new Error(
+			`pi-multi-account: subscription (OAuth) login is unavailable — ${piAiOauthLoadError}`,
+		);
+	}
+	return bridge;
+}
+
+/**
+ * pi-ai's static model catalog lookup. It lived on the package root until 0.79 and
+ * moved to `dist/compat.js` in 0.80, so resolve it lazily from whichever is present
+ * — and treat "absent" as "no canonical metadata", never as a load failure.
+ */
+let piAiGetModelFn: ((provider: string, id: string) => any) | null | undefined;
+
+function piAiGetModel(provider: string, id: string): any {
+	if (piAiGetModelFn === undefined) {
+		piAiGetModelFn = null;
+		const root = findPiAiRoot();
+		if (root) {
+			const localRequire = createRequire(import.meta.url);
+			for (const relative of ["compat.js", "index.js"]) {
+				const file = join(root, "dist", relative);
+				if (!existsSync(file)) continue;
+				try {
+					const candidate = localRequire(file)?.getModel;
+					if (typeof candidate === "function") {
+						piAiGetModelFn = candidate;
+						break;
+					}
+				} catch {
+					// Try the next entry point.
+				}
+			}
+		}
+	}
+	try {
+		return piAiGetModelFn?.(provider, id);
+	} catch {
+		return undefined;
+	}
+}
+import {
+	CodexCatalogFetchError,
+	compareCodexModelStrength,
+	fetchCodexModelCatalog,
+	type CodexCatalogModel,
+	type CodexCatalogSnapshot,
+} from "./model-catalog.ts";
 import {
 	fetchUsageSnapshot,
 	formatUsageCompact,
@@ -68,6 +378,7 @@ type ProviderFamily =
 	| "qwen"
 	| "ollama"
 	| "cursor";
+type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 type OpenAICodexAliasConfig = {
 	id: string;
@@ -84,11 +395,21 @@ type ProviderFailoverConfig = {
 	enabled?: boolean;
 	autoContinue?: boolean;
 	autoDiscover?: boolean;
+	autoDiscoverModels?: boolean;
 	maxAccountsPerProvider?: number;
 	includeQwen?: boolean;
 	qwenProvider?: string;
 	includeOllama?: boolean;
 	includeCursor?: boolean;
+	/**
+	 * Provider ids this extension must never fail away from, even on an actionable error.
+	 *
+	 * For providers we do not manage (no cooldown/refresh lifecycle of ours) that run their own
+	 * retry logic — typically a companion extension that owns retries for that provider. Failing
+	 * over would fight it: we would switch accounts while the other extension is mid-retry.
+	 * Only meaningful for unmanaged providers; a managed account still cools and rotates normally.
+	 */
+	neverFailoverProviders?: string[];
 	providerOrder?: ProviderFamily[];
 	cooldownMs?: number;
 	probeCooldownMs?: number;
@@ -121,6 +442,9 @@ type ProviderFailoverConfig = {
 	// Always upgrade to the newest available model on failover instead of carrying a
 	// previously-downgraded model forward forever. Default: true.
 	preferLatestModel?: boolean;
+	// Reasoning effort to apply at the start of every turn and restore after model/account
+	// switches. Default: high. Extreme levels such as xhigh are opt-in only.
+	reasoningLevel?: ReasoningLevel;
 	// Per-family override of the preferred model order (newest first). Lets you pin the
 	// latest model for each provider WITHOUT a code change when a new one ships, e.g.
 	// { "openai-codex": ["gpt-5.6", "gpt-5.5"], "anthropic": ["claude-opus-4-9"] }.
@@ -137,11 +461,13 @@ type RuntimeConfig = Required<
 		| "enabled"
 		| "autoContinue"
 		| "autoDiscover"
+		| "autoDiscoverModels"
 		| "maxAccountsPerProvider"
 		| "includeQwen"
 		| "qwenProvider"
 		| "includeOllama"
 		| "includeCursor"
+		| "neverFailoverProviders"
 		| "providerOrder"
 		| "cooldownMs"
 		| "probeCooldownMs"
@@ -163,6 +489,7 @@ type RuntimeConfig = Required<
 		| "autoRecoverStuck"
 		| "debugLog"
 		| "preferLatestModel"
+		| "reasoningLevel"
 		| "preferredModels"
 		| "resumeIdleTimeoutMs"
 		| "stuckWatchdogMs"
@@ -188,6 +515,7 @@ type ProviderFailoverState = {
 	lastProbeAtByProvider?: Record<string, number>;
 	invalidatedByProvider?: Record<string, InvalidationRecord>;
 	usageByProvider?: Record<string, UsageSnapshot>;
+	codexModelCatalogByProvider?: Record<string, CodexCatalogSnapshot>;
 	pendingContinuationPrompt?: string;
 	pendingFrom?: ModelRef;
 	pendingSince?: number;
@@ -215,6 +543,7 @@ const DEFAULT_INVALID_COOLDOWN_MS = 365 * 24 * 60 * 60 * 1000; // effectively "u
 const DEFAULT_TRANSIENT_COOLDOWN_MS = 60 * 1000;
 const DEFAULT_USAGE_REFRESH_MS = 5 * 60 * 1000;
 const DEFAULT_USAGE_STATUS_REFRESH_MS = 60 * 1000;
+const CODEX_MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
 const MIN_ANTHROPIC_USAGE_REFRESH_MS = 10 * 60 * 1000;
 const MAX_MIGRATED_COOLDOWN_MS = 8 * 24 * 60 * 60 * 1000;
 // v1.13.7 — Hard ceiling on any LIVE-parsed cooldown. Codex/usage error bodies can report the
@@ -256,7 +585,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.13.14";
+const VERSION = "1.14.0";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -479,8 +808,36 @@ const CODEX_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 		contextWindow: 272000,
 		maxTokens: 128000,
 	},
+	// Known metadata for the 5.6 family. These are NOT in DEFAULT_CODEX_MODELS on purpose —
+	// the family is picked up from the host registry / live catalog (or an explicit
+	// preferredModels pin) and these defs give it real costs and reasoning levels instead of
+	// the generic placeholder def.
+	"gpt-5.6": {
+		id: "gpt-5.6",
+		name: "GPT-5.6",
+		reasoning: true,
+		thinkingLevelMap: { xhigh: "xhigh", minimal: "low" },
+		input: ["text", "image"],
+		cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+		contextWindow: 272000,
+		maxTokens: 128000,
+	},
+	"gpt-5.6-mini": {
+		id: "gpt-5.6-mini",
+		name: "GPT-5.6 mini",
+		reasoning: true,
+		thinkingLevelMap: { xhigh: "xhigh", minimal: "low" },
+		input: ["text", "image"],
+		cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
+		contextWindow: 272000,
+		maxTokens: 128000,
+	},
 };
 
+// Offline last resort ONLY — newest first. Both the live per-account catalog and the host
+// model registry outrank this list (see refreshRegistryCodexModels), which is what makes a
+// new generation such as gpt-5.6 win with no release here. Deliberately conservative: it must
+// never *invent* a model the host has never heard of and OpenAI may not serve for this plan.
 const DEFAULT_CODEX_MODELS = [
 	"gpt-5.5",
 	"gpt-5.4",
@@ -490,6 +847,8 @@ const DEFAULT_CODEX_MODELS = [
 const DEFAULT_ANTHROPIC_MODELS = [
 	"claude-opus-4-8",
 	"claude-opus-4-5",
+	// claude-sonnet-4-6 contributed by @RuslanAsadov (PR #1).
+	"claude-sonnet-4-6",
 	"claude-sonnet-4-5",
 	"claude-haiku-4-5",
 ];
@@ -502,11 +861,13 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	enabled: true,
 	autoContinue: true,
 	autoDiscover: true,
+	autoDiscoverModels: true,
 	maxAccountsPerProvider: 10,
 	includeQwen: true,
 	qwenProvider: DEFAULT_QWEN_PROVIDER,
 	includeOllama: true,
 	includeCursor: true,
+	neverFailoverProviders: [],
 	providerOrder: DEFAULT_PROVIDER_ORDER,
 	cooldownMs: DEFAULT_COOLDOWN_MS,
 	probeCooldownMs: DEFAULT_PROBE_COOLDOWN_MS,
@@ -530,6 +891,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	autoRecoverStuck: true,
 	debugLog: true,
 	preferLatestModel: true,
+	reasoningLevel: "high",
 	preferredModels: {},
 	resumeIdleTimeoutMs: RESUME_IDLE_TIMEOUT_MS,
 	stuckWatchdogMs: STUCK_WATCHDOG_MS,
@@ -577,6 +939,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		enabled: raw.enabled ?? true,
 		autoContinue: raw.autoContinue ?? true,
 		autoDiscover: raw.autoDiscover ?? true,
+		autoDiscoverModels: raw.autoDiscoverModels ?? true,
 		maxAccountsPerProvider: Math.max(
 			1,
 			Math.floor(positiveOr(raw.maxAccountsPerProvider, 10)),
@@ -585,6 +948,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		qwenProvider: raw.qwenProvider?.trim() || DEFAULT_QWEN_PROVIDER,
 		includeOllama: raw.includeOllama ?? true,
 		includeCursor: raw.includeCursor ?? true,
+		neverFailoverProviders: stringArray(raw.neverFailoverProviders),
 		providerOrder: order.filter(
 			(f): f is ProviderFamily =>
 				f === "anthropic" ||
@@ -647,6 +1011,15 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		autoRecoverStuck: raw.autoRecoverStuck ?? true,
 		debugLog: raw.debugLog ?? true,
 		preferLatestModel: raw.preferLatestModel ?? true,
+		reasoningLevel:
+			raw.reasoningLevel === "off" ||
+			raw.reasoningLevel === "minimal" ||
+			raw.reasoningLevel === "low" ||
+			raw.reasoningLevel === "medium" ||
+			raw.reasoningLevel === "high" ||
+			raw.reasoningLevel === "xhigh"
+				? raw.reasoningLevel
+				: "high",
 		preferredModels:
 			raw.preferredModels && typeof raw.preferredModels === "object"
 				? Object.fromEntries(
@@ -1088,7 +1461,7 @@ function parseTarget(
 // ---------------------------------------------------------------------------
 
 function anthropicModelDef(id: string, providerId: string) {
-	const canonical = getModel("anthropic", id as any) as any;
+	const canonical = piAiGetModel("anthropic", id) as any;
 	if (canonical) return { ...canonical, provider: providerId };
 	return {
 		id,
@@ -1142,7 +1515,7 @@ export function mergeRefreshedCredentials(credentials: any, refreshed: any) {
 async function refreshAnthropicCredentials(credentials: any) {
 	return mergeRefreshedCredentials(
 		credentials,
-		await refreshAnthropicToken(credentials.refresh),
+		await requirePiAiOauth().anthropic.refresh(credentials),
 	);
 }
 
@@ -1156,7 +1529,10 @@ function registerAnthropicSlot(pi: ExtensionAPI, id: string) {
 		oauth: {
 			name: `Claude Pro/Max (${id})`,
 			async login(callbacks: any) {
-				return rejectDuplicateLogin(id, await loginAnthropic(callbacks));
+				return rejectDuplicateLogin(
+					id,
+					await requirePiAiOauth().anthropic.login(callbacks),
+				);
 			},
 			refreshToken: refreshAnthropicCredentials,
 			getApiKey: (credentials: any) => credentials.access,
@@ -1166,28 +1542,58 @@ function registerAnthropicSlot(pi: ExtensionAPI, id: string) {
 }
 
 function codexOAuthOverride(providerId: string, name: string) {
+	const getProvider = () => requirePiAiOauth().codex;
 	return {
 		name,
-		usesCallbackServer: openaiCodexOAuthProvider.usesCallbackServer,
-		async login(callbacks: any) {
-			return rejectDuplicateLogin(
-				providerId,
-				await openaiCodexOAuthProvider.login(callbacks),
-			);
+		// Read-only flag: Pi reads it while merely LISTING providers, long before any
+		// login. It must never throw — an unresolvable pi-ai here is what used to blow
+		// up the whole extension load. `true` mirrors pi-ai's own Codex provider, and an
+		// actual login attempt still fails loudly with an actionable message.
+		get usesCallbackServer() {
+			return tryLoadPiAiOauth()?.codex.usesCallbackServer ?? true;
 		},
-		refreshToken: openaiCodexOAuthProvider.refreshToken,
-		getApiKey: openaiCodexOAuthProvider.getApiKey,
+		async login(callbacks: any) {
+			return rejectDuplicateLogin(providerId, await getProvider().login(callbacks));
+		},
+		async refreshToken(credentials: any) {
+			return getProvider().refresh(credentials);
+		},
+		getApiKey(credentials: any) {
+			return getProvider().getApiKey(credentials);
+		},
 	};
 }
 
-function registerCodexSlot(pi: ExtensionAPI, id: string) {
-	if (id === CODEX_BASE) return; // base provider is native
-	const models = DEFAULT_CODEX_MODELS.map(codexModelDef);
+function registerCodexSlot(
+	pi: ExtensionAPI,
+	id: string,
+	models: Array<Record<string, unknown>> = DEFAULT_CODEX_MODELS.map(codexModelDef),
+) {
+	if (id === CODEX_BASE) return; // base provider is native until live catalog sync enriches it
 	pi.registerProvider(id, {
 		name: `ChatGPT Plus/Pro (Codex ${id})`,
 		baseUrl: "https://chatgpt.com/backend-api",
 		api: "openai-codex-responses" as any,
 		oauth: codexOAuthOverride(id, `ChatGPT Plus/Pro (Codex ${id})`),
+		models: models as any,
+	});
+}
+
+/** Replace one Codex provider's model list while preserving its OAuth behavior. */
+function registerCodexCatalog(
+	pi: ExtensionAPI,
+	id: string,
+	models: Array<Record<string, unknown>>,
+) {
+	const name =
+		id === CODEX_BASE
+			? "ChatGPT Plus/Pro (Codex)"
+			: `ChatGPT Plus/Pro (Codex ${id})`;
+	pi.registerProvider(id, {
+		name,
+		baseUrl: "https://chatgpt.com/backend-api",
+		api: "openai-codex-responses" as any,
+		oauth: codexOAuthOverride(id, name),
 		models: models as any,
 	});
 }
@@ -1781,7 +2187,10 @@ function anthropicOAuthOverride(providerId: string, name: string) {
 		name,
 		usesCallbackServer: true,
 		async login(callbacks: any) {
-			return rejectDuplicateLogin(providerId, await loginAnthropic(callbacks));
+			return rejectDuplicateLogin(
+				providerId,
+				await requirePiAiOauth().anthropic.login(callbacks),
+			);
 		},
 		refreshToken: refreshAnthropicCredentials,
 		getApiKey: (credentials: any) => credentials.access,
@@ -1793,6 +2202,13 @@ function anthropicOAuthOverride(providerId: string, name: string) {
 // ===========================================================================
 
 export default function piMultiAccount(pi: ExtensionAPI) {
+	// Warm up the OAuth helpers before any provider registration: providers are
+	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
+	// read from the cached module. Deliberately NON-fatal — if pi-ai's oauth entry
+	// cannot be resolved (hoisted npm layout, incompatible pi-ai), the extension
+	// still loads and every non-OAuth account keeps working; only subscription
+	// logins are unavailable, and the user is told once at session start.
+	const oauthUnavailable = piAiOauthUnavailableReason();
 	let config = loadConfig();
 	debugLogEnabled = config.debugLog;
 	let configuredFallbacks = config.fallbacks.slice();
@@ -1816,6 +2232,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	);
 	const usageByProvider = new Map<string, UsageSnapshot>(
 		Object.entries(persistedState.usageByProvider ?? {}),
+	);
+	const codexModelCatalogByProvider = new Map<string, CodexCatalogSnapshot>(
+		Object.entries(persistedState.codexModelCatalogByProvider ?? {}),
 	);
 	const usageFetches = new Map<string, Promise<UsageSnapshot>>();
 	const usageErrors = new Map<string, string>();
@@ -1845,6 +2264,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let preflightNotified = false;
 	// Slot ids registered as targets in the interactive /login provider picker.
 	const registeredSlots = new Set<string>();
+	// Strongest-first order learned from OpenAI's live per-account catalogs. It feeds the same
+	// cross-account ranking path as explicit preferredModels, so newly released flagships win
+	// immediately without hard-coding their names in this extension.
+	let discoveredCodexModelOrder: string[] = [];
+	// Same idea one level down: strongest-first order learned from the HOST model registry
+	// (plus our static list). Used whenever the live catalog is unavailable — offline, catalog
+	// fetch failing, or autoDiscoverModels turned off.
+	let registryCodexModelOrder: string[] = [];
 	let lastAuthMtime = -1;
 	const credentialHashes = new Map<string, string>();
 	// Stable per-slot account fingerprints (survive token refresh). A change means the slot was
@@ -1900,11 +2327,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let desiredThinkingLevel: any;
 
 	function captureDesiredThinking() {
+		desiredThinkingLevel = config.reasoningLevel;
 		try {
-			const level = (pi as any).getThinkingLevel?.();
-			if (level) desiredThinkingLevel = level;
+			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
 		} catch {
-			/* getThinkingLevel may be unavailable on older Pi — degrade gracefully */
+			/* older hosts clamp or reject unsupported levels; failover remains functional */
 		}
 	}
 
@@ -1993,6 +2420,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				invalidatedByProvider.entries(),
 			),
 			usageByProvider: Object.fromEntries(usageByProvider.entries()),
+			codexModelCatalogByProvider: Object.fromEntries(
+				codexModelCatalogByProvider.entries(),
+			),
 		};
 		saveState(persistedState);
 	}
@@ -2094,7 +2524,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			} else if (family === "openai-codex") {
 				refreshed = mergeRefreshedCredentials(
 					entry,
-					await openaiCodexOAuthProvider.refreshToken(entry as any),
+					await requirePiAiOauth().codex.refresh(entry as any),
 				);
 			} else if (family === "cursor") {
 				const authMod = await import(
@@ -2136,6 +2566,172 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				? { status: "terminal", error: text }
 				: { status: "transient", error: text };
 		}
+	}
+
+	function registryCodexModels(ctx: any): CodexCatalogModel[] {
+		let models: any[] = [];
+		try {
+			models = ctx?.modelRegistry
+				?.getAll?.()
+				?.filter((model: any) => model?.provider === CODEX_BASE) ?? [];
+		} catch {
+			return [];
+		}
+		return models
+			.filter(
+				(model) =>
+					typeof model?.id === "string" &&
+					// Codex only ever serves OpenAI ids. Guard against a host registry that
+					// lists something else under this provider leaking into a Codex model list.
+					/gpt|codex|^o\d/i.test(model.id),
+			)
+			.map((model) => ({
+				id: model.id,
+				name: typeof model.name === "string" ? model.name : model.id,
+				reasoning: model.reasoning !== false,
+				...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
+				input: Array.isArray(model.input) && model.input.length > 0 ? model.input : ["text"],
+				cost:
+					model.cost && typeof model.cost === "object"
+						? model.cost
+						: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow:
+					typeof model.contextWindow === "number" ? model.contextWindow : 272_000,
+				maxTokens: typeof model.maxTokens === "number" ? model.maxTokens : 128_000,
+			})) as CodexCatalogModel[];
+	}
+
+	function mergeCodexModels(...groups: CodexCatalogModel[][]): CodexCatalogModel[] {
+		const byId = new Map<string, CodexCatalogModel>();
+		for (const group of groups) {
+			for (const model of group) if (!byId.has(model.id)) byId.set(model.id, model);
+		}
+		return [...byId.values()].sort(compareCodexModelStrength);
+	}
+
+	/**
+	 * Offline Codex ordering: everything the HOST (Pi) knows about the Codex provider, merged
+	 * with our static list and sorted strongest-first.
+	 *
+	 * Without this, the built-in `DEFAULT_CODEX_MODELS` list was consulted BEFORE the host
+	 * registry, so a Pi that already shipped a newer flagship (e.g. gpt-5.6) kept failing over
+	 * to the newest model this extension happened to have been released with (gpt-5.5) — a
+	 * silent downgrade that needed a new release for every OpenAI generation. Registry-learned
+	 * models now win by version, so the next generation works with no release at all. The live
+	 * per-account catalog (when reachable) still outranks this.
+	 */
+	function refreshRegistryCodexModels(ctx: any) {
+		const merged = mergeCodexModels(
+			registryCodexModels(ctx),
+			DEFAULT_CODEX_MODELS.map((id) => codexModelDef(id) as CodexCatalogModel),
+		);
+		const ids = merged.map((model) => model.id);
+		if (ids.join(",") === registryCodexModelOrder.join(",")) return;
+		registryCodexModelOrder = ids;
+		// Alias slots are registered from our static list, so a model only the host knows about
+		// would not be selectable on them. Re-register — but never over a live catalog, which is
+		// authoritative for that specific account.
+		for (const provider of registeredSlots) {
+			if (classifyProvider(provider, config.qwenProvider) !== "openai-codex") continue;
+			if (codexModelCatalogByProvider.has(provider)) continue;
+			registerCodexCatalog(pi, provider, merged as Array<Record<string, unknown>>);
+		}
+	}
+
+	async function fetchFreshCodexCatalog(
+		ctx: any,
+		provider: string,
+	): Promise<CodexCatalogModel[]> {
+		let entry = readAuthFile()[provider];
+		if (!entry) throw new CodexCatalogFetchError(`${provider} has no stored credential`);
+		const runFetch = () =>
+			fetchCodexModelCatalog(entry, { clientVersion: VERSION });
+		try {
+			return await runFetch();
+		} catch (error) {
+			if (
+				!(error instanceof CodexCatalogFetchError) ||
+				error.status !== 401 ||
+				!isRefreshable(provider)
+			) {
+				throw error;
+			}
+			const refreshed = await forceRefreshProvider(ctx, provider);
+			if (refreshed.status !== "refreshed") throw error;
+			entry = readAuthFile()[provider];
+			if (!entry) throw error;
+			return runFetch();
+		}
+	}
+
+	/**
+	 * Pull OpenAI's account-specific catalog and immediately replace every Codex alias model list.
+	 * The backend's priority is authoritative; Pi's built-in registry and our static definitions are
+	 * only an offline fallback. Catalog snapshots are credential-free and safe to persist.
+	 */
+	async function syncCodexModelCatalog(ctx: any, force = false) {
+		if (!config.autoDiscoverModels) return;
+		const auth = readAuthFile();
+		const providers = Object.keys(auth).filter(
+			(provider) =>
+				classifyProvider(provider, config.qwenProvider) === "openai-codex" &&
+				isEntryUsable(auth[provider]),
+		);
+		const registryFallback = mergeCodexModels(
+			registryCodexModels(ctx),
+			DEFAULT_CODEX_MODELS.map((id) => codexModelDef(id) as CodexCatalogModel),
+		);
+		let changed = false;
+		await Promise.all(
+			providers.map(async (provider) => {
+				const cached = codexModelCatalogByProvider.get(provider);
+				if (
+					!force &&
+					cached &&
+					Date.now() - cached.fetchedAt < CODEX_MODEL_CATALOG_TTL_MS
+				) {
+					return;
+				}
+				try {
+					const models = await fetchFreshCodexCatalog(ctx, provider);
+					codexModelCatalogByProvider.set(provider, {
+						fetchedAt: Date.now(),
+						models,
+					});
+					changed = true;
+					logEvent("model_catalog_refresh", {
+						provider,
+						models: models.map((model) => model.id).join(","),
+					});
+				} catch (error) {
+					logEvent("model_catalog_error", {
+						provider,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}),
+		);
+
+		const allKnown = mergeCodexModels(
+			...providers.map(
+				(provider) => codexModelCatalogByProvider.get(provider)?.models ?? [],
+			),
+			registryFallback,
+		);
+		discoveredCodexModelOrder = allKnown.map((model) => model.id);
+
+		for (const provider of providers) {
+			const models = codexModelCatalogByProvider.get(provider)?.models ?? registryFallback;
+			registerCodexCatalog(pi, provider, models as Array<Record<string, unknown>>);
+		}
+		// Also keep unauthenticated spare login slots current so a newly logged-in account can select
+		// the new flagship before the next restart/session refresh.
+		for (const provider of registeredSlots) {
+			if (classifyProvider(provider, config.qwenProvider) !== "openai-codex") continue;
+			if (providers.includes(provider)) continue;
+			registerCodexCatalog(pi, provider, allKnown as Array<Record<string, unknown>>);
+		}
+		if (changed) persist();
 	}
 
 	function cachedUsage(provider: string): UsageSnapshot | undefined {
@@ -2247,7 +2843,21 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const blockMs = cooldownMsFromUsage(snapshot);
 		if (blockMs !== undefined && blockMs > 0) {
 			markExhausted(snapshot.provider, blockMs);
+		} else if (blockMs === 0) {
+			// A live account probe is allowed to contradict an older reset estimate. Plans can be
+			// upgraded, credits can be purchased, and providers can restore capacity before the
+			// previously advertised resetAt. Fresh headroom therefore clears the old cooldown; the
+			// usage-untrusted guard inside applyUsageToCooldown still protects session limits that
+			// the quota endpoint is known not to see.
+			applyUsageToCooldown(snapshot.provider, snapshot, Date.now());
 		}
+		logEvent("usage_refresh", {
+			provider: snapshot.provider,
+			family: snapshot.family,
+			plan: snapshot.plan ?? "unknown",
+			primaryUsedPercent: snapshot.primary?.usedPercent ?? "unknown",
+			blocked: blockMs !== undefined && blockMs > 0,
+		});
 		persist();
 		updateUsageStatus(ctx);
 	}
@@ -2325,6 +2935,34 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
+	/**
+	 * Refresh every authenticated account independently, not just the account currently selected
+	 * in the session. This is what detects an early quota restoration, a purchased credit balance,
+	 * or a Free -> Plus/Pro plan upgrade while the account is benched by an older 100% snapshot.
+	 *
+	 * refreshUsage() already applies a per-family TTL and deduplicates in-flight requests, so calling
+	 * this from the status timer is cheap: network traffic occurs only when an account's own snapshot
+	 * is stale. Qwen/Cursor use honest capability-only snapshots because they expose no quota API.
+	 */
+	async function refreshRotationUsage(ctx: any, force = false) {
+		if (!config.showUsage) {
+			updateUsageStatus(ctx);
+			return;
+		}
+		const providers = [
+			...new Set(
+				rotation.filter(
+					(provider) =>
+						!!usageFamily(provider) && providerHasUsableAuth(ctx, provider),
+				),
+			),
+		];
+		await Promise.all(
+			providers.map((provider) => refreshUsage(ctx, provider, force)),
+		);
+		updateUsageStatus(ctx);
+	}
+
 	function clearUsageStatusTimer() {
 		if (!usageStatusTimer) return;
 		clearInterval(usageStatusTimer);
@@ -2333,12 +2971,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function startUsageStatusTimer(ctx: any) {
 		clearUsageStatusTimer();
-		if (!config.showUsage || typeof ctx?.ui?.setStatus !== "function") {
+		if (!config.showUsage && !config.autoDiscoverModels) {
 			updateUsageStatus(ctx);
 			return;
 		}
 		usageStatusTimer = setInterval(() => {
-			runBackground("usage status timer", ctx, () => refreshUsage(ctx));
+			runBackground("rotation metadata refresh", ctx, async () => {
+				await refreshRotationUsage(ctx);
+				// Re-registering provider models is safe while idle and avoids touching the registry in
+				// the middle of a streaming request. The five-minute catalog TTL keeps this sweep cheap.
+				if (ctx?.isIdle?.() !== false) await syncCodexModelCatalog(ctx);
+			});
 		}, config.usageStatusRefreshMs);
 		(usageStatusTimer as any).unref?.();
 	}
@@ -2737,11 +3380,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return duplicates;
 	}
 
+	/**
+	 * `explicit` = the user asked for Cursor by name (`/multi-account add cursor`), which is
+	 * the ONLY case where a missing provider clone is worth a warning. On the automatic path
+	 * a not-installed Cursor provider is a silent no-op: `includeCursor` defaults to true, so
+	 * warning there nagged every user who never wanted Cursor at all.
+	 */
 	async function refreshCursorSlots(
 		auth: Record<string, AuthEntry>,
 		ctx?: any,
+		explicit = false,
 	) {
 		if (!config.includeCursor) return;
+		if (!explicit && !isCursorProviderInstalled()) return;
 		const slotIds = [
 			...new Set([
 				...Object.keys(auth).filter(
@@ -2765,10 +3416,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	/** Register authed alias slots plus one spare per family for the next interactive /login. */
 	function syncRegisteredSlots(auth: Record<string, AuthEntry>) {
+		// Cursor is the one family whose provider lives in a separate, optional repo. Unlike
+		// anthropic/codex/qwen/ollama — which only ever create slots backed by a real auth
+		// entry — cursor used to conjure a spare `cursor-account-2` out of nothing, so /login
+		// offered a slot no provider could serve. Only offer cursor slots once the provider
+		// is actually on disk.
+		const cursorAvailable = config.includeCursor && isCursorProviderInstalled();
 		const families: ProviderFamily[] = [
 			"anthropic",
 			"openai-codex",
-			"cursor",
+			...(cursorAvailable ? (["cursor"] as const) : []),
 			"ollama",
 			"qwen",
 		];
@@ -2811,7 +3468,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				registeredSlots.add(id);
 			}
 		}
-		if (config.includeCursor) void refreshCursorSlots(auth);
+		if (cursorAvailable) void refreshCursorSlots(auth);
 	}
 
 	function reloadHostAuth(ctx: any) {
@@ -2848,6 +3505,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				nextIdentity !== previousIdentity
 			) {
 				if (exhaustedUntilByProvider.delete(provider)) cooldownsCleared = true;
+				// Model availability is account/plan-specific. Never let a newly logged-in account
+				// inherit the previous account's five-minute catalog snapshot for this slot.
+				if (codexModelCatalogByProvider.delete(provider)) cooldownsCleared = true;
 				// A different real account also clears any stale 401-streak tracking: the new
 				// account's credentials are unrelated to the old failures.
 				authFailures.delete(provider);
@@ -2883,6 +3543,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (cooldownsCleared) persist();
 		clearReauthedInvalidations(auth);
 		syncRegisteredSlots(auth);
+		// After the slots exist: learn the host's Codex model list, so a flagship that shipped
+		// with Pi (and not with this extension) is selectable and preferred on every slot.
+		if (ctx) refreshRegistryCodexModels(ctx);
 		duplicateSlots = discoverDuplicateSlots(auth);
 		rotation = discoverRotation(auth);
 		return true;
@@ -2940,7 +3603,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return family === "anthropic"
 			? DEFAULT_ANTHROPIC_MODELS
 			: family === "openai-codex"
-				? DEFAULT_CODEX_MODELS
+				? discoveredCodexModelOrder.length > 0
+					? discoveredCodexModelOrder
+					: registryCodexModelOrder.length > 0
+						? registryCodexModelOrder
+						: DEFAULT_CODEX_MODELS
 				: family === "ollama"
 					? DEFAULT_OLLAMA_MODELS
 					: family === "qwen"
@@ -3022,6 +3689,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	) {
 		reconcileCooldownsFromUsage(ctx);
 		pruneCooldowns();
+		// Cheap and idempotent: guarantees the newest Codex generation the host knows about is
+		// ranked first at the exact moment we choose a fallback, even if no session_start ran.
+		refreshRegistryCodexModels(ctx);
 		const fallbacks = activeFallbacks();
 		if (fallbacks.length === 0) return [];
 
@@ -3093,10 +3763,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (scored.length === 0) return [];
 
 		// Manual `/multi-account next`: walk the rotation forward from the current account,
-		// wrapping around, so repeated presses cycle through EVERY account instead of bouncing
-		// between the two whose cooldowns happen to be shortest. Accounts that are free RIGHT NOW
-		// are offered first (still in rotation order); only if none are free do we cycle through
-		// the cooling ones — the user is explicitly overriding the cooldown in that case.
+		// wrapping around, so repeated presses cycle through EVERY account. This is an explicit user
+		// override: quota/cooldown metadata may be stale after an early provider reset, purchased
+		// credits, or a plan upgrade, so it must never reorder the manual ring or permanently starve
+		// an account. Automatic failover still prefers accounts known to be available right now.
 		if (options.manualRoundRobin) {
 			const n = fallbacks.length;
 			const currentRotIndex = currentModel?.provider
@@ -3110,10 +3780,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					: (rotIndex - currentRotIndex + n) % n || n;
 			const byDistance = (a: Scored, b: Scored) =>
 				forwardDistance(a.rotIndex) - forwardDistance(b.rotIndex);
-			let ordered = [
-				...scored.filter((s) => s.remaining === 0).sort(byDistance),
-				...scored.filter((s) => s.remaining > 0).sort(byDistance),
-			];
+			let ordered = [...scored].sort(byDistance);
 			if (
 				lastLeftProvider &&
 				now - lastLeftAt < ANTI_PINGPONG_MS &&
@@ -4240,6 +4907,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		authFailures.delete(provider);
 		usageByProvider.delete(provider);
 		usageErrors.delete(provider);
+		codexModelCatalogByProvider.delete(provider);
 		credentialHashes.delete(provider);
 		credentialIdentities.delete(provider);
 		registeredSlots.delete(provider);
@@ -4340,7 +5008,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				);
 			} else {
 				lines.push(
-					'Tip: pin the newest model per provider in provider-failover.json, e.g. "preferredModels": { "openai-codex": ["gpt-5.6","gpt-5.5"] }, then /multi-account reload.',
+					`Live Codex discovery: ${config.autoDiscoverModels ? `ON${discoveredCodexModelOrder.length ? ` — ${discoveredCodexModelOrder.join(" → ")}` : " — no cached catalog yet"}` : "OFF"}.`,
 				);
 			}
 			ctx.ui.notify(lines.join("\n"), "info");
@@ -4353,7 +5021,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			configuredFallbacks = config.fallbacks.slice();
 			refreshDiscovery(true, ctx);
 			startUsageStatusTimer(ctx);
-			runBackground("reload usage refresh", ctx, () => refreshUsage(ctx));
+			runBackground("reload account metadata refresh", ctx, async () => {
+				await refreshRotationUsage(ctx);
+				await syncCodexModelCatalog(ctx, true);
+			});
 			ctx.ui.notify(
 				"pi-multi-account: config reloaded and accounts re-discovered",
 				"info",
@@ -4362,6 +5033,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		if (command === "rediscover") {
 			const changed = refreshDiscovery(true, ctx);
+			runBackground("rediscover account metadata refresh", ctx, async () => {
+				await refreshRotationUsage(ctx);
+				await syncCodexModelCatalog(ctx, true);
+			});
 			ctx.ui.notify(
 				`pi-multi-account: rediscovered accounts${changed ? "" : " (no auth.json change)"}. Rotation: ${rotation.join(" → ") || "none"}`,
 				"info",
@@ -4392,6 +5067,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				return;
 			}
 			const id = slotId(family, n, config.qwenProvider);
+			if (family === "cursor" && !isCursorProviderInstalled()) {
+				// Asked for by name → this is exactly when the clone instruction is useful.
+				await refreshCursorSlots(auth, ctx, true);
+				return;
+			}
 			syncRegisteredSlots(auth);
 			if (
 				family === "anthropic" ||
@@ -4521,6 +5201,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			authFailures.clear();
 			usageByProvider.clear();
 			usageErrors.clear();
+			codexModelCatalogByProvider.clear();
+			discoveredCodexModelOrder = [];
 			responseCooldownHints.clear();
 			handledAssistantErrors.clear();
 			currentPromptSwitch = undefined;
@@ -4535,6 +5217,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				lastProbeAtByProvider: {},
 				invalidatedByProvider: {},
 				usageByProvider: {},
+				codexModelCatalogByProvider: {},
 				lastSwitches: [],
 			};
 			saveState(persistedState);
@@ -4571,6 +5254,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				lastProbeAtByProvider: {},
 				invalidatedByProvider: {},
 				usageByProvider: {},
+				codexModelCatalogByProvider: Object.fromEntries(
+					codexModelCatalogByProvider.entries(),
+				),
 				lastSwitches: [],
 			};
 			invalidatedByProvider.clear();
@@ -4895,10 +5581,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			canSwitch,
 			canResume,
 			seamlessResume,
+			...(oauthUnavailable ? { oauthUnavailable } : {}),
 		});
 		// One notice per process — informative, never nagging on every session.
 		if (!preflightNotified) {
 			preflightNotified = true;
+			if (oauthUnavailable) {
+				// The extension is alive (api-key accounts keep rotating) but no
+				// subscription account can log in or refresh — say so plainly instead of
+				// letting the user hit it mid-failover.
+				ctx.ui?.notify?.(
+					`pi-multi-account v${VERSION}: subscription (OAuth) logins are unavailable — ${oauthUnavailable}`,
+					"warning",
+				);
+			}
 			if (!canSwitch) {
 				ctx.ui?.notify?.(
 					`pi-multi-account v${VERSION}: this Pi build does not expose pi.setModel() — automatic account switching is IMPOSSIBLE on this host, so failover cannot work until it is restored. Check your @earendil-works/pi-coding-agent version.`,
@@ -4922,6 +5618,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	safeOn("session_start", async (_event, ctx) => {
 		preflightHostCapabilities(ctx);
 		refreshDiscovery(true, ctx);
+		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
 		pruneCooldowns();
 		// Tight session binding: every session starts as a clean slate. Auto-resume only ever
@@ -4954,11 +5651,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				"warning",
 			);
 		}
+		// Refresh every account BEFORE deciding the selected model is unavailable. Otherwise a
+		// plan upgrade can revive the current account milliseconds after startup preflight has
+		// already switched away from it using the old plan's stale 100% snapshot.
+		await refreshRotationUsage(ctx);
+		await syncCodexModelCatalog(ctx);
 		await ensureReadyModel(
 			ctx,
 			"startup preflight: selected account unavailable",
 		);
-		await refreshUsage(ctx);
 		startUsageStatusTimer(ctx);
 	});
 
@@ -5209,6 +5910,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// any actionable error. scope:"model" + a short cooldown so we never poison a provider we
 		// don't own.
 		if (!managed) {
+			// Opt-out for unmanaged providers that run their own retry logic (usually a companion
+			// extension owning retries for that provider). Switching accounts underneath it would
+			// fight those retries, so leave the turn alone entirely.
+			if (config.neverFailoverProviders.includes(provider)) {
+				logEvent("failover_suppressed", {
+					provider,
+					model: modelId,
+					reason: "neverFailoverProviders",
+				});
+				return;
+			}
 			if (
 				isLimitError(errorText) ||
 				isAuthError(errorText) ||

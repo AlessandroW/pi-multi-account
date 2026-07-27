@@ -5,6 +5,79 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-07-27
+
+### Fixed
+
+- **The extension no longer fails to load** with `undefined is not an object (evaluating
+  '_oauth.openaiCodexOAuthProvider.usesCallbackServer')` (issue #3). Two independent causes, both
+  closed:
+  - `@earendil-works/pi-ai` was only ever probed inside the extension's *own* `node_modules`, so
+    every hoisted `npm install` / `pi install` layout — where pi-ai sits next to the package —
+    found nothing. Resolution now walks ancestor `node_modules` the way Node does and falls back
+    to `require.resolve`.
+  - pi-ai 0.80 **removed** the runtime OAuth surface: `dist/oauth.js` is now types-only, `getModel`
+    moved to `dist/compat.js`, and the implementations live behind provider factories with a new
+    `login(interaction)` / `refresh(credential)` API. Both eras are now normalized behind one
+    internal bridge, including an adapter from Pi's legacy OAuth callbacks to pi-ai's
+    `AuthInteraction` (this fixes `interaction.notify is not a function` during browser login).
+    Diagnosis and the 0.80+ approach contributed by **@lfoscari** (PR #4).
+
+  Loading is now non-fatal in every case: a pi-ai that cannot be adapted degrades to "subscription
+  login unavailable" with an actionable message at session start, and API-key accounts keep
+  rotating instead of the whole extension dying at startup.
+
+- **A brand-new OpenAI generation no longer needs a release of this extension** (issue #2). The
+  built-in model list was consulted *before* the host model registry, so a Pi that already shipped
+  `gpt-5.6` still failed over to `gpt-5.5`. Models the host knows about are now merged and ranked
+  by version, and re-registered onto numbered account aliases so they are selectable there too.
+  The live per-account catalog still outranks everything. `gpt-5.6` / `gpt-5.6-mini` metadata added.
+
+- **Cursor no longer appears in sessions that never asked for it** (issue #5). With
+  `includeCursor` on by default but the (separately cloned) Cursor provider absent, the extension
+  registered a phantom `cursor-account-2` login slot backed by nothing and printed a `git clone`
+  warning at every start. Cursor slots are now created only once the provider is actually on disk,
+  and the install instructions appear only on the explicit `/multi-account add cursor` path.
+  Cloning the provider is picked up on the next discovery pass — no restart needed.
+
+### Added
+
+- `claude-sonnet-4-6` to the default Anthropic model list — contributed by **@RuslanAsadov** (PR #1).
+
+## [1.13.16] - 2026-07-15
+
+### Added
+
+- **New OpenAI Codex models are discovered automatically per account.** The extension now calls
+  OpenAI's authenticated `/backend-api/codex/models` catalog at session start and on explicit
+  reload/rediscovery, mirrors each account's selectable models onto its numbered Pi alias, and
+  follows the catalog's server-defined priority. The credential-free catalog is cached for five
+  minutes and persisted, so transient network failures do not erase a known model. Pi's own model
+  registry and the static list remain offline fallbacks. Manual `preferredModels` overrides still
+  win when the user deliberately pins an order.
+- **High reasoning is now the default contract.** `reasoningLevel` defaults to `"high"`, is applied
+  at the start of every turn, and is restored after every account/model switch. Extreme levels
+  such as `xhigh` / Max / Ultra are never selected automatically; `xhigh` is available only through
+  an explicit config override. Hosts/models with smaller capability clamp safely.
+
+## [1.13.15] - 2026-07-15
+
+### Fixed
+
+- **Plan upgrades, purchased credits, and early provider resets now revive benched accounts.**
+  Usage is refreshed independently for every authenticated rotation account at startup and on the
+  existing status interval (with the existing per-family TTL and in-flight deduplication). A fresh
+  usage response with headroom clears the older cooldown, even when its previous `resetAt` is still
+  in the future. This closes the stale `100% Free` trap where an account upgraded to Plus/Pro stayed
+  excluded until the old plan's projected reset date because only the currently selected account
+  was ever polled.
+- **`/multi-account next` is now a true manual override.** It walks the complete account ring in
+  rotation order without moving cached-cooling accounts behind every nominally-free provider.
+  Automatic failover still avoids known-spent accounts; only the explicit user command ignores
+  potentially stale quota metadata. The black-box log now records credential-free `usage_refresh`
+  decisions so future stale-limit reports show exactly which account was rechecked and why it stayed
+  blocked or became available.
+
 ## [1.13.14] - 2026-07-07
 
 ### Fixed
