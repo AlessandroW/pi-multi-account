@@ -99,6 +99,59 @@ export function compareCodexModelStrength(
 	return variant || a.id.localeCompare(b.id);
 }
 
+/** Anthropic ships dated aliases (`claude-opus-4-5-20251101`) beside the rolling id. */
+function isDatedAnthropicAlias(id: string): boolean {
+	return /-\d{8}$/.test(id);
+}
+
+function anthropicTierRank(id: string): number {
+	const lower = id.toLowerCase();
+	if (lower.includes("opus")) return 3;
+	if (lower.includes("sonnet")) return 2;
+	if (lower.includes("haiku")) return 1;
+	return 0;
+}
+
+/** Numeric generation parts after the tier: `claude-opus-4-8` -> [4,8], `claude-opus-5` -> [5]. */
+function anthropicVersionParts(id: string): number[] {
+	const tail = id.toLowerCase().replace(/^.*?(opus|sonnet|haiku)/, "");
+	return (tail.match(/\d+/g) ?? [])
+		.map(Number)
+		.filter((n) => Number.isFinite(n) && n < 100_000);
+}
+
+/**
+ * Strongest-first ordering for Anthropic model ids, so a newly released flagship (e.g.
+ * `claude-opus-5` arriving in Pi's registry) outranks the newest id this extension happened to
+ * be released with — the same release-per-model treadmill that was removed for Codex.
+ *
+ * Tier dominates version: Anthropic's flagship line is Opus, and the project's hard rule is to
+ * stay on a provider's top model. Within a tier, the higher generation wins.
+ */
+export function compareAnthropicModelStrength(a: string, b: string): number {
+	const tier = anthropicTierRank(b) - anthropicTierRank(a);
+	if (tier !== 0) return tier;
+	const av = anthropicVersionParts(a);
+	const bv = anthropicVersionParts(b);
+	for (let i = 0; i < Math.max(av.length, bv.length); i++) {
+		if ((av[i] ?? 0) !== (bv[i] ?? 0)) return (bv[i] ?? 0) - (av[i] ?? 0);
+	}
+	// Prefer the rolling id over its dated alias so the list is not doubled up.
+	const dated = Number(isDatedAnthropicAlias(a)) - Number(isDatedAnthropicAlias(b));
+	return dated || a.localeCompare(b);
+}
+
+/** Known Anthropic chat model ids, strongest first, deduped and without dated aliases. */
+export function rankAnthropicModelIds(ids: Iterable<string>): string[] {
+	const seen = new Set<string>();
+	for (const id of ids) {
+		if (typeof id !== "string" || !id.trim()) continue;
+		if (!/claude/i.test(id) || isDatedAnthropicAlias(id)) continue;
+		seen.add(id);
+	}
+	return [...seen].sort(compareAnthropicModelStrength);
+}
+
 export function parseCodexModelCatalog(body: unknown): CodexCatalogModel[] {
 	const source = record(body);
 	const rawModels = Array.isArray(source.models)

@@ -3,7 +3,60 @@ import test from "node:test";
 import {
 	compareCodexModelStrength,
 	parseCodexModelCatalog,
+	rankAnthropicModelIds,
 } from "../model-catalog.ts";
+
+test("a newly released Claude flagship outranks the newest one this extension shipped with", () => {
+	// The exact miss that prompted this: Pi's registry already had claude-opus-5 while the
+	// extension's static list still topped out at claude-opus-4-8, so failover stayed on 4-8.
+	const ranked = rankAnthropicModelIds([
+		"claude-opus-4-8",
+		"claude-sonnet-4-6",
+		"claude-opus-5",
+		"claude-haiku-4-5",
+	]);
+	assert.equal(ranked[0], "claude-opus-5");
+});
+
+test("Claude ordering is tier-first, then generation", () => {
+	assert.deepEqual(
+		rankAnthropicModelIds([
+			"claude-haiku-4-5",
+			"claude-sonnet-4-5",
+			"claude-opus-4-5",
+			"claude-sonnet-4-6",
+			"claude-opus-4-8",
+		]),
+		[
+			"claude-opus-4-8",
+			"claude-opus-4-5",
+			"claude-sonnet-4-6",
+			"claude-sonnet-4-5",
+			"claude-haiku-4-5",
+		],
+	);
+});
+
+test("an unreleased future Claude generation ranks without an extension release", () => {
+	const ranked = rankAnthropicModelIds([
+		"claude-opus-5",
+		"claude-opus-6",
+		"claude-opus-5-2",
+	]);
+	assert.deepEqual(ranked, ["claude-opus-6", "claude-opus-5-2", "claude-opus-5"]);
+});
+
+test("dated Claude aliases and non-Claude ids never pollute the ranking", () => {
+	assert.deepEqual(
+		rankAnthropicModelIds([
+			"claude-opus-4-5-20251101",
+			"claude-opus-4-5",
+			"gpt-5.5",
+			"",
+		]),
+		["claude-opus-4-5"],
+	);
+});
 
 test("live Codex catalog follows server priority: Sol beats Terra and Luna", () => {
 	const models = parseCodexModelCatalog({

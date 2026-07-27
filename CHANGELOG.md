@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.1] - 2026-07-27
+
+### Fixed
+
+- **A Cursor provider that fails to load can no longer damage the session.** Cursor lives in a
+  separate repo, on whatever Node the user runs; a clone that is incompatible with the running
+  Node (for example a JSON import newer Node rejects) threw during setup. That rejection escaped
+  the fire-and-forget discovery call as an **unhandled rejection** — which Node can turn into a
+  process exit — and aborted `session_start` partway, skipping the reset that clears a previous
+  session's pending auto-resume. A stale resume surviving into a new session means silently
+  restarting work the user never asked to restart. The failure is now contained, logged, and
+  reported once; everything else continues.
+
+- **A newly released Claude flagship no longer needs a release of this extension.** The Anthropic
+  model list was hard-coded, so when `claude-opus-5` shipped in Pi's registry the extension still
+  ranked `claude-opus-4-8` highest and failover stayed on the older model — silently breaking the
+  project's hard rule of always using a provider's top model. Claude models known to the host are
+  now merged and ranked (tier first, then generation) exactly as Codex models already were, and
+  re-registered onto numbered account aliases so they are selectable there too. `claude-opus-5`
+  added to the built-in ordering as well.
+
+### Changed
+
+- The invented `gpt-5.6` / `gpt-5.6-mini` entries added in 1.14.0 were removed: OpenAI's real 5.6
+  family ships as `gpt-5.6-sol` / `-terra` / `-luna`, and those come from the host registry and the
+  live per-account catalog with correct metadata. Guessed ids risk offering a model a plan cannot
+  serve and re-introduce the release-per-generation treadmill the 1.14.0 fix removed.
+
 ## [1.14.0] - 2026-07-27
 
 ### Fixed

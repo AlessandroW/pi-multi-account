@@ -41,6 +41,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	CURSOR_BASE,
+	getCursorProviderRoot,
 	isCursorProviderId,
 	isCursorProviderInstalled,
 	setupCursorSubscription,
@@ -355,6 +356,7 @@ import {
 	CodexCatalogFetchError,
 	compareCodexModelStrength,
 	fetchCodexModelCatalog,
+	rankAnthropicModelIds,
 	type CodexCatalogModel,
 	type CodexCatalogSnapshot,
 } from "./model-catalog.ts";
@@ -585,7 +587,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.14.0";
+const VERSION = "1.14.1";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -808,31 +810,12 @@ const CODEX_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 		contextWindow: 272000,
 		maxTokens: 128000,
 	},
-	// Known metadata for the 5.6 family. These are NOT in DEFAULT_CODEX_MODELS on purpose —
-	// the family is picked up from the host registry / live catalog (or an explicit
-	// preferredModels pin) and these defs give it real costs and reasoning levels instead of
-	// the generic placeholder def.
-	"gpt-5.6": {
-		id: "gpt-5.6",
-		name: "GPT-5.6",
-		reasoning: true,
-		thinkingLevelMap: { xhigh: "xhigh", minimal: "low" },
-		input: ["text", "image"],
-		cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
-		contextWindow: 272000,
-		maxTokens: 128000,
-	},
-	"gpt-5.6-mini": {
-		id: "gpt-5.6-mini",
-		name: "GPT-5.6 mini",
-		reasoning: true,
-		thinkingLevelMap: { xhigh: "xhigh", minimal: "low" },
-		input: ["text", "image"],
-		cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
-		contextWindow: 272000,
-		maxTokens: 128000,
-	},
 };
+// Deliberately NOT listing the 5.6 family (gpt-5.6-sol / -terra / -luna) or anything newer here.
+// Those come from the host model registry and the live per-account catalog, which carry their real
+// costs, context windows and reasoning levels — and `compareCodexModelStrength` already ranks an
+// unknown generation correctly by version and variant. Hard-coding guessed ids would risk offering
+// a model a given plan cannot serve, and re-introduce the release-per-generation treadmill.
 
 // Offline last resort ONLY — newest first. Both the live per-account catalog and the host
 // model registry outrank this list (see refreshRegistryCodexModels), which is what makes a
@@ -844,7 +827,10 @@ const DEFAULT_CODEX_MODELS = [
 	"gpt-5.4-mini",
 	"gpt-5.3-codex-spark",
 ];
+// Newest first. Offline fallback ordering: the host model registry is consulted too (see
+// refreshRegistryAnthropicModels), so a newer flagship wins even before it is listed here.
 const DEFAULT_ANTHROPIC_MODELS = [
+	"claude-opus-5",
 	"claude-opus-4-8",
 	"claude-opus-4-5",
 	// claude-sonnet-4-6 contributed by @RuslanAsadov (PR #1).
@@ -1519,9 +1505,13 @@ async function refreshAnthropicCredentials(credentials: any) {
 	);
 }
 
-function registerAnthropicSlot(pi: ExtensionAPI, id: string) {
+function registerAnthropicSlot(
+	pi: ExtensionAPI,
+	id: string,
+	modelIds: string[] = DEFAULT_ANTHROPIC_MODELS,
+) {
 	if (id === ANTHROPIC_BASE) return; // base provider: oauth + shaping registered in piMultiAccount()
-	const models = DEFAULT_ANTHROPIC_MODELS.map((m) => anthropicModelDef(m, id));
+	const models = modelIds.map((m) => anthropicModelDef(m, id));
 	pi.registerProvider(id, {
 		name: `Claude Pro/Max (${id})`,
 		baseUrl: "https://api.anthropic.com",
@@ -2264,6 +2254,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let preflightNotified = false;
 	// Slot ids registered as targets in the interactive /login provider picker.
 	const registeredSlots = new Set<string>();
+	// One notice per process when the optional Cursor provider cannot be loaded.
+	let cursorSetupFailureNotified = false;
 	// Strongest-first order learned from OpenAI's live per-account catalogs. It feeds the same
 	// cross-account ranking path as explicit preferredModels, so newly released flagships win
 	// immediately without hard-coding their names in this extension.
@@ -2272,6 +2264,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// (plus our static list). Used whenever the live catalog is unavailable — offline, catalog
 	// fetch failing, or autoDiscoverModels turned off.
 	let registryCodexModelOrder: string[] = [];
+	// The same, for Anthropic. Anthropic publishes no per-account catalog API, so the host
+	// registry is the only way a new flagship (e.g. claude-opus-5) can win without a release.
+	let registryAnthropicModelOrder: string[] = [];
 	let lastAuthMtime = -1;
 	const credentialHashes = new Map<string, string>();
 	// Stable per-slot account fingerprints (survive token refresh). A change means the slot was
@@ -2620,6 +2615,38 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * models now win by version, so the next generation works with no release at all. The live
 	 * per-account catalog (when reachable) still outranks this.
 	 */
+	/**
+	 * Offline Anthropic ordering: every Claude model the HOST knows, merged with our static list
+	 * and ranked strongest-first. Without this, a new flagship shipped by Pi (claude-opus-5 while
+	 * this extension's list still topped out at claude-opus-4-8) was invisible to failover, which
+	 * silently broke the project's hard rule of always staying on a provider's top model.
+	 */
+	function refreshRegistryAnthropicModels(ctx: any) {
+		let hostIds: string[] = [];
+		try {
+			hostIds =
+				ctx?.modelRegistry
+					?.getAll?.()
+					?.filter((model: any) => model?.provider === ANTHROPIC_BASE)
+					?.map((model: any) => model?.id) ?? [];
+		} catch {
+			hostIds = [];
+		}
+		const ranked = rankAnthropicModelIds([
+			...hostIds,
+			...DEFAULT_ANTHROPIC_MODELS,
+		]);
+		if (ranked.length === 0) return;
+		if (ranked.join(",") === registryAnthropicModelOrder.join(",")) return;
+		registryAnthropicModelOrder = ranked;
+		// Alias slots are registered from the static list, so a model only the host knows about
+		// would not be selectable on them even once it is ranked first.
+		for (const provider of registeredSlots) {
+			if (classifyProvider(provider, config.qwenProvider) !== "anthropic") continue;
+			registerAnthropicSlot(pi, provider, ranked);
+		}
+	}
+
 	function refreshRegistryCodexModels(ctx: any) {
 		const merged = mergeCodexModels(
 			registryCodexModels(ctx),
@@ -3406,12 +3433,35 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				),
 			]),
 		].sort((a, b) => slotIndex(a) - slotIndex(b));
-		await setupCursorSubscription(pi, {
-			readAuth: readAuthFile,
-			rejectDuplicateLogin: (slot, creds) => rejectDuplicateLogin(slot, creds),
-			slotIds,
-			notify: (message, level) => ctx?.ui?.notify?.(message, level),
-		});
+		// Cursor lives in a separate repo we do not control, on whatever Node the user runs.
+		// A version-incompatible clone (e.g. a JSON import that newer Node rejects) must never
+		// escape as a rejected promise: on the automatic path this is fire-and-forget, so it
+		// would surface as an unhandled rejection, and inside session_start it aborted the rest
+		// of the handler — skipping the pending-resume reset that must run on every session.
+		// Cursor is optional; nothing else may be lost because it failed.
+		try {
+			await setupCursorSubscription(pi, {
+				readAuth: readAuthFile,
+				rejectDuplicateLogin: (slot, creds) => rejectDuplicateLogin(slot, creds),
+				slotIds,
+				notify: (message, level) => ctx?.ui?.notify?.(message, level),
+			});
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			logEvent("cursor_setup_failed", { reason });
+			// Once per process: the user cloned it deliberately, so silence would be wrong —
+			// but repeating it on every discovery pass would be nagging. The flag is set only
+			// once a notice was really delivered: the first attempt runs from discovery, which
+			// has no ctx and therefore no UI to notify, and marking it "notified" there would
+			// swallow the message for the session_start attempt that can actually show it.
+			if (!cursorSetupFailureNotified && typeof ctx?.ui?.notify === "function") {
+				cursorSetupFailureNotified = true;
+				ctx.ui.notify(
+					`pi-multi-account: the Cursor provider at ${getCursorProviderRoot()} failed to load, so Cursor accounts are unavailable this session (${reason.slice(0, 160)}). Everything else keeps working; update that provider or set "includeCursor": false in ${CONFIG_PATH} to silence this.`,
+					"warning",
+				);
+			}
+		}
 	}
 
 	/** Register authed alias slots plus one spare per family for the next interactive /login. */
@@ -3545,7 +3595,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		syncRegisteredSlots(auth);
 		// After the slots exist: learn the host's Codex model list, so a flagship that shipped
 		// with Pi (and not with this extension) is selectable and preferred on every slot.
-		if (ctx) refreshRegistryCodexModels(ctx);
+		if (ctx) {
+			refreshRegistryCodexModels(ctx);
+			refreshRegistryAnthropicModels(ctx);
+		}
 		duplicateSlots = discoverDuplicateSlots(auth);
 		rotation = discoverRotation(auth);
 		return true;
@@ -3601,7 +3654,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const configured = config.preferredModels[family];
 		if (configured && configured.length > 0) return configured;
 		return family === "anthropic"
-			? DEFAULT_ANTHROPIC_MODELS
+			? registryAnthropicModelOrder.length > 0
+				? registryAnthropicModelOrder
+				: DEFAULT_ANTHROPIC_MODELS
 			: family === "openai-codex"
 				? discoveredCodexModelOrder.length > 0
 					? discoveredCodexModelOrder
@@ -3692,6 +3747,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Cheap and idempotent: guarantees the newest Codex generation the host knows about is
 		// ranked first at the exact moment we choose a fallback, even if no session_start ran.
 		refreshRegistryCodexModels(ctx);
+		refreshRegistryAnthropicModels(ctx);
 		const fallbacks = activeFallbacks();
 		if (fallbacks.length === 0) return [];
 

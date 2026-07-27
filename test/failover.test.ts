@@ -45,6 +45,10 @@ function uninstallCursorProvider() {
 	rmSync(CURSOR_ROOT, { recursive: true, force: true });
 }
 
+// A Cursor provider that is present but UNLOADABLE is covered in test/cursor-optional.test.ts:
+// that case needs a fresh process, because the cursor bridge caches the loaded module and an
+// earlier test in this file loads a working stub.
+
 const { default: piMultiAccount, mergeRefreshedCredentials } = (await import(
 	"../index.ts"
 )) as {
@@ -1277,7 +1281,7 @@ test("a second account failure in the same agent chain is not hidden by the prev
 	});
 	assert.deepEqual(t.rec.setModels, [
 		"openai-codex-account-4/gpt-5.5",
-		"anthropic/claude-opus-4-8",
+		"anthropic/claude-opus-5",
 	]);
 	assert.ok(t.readState().invalidatedByProvider?.["openai-codex-account-2"]);
 	assert.ok(t.readState().invalidatedByProvider?.["openai-codex-account-4"]);
@@ -1786,7 +1790,7 @@ test("manual next keeps every account selectable and always at its flagship mode
 		`next must keep cycling through every account; visited=${seen.join(",")}`,
 	);
 	assert.ok(
-		seen.every((s) => s.endsWith("/gpt-5.5") || s.endsWith("/claude-opus-4-8")),
+		seen.every((s) => s.endsWith("/gpt-5.5") || s.endsWith("/claude-opus-5")),
 		`every account must be offered at its flagship model; visited=${seen.join(",")}`,
 	);
 });
