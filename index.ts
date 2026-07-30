@@ -381,6 +381,19 @@ type ProviderFamily =
 	| "ollama"
 	| "cursor";
 type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+// Reasoning levels ordered weakest → strongest. Used to tell a host clamp (a drop forced by a
+// weaker fallback model) apart from a deliberate change by the user.
+const REASONING_LEVELS: ReasoningLevel[] = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+];
+// "auto" = follow the session's own level (per-agent `--thinking`, `/thinking`) instead of
+// forcing a global one. Any explicit level still forces that level on every turn.
+type ReasoningLevelSetting = ReasoningLevel | "auto";
 
 type OpenAICodexAliasConfig = {
 	id: string;
@@ -444,9 +457,12 @@ type ProviderFailoverConfig = {
 	// Always upgrade to the newest available model on failover instead of carrying a
 	// previously-downgraded model forward forever. Default: true.
 	preferLatestModel?: boolean;
-	// Reasoning effort to apply at the start of every turn and restore after model/account
-	// switches. Default: high. Extreme levels such as xhigh are opt-in only.
-	reasoningLevel?: ReasoningLevel;
+	// Reasoning effort to preserve across model/account switches. Default: "auto" — the level
+	// the session actually runs at (per-agent `--thinking`, `/thinking`, your Pi default) is
+	// honoured and only restored after a switch, never overridden. Set an explicit level to
+	// FORCE it on every turn regardless of the session. Extreme levels such as xhigh are
+	// opt-in only.
+	reasoningLevel?: ReasoningLevelSetting;
 	// Per-family override of the preferred model order (newest first). Lets you pin the
 	// latest model for each provider WITHOUT a code change when a new one ships, e.g.
 	// { "openai-codex": ["gpt-5.6", "gpt-5.5"], "anthropic": ["claude-opus-4-9"] }.
@@ -587,7 +603,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.14.1";
+const VERSION = "1.14.2";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -877,7 +893,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	autoRecoverStuck: true,
 	debugLog: true,
 	preferLatestModel: true,
-	reasoningLevel: "high",
+	reasoningLevel: "auto",
 	preferredModels: {},
 	resumeIdleTimeoutMs: RESUME_IDLE_TIMEOUT_MS,
 	stuckWatchdogMs: STUCK_WATCHDOG_MS,
@@ -997,6 +1013,8 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		autoRecoverStuck: raw.autoRecoverStuck ?? true,
 		debugLog: raw.debugLog ?? true,
 		preferLatestModel: raw.preferLatestModel ?? true,
+		// Anything unset/invalid means "auto": follow the session's own level. Forcing a level
+		// here would clobber per-agent `--thinking` on every turn (issue #6).
 		reasoningLevel:
 			raw.reasoningLevel === "off" ||
 			raw.reasoningLevel === "minimal" ||
@@ -1005,7 +1023,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 			raw.reasoningLevel === "high" ||
 			raw.reasoningLevel === "xhigh"
 				? raw.reasoningLevel
-				: "high",
+				: "auto",
 		preferredModels:
 			raw.preferredModels && typeof raw.preferredModels === "object"
 				? Object.fromEntries(
@@ -2315,27 +2333,91 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// (auto-continue paused) stays in effect once tripped.
 	let recoveryFailures = 0;
 	let breakerOpenUntil = 0;
-	// The thinking level the user intended for this turn. pi.setModel() re-clamps and
-	// persists the thinking level on every model switch, so without this it drifts
-	// downward across failovers ("thinking level keeps dropping"). We capture it before
-	// any switch and re-assert it after each successful switch.
-	let desiredThinkingLevel: any;
+	// The thinking level the user intends for this session. pi.setModel() re-clamps AND
+	// persists the thinking level on every model switch, so without re-asserting it the level
+	// drifts downward across failovers ("thinking level keeps dropping"). But the intent must be
+	// read from the SESSION (per-agent `--thinking`, `/thinking`), not from a global default:
+	// forcing config.reasoningLevel on every agent_start clobbered per-agent thinking, so an
+	// agent configured `low` was flipped to `high` on its first turn (issue #6).
+	let desiredThinkingLevel: ReasoningLevel | undefined;
+	// What the host clamped our level down to, and on which model. A clamp is the fallback
+	// model's cap, NOT a user decision — it must never become the new intent, otherwise one
+	// failover to a weaker model would ratchet thinking down for the rest of the session.
+	let thinkingClamp: { model: string; level: ReasoningLevel } | undefined;
 
-	function captureDesiredThinking() {
-		desiredThinkingLevel = config.reasoningLevel;
+	const thinkingRank = (level: unknown) =>
+		REASONING_LEVELS.indexOf(level as ReasoningLevel);
+
+	function readThinkingLevel(): ReasoningLevel | undefined {
 		try {
-			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
+			const level = (pi as any).getThinkingLevel?.();
+			return thinkingRank(level) >= 0 ? (level as ReasoningLevel) : undefined;
 		} catch {
-			/* older hosts clamp or reject unsupported levels; failover remains functional */
+			// Older hosts have no getThinkingLevel; we simply have nothing to preserve.
+			return undefined;
 		}
 	}
 
-	function restoreDesiredThinking() {
+	const thinkingModelKey = (ctx?: any) =>
+		ctx?.model?.provider && ctx?.model?.id
+			? ref(ctx.model.provider, ctx.model.id)
+			: "unknown";
+
+	// A level lower than the intent that is exactly what the host produced last time we asserted
+	// the intent on THIS model is a clamp, not the user lowering thinking on purpose.
+	function isKnownThinkingClamp(ctx: any, level: ReasoningLevel) {
+		return (
+			!!thinkingClamp &&
+			thinkingClamp.level === level &&
+			thinkingClamp.model === thinkingModelKey(ctx) &&
+			thinkingRank(level) < thinkingRank(desiredThinkingLevel)
+		);
+	}
+
+	function captureDesiredThinking(ctx?: any) {
+		const forced =
+			config.reasoningLevel === "auto" ? undefined : config.reasoningLevel;
+		if (forced) {
+			// Explicit config is an opt-in override: force it on every turn (old behaviour).
+			desiredThinkingLevel = forced;
+		} else {
+			const actual = readThinkingLevel();
+			if (!actual) {
+				/* host cannot report the level: keep whatever we already know, force nothing */
+			} else if (desiredThinkingLevel === undefined) {
+				// First turn of the session: whatever the session runs at IS the user's intent.
+				desiredThinkingLevel = actual;
+			} else if (
+				actual !== desiredThinkingLevel &&
+				!isKnownThinkingClamp(ctx, actual)
+			) {
+				// The user changed it (`/thinking`, or a delegated agent with its own level).
+				logEvent("thinking_intent", { from: desiredThinkingLevel, to: actual });
+				desiredThinkingLevel = actual;
+			}
+		}
+		restoreDesiredThinking(ctx);
+	}
+
+	function restoreDesiredThinking(ctx?: any) {
 		if (!desiredThinkingLevel) return;
 		try {
 			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
 		} catch {
 			/* setThinkingLevel clamps to model caps; ignore if unsupported */
+		}
+		// Record a clamp so the next turn does not mistake the fallback model's cap for intent.
+		const applied = readThinkingLevel();
+		if (!applied) return;
+		if (applied !== desiredThinkingLevel) {
+			thinkingClamp = { model: thinkingModelKey(ctx), level: applied };
+			logEvent("thinking_clamped", {
+				wanted: desiredThinkingLevel,
+				applied,
+				model: thinkingClamp.model,
+			});
+		} else {
+			thinkingClamp = undefined;
 		}
 	}
 
@@ -3929,7 +4011,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				failedProviders.add(fallback.provider);
 				continue;
 			}
-			restoreDesiredThinking();
+			restoreDesiredThinking(ctx);
 			setLastProbe(fallback.provider);
 			const record = { from, to, reason, at: Date.now() };
 			currentPromptSwitch =
@@ -5848,7 +5930,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		automaticModelTarget = undefined;
 		responseCooldownHints.clear();
 		handledAssistantErrors.clear();
-		captureDesiredThinking(); // remember the level BEFORE any failover can clamp it
+		captureDesiredThinking(ctx); // remember the level BEFORE any failover can clamp it
 		refreshDiscovery(false, ctx); // also refresh Pi's in-memory AuthStorage
 		if (!usageStatusTimer) startUsageStatusTimer(ctx);
 		updateUsageStatus(ctx);

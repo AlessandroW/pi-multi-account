@@ -14,7 +14,7 @@ When the account you are using hits a quota or rate limit, `pi-multi-account` tr
 - **Optional auto-continue**: queues a safe continuation prompt after a switch so the agent keeps going from the last safe point.
 - **Session-bound overnight resume**: if every account is cooling down, the live Pi session waits for the earliest recovery and continues automatically. A new user message, `/multi-account stop`, session exit, or Esc during a running turn cancels the chain.
 - **Deduplicates provably identical accounts** so duplicate Codex `accountId` values and identical credentials do not consume multiple rotation slots or get separate cooldowns. New provable duplicate logins are rejected before the redundant slot is saved.
-- **Uses `high` reasoning by default on every provider/model** and restores it after every switch instead of letting it drift downward. Extreme levels such as `xhigh` / Max / Ultra are never forced; `xhigh` remains an explicit opt-in.
+- **Keeps YOUR reasoning level across switches.** Whatever the session runs at — your Pi default, `/thinking`, or a per-agent `--thinking low` — is preserved and restored after every account/model switch, so it never drifts downward when a weaker fallback model clamps it. The extension does not override your level (set `reasoningLevel` if you *want* a forced one), and extreme levels such as `xhigh` / Max / Ultra are never forced.
 - **Shows live limits for the active account** in Pi's footer: remaining 5-hour and 7-day allowance plus reset countdowns for Codex and Anthropic OAuth accounts.
 
 ## Install
@@ -142,7 +142,7 @@ A default config is created at `~/.pi/agent/provider-failover.json` on first run
 | `autoRecoverStuck` | `true` | When a resume wedges, auto-cancel it and auto-resume when an account frees, instead of only notifying. Set `false` for notify-only. |
 | `debugLog` | `true` | Write a structured "black box" decision log to `provider-failover-debug.log` (no credentials — only provider/model ids and truncated reasons). View with `/multi-account log`. |
 | `preferLatestModel` | `true` | Rank the strongest/current model ahead of older siblings during automatic failover. |
-| `reasoningLevel` | `"high"` | Reasoning effort applied at the start of every turn and restored after switches. Set `"xhigh"` only when you explicitly want the extreme level. |
+| `reasoningLevel` | `"auto"` | `"auto"` follows the level the session actually runs at (your Pi default, `/thinking`, per-agent `--thinking`) and only restores it after switches. Set an explicit level (`"off"`…`"xhigh"`) to **force** it on every turn regardless of the session — `"xhigh"` only if you really want the extreme level. |
 | `preferredModels` | `{}` | Optional manual strongest-first override per family; when present it wins over live catalog priority. |
 
 State (cooldowns, invalidations, recent switches, credential-free Codex model catalogs, and an in-session pending resume marker) is persisted to `~/.pi/agent/provider-failover-state.json`. Pending work is deliberately discarded when the session closes or a different session starts.

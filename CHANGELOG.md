@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.2] - 2026-07-30
+
+### Fixed
+
+- **A per-agent thinking level is no longer clobbered.** `captureDesiredThinking()` ran on every
+  `agent_start` and applied the *global* `config.reasoningLevel` (which defaulted to `high` and,
+  because the parser fell back to `high` for anything unset or invalid, could not be turned off).
+  A delegated agent configured `--thinking low` was therefore flipped to `high` on its very first
+  turn — the session recorded `thinking_level_change: low -> high` before the first user message —
+  and, because Pi's `setThinkingLevel()` also persists to settings, the override leaked into the
+  default level too. Reported and diagnosed in
+  [#6](https://github.com/Sarrius/pi-multi-account/pull/6) (thanks @fwhskr, confirmed by
+  @julius-retzer).
+
+  The intent is now read from the session itself (`pi.getThinkingLevel()`), so your Pi default,
+  `/thinking`, and per-agent `--thinking` all win. The original protection is kept and made
+  sharper: a level the *host* clamped down to (because a weaker fallback model caps out lower) is
+  recorded as a clamp, never adopted as intent, so it is restored the moment a capable model is
+  back — a naive "just read the session level" fix would let a single failover ratchet thinking
+  down for the rest of the session. An explicit `/thinking` change between turns is still honoured.
+
+### Changed
+
+- **`reasoningLevel` now defaults to `"auto"`** — follow the session, only restore after switches.
+  Setting an explicit level (`"off"`…`"xhigh"`) keeps the old behaviour and *forces* that level on
+  every turn, for anyone who wants a hard floor regardless of the session.
+- New black-box log kinds `thinking_intent` and `thinking_clamped` make level changes traceable in
+  `/multi-account log`.
+
 ## [1.14.1] - 2026-07-27
 
 ### Fixed

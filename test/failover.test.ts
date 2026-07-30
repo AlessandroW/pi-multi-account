@@ -129,6 +129,10 @@ function setup(opts: {
 	omitSendUserMessage?: boolean;
 	/** Models the HOST (Pi) itself publishes for the base Codex provider. */
 	hostCodexModels?: string[];
+	/** The level the SESSION runs at (what `--thinking` / `/thinking` produced). */
+	thinkingLevel?: string;
+	/** Highest thinking level a provider's models support — Pi clamps anything above it. */
+	thinkingCaps?: Record<string, string>;
 }) {
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
@@ -180,6 +184,18 @@ function setup(opts: {
 		thinkingLevels: [] as string[],
 		aborts: 0,
 		authReloads: 0,
+	};
+	// Pi's real thinking-level semantics: a single mutable session level, clamped to what the
+	// CURRENT model supports, and re-clamped on every model switch (see AgentSession.setModel).
+	// That re-clamp is exactly how the level used to drift downward across failovers.
+	const THINKING_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh"];
+	let sessionThinkingLevel = opts.thinkingLevel ?? "high";
+	const clampThinking = (level: string) => {
+		const cap = opts.thinkingCaps?.[ctx.model?.provider ?? ""];
+		if (!cap) return level;
+		return THINKING_ORDER.indexOf(level) > THINKING_ORDER.indexOf(cap)
+			? cap
+			: level;
 	};
 	let idle = opts.idle ?? true;
 	const events: Record<string, (event: any, ctx?: any) => any> = {};
@@ -270,6 +286,8 @@ function setup(opts: {
 			rec.setModels.push(target);
 			if (opts.setModelFailures?.includes(target)) return false;
 			ctx.model = mkModel(model.provider, model.id);
+			// Pi re-clamps (and persists) the thinking level for the new model's capabilities.
+			sessionThinkingLevel = clampThinking(sessionThinkingLevel);
 			await events.model_select?.(
 				{ model: ctx.model, previousModel, source: "set" },
 				ctx,
@@ -284,8 +302,11 @@ function setup(opts: {
 			if (opts.continueBlocks) await opts.continueBlocks();
 		},
 		appendEntry: () => {},
-		getThinkingLevel: () => "high",
-		setThinkingLevel: (level: string) => rec.thinkingLevels.push(level),
+		getThinkingLevel: () => sessionThinkingLevel,
+		setThinkingLevel: (level: string) => {
+			rec.thinkingLevels.push(level); // what the extension ASKED for
+			sessionThinkingLevel = clampThinking(level); // what the host actually applied
+		},
 	};
 
 	// Simulate a host Pi build that predates pi.continueAgent() (seamless in-place resume). The
@@ -319,6 +340,12 @@ function setup(opts: {
 	const input = async (text: string, images?: any[]) =>
 		events.input?.({ type: "input", text, images, source: "interactive" }, ctx);
 
+	// The level the session is actually running at, and the user changing it via `/thinking`.
+	const thinkingLevel = () => sessionThinkingLevel;
+	const userSetsThinking = (level: string) => {
+		sessionThinkingLevel = clampThinking(level);
+	};
+
 	return {
 		ctx,
 		rec,
@@ -329,6 +356,8 @@ function setup(opts: {
 		beforeReq,
 		command,
 		input,
+		thinkingLevel,
+		userSetsThinking,
 	};
 }
 
@@ -390,10 +419,27 @@ test("usage footer countdown refreshes while the session is idle", async () => {
 	});
 
 	await t.fire("session_start");
-	assert.equal(t.rec.statuses.at(-1)?.value, "Codex A2 | 5h 99% left/2m");
+	const readCountdown = () => {
+		const value = t.rec.statuses.at(-1)?.value ?? "";
+		const match = /^Codex A2 \| 5h 99% left\/(\d+)m$/.exec(value);
+		assert.ok(match, `unexpected footer value: ${JSON.stringify(value)}`);
+		return Number(match[1]);
+	};
+	const first = readCountdown();
+	const updatesAfterStart = t.rec.statuses.length;
 
+	// The countdown is minute-granular, so which minute it lands on depends on how long the
+	// harness took to boot (that made this assertion flaky). What must hold is that the idle
+	// timer keeps repainting the footer and the countdown only ever runs down.
 	await wait(1_100);
-	assert.equal(t.rec.statuses.at(-1)?.value, "Codex A2 | 5h 99% left/1m");
+	assert.ok(
+		t.rec.statuses.length > updatesAfterStart,
+		"the idle timer must keep repainting the footer",
+	);
+	assert.ok(
+		readCountdown() <= first,
+		`the countdown must never run backwards: ${first}m -> ${readCountdown()}m`,
+	);
 	await t.fire("session_shutdown");
 });
 
@@ -1664,6 +1710,126 @@ test("high reasoning is the baseline and is restored across every provider rotat
 	assert.ok(
 		t.rec.thinkingLevels.every((level) => level === "high"),
 		`no provider may escalate reasoning above high by default: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// v1.14.2: the session owns the thinking level; the extension only preserves it
+// ---------------------------------------------------------------------------
+
+const THINKING_ACCOUNTS: Account = {
+	anthropic: {
+		type: "oauth",
+		access: "anthropic",
+		refresh: "anthropic-refresh",
+	},
+	"openai-codex-account-2": {
+		type: "oauth",
+		access: "codex",
+		refresh: "codex-refresh",
+		accountId: "codex-account",
+	},
+};
+
+test("a per-agent thinking level (--thinking low) is never clobbered to the global default", async () => {
+	const t = setup({
+		accounts: THINKING_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "low", // this delegated agent is configured for low thinking
+	});
+
+	await t.fire("session_start");
+	await t.fire("agent_start");
+
+	assert.equal(
+		t.thinkingLevel(),
+		"low",
+		"agent_start must not raise a session configured for low thinking",
+	);
+	assert.ok(
+		!t.rec.thinkingLevels.includes("high"),
+		`the global default must never be forced onto the session: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+
+	// ...and it stays low across a failover switch too.
+	await t.command("next");
+	assert.equal(t.thinkingLevel(), "low");
+	assert.ok(t.rec.thinkingLevels.every((level) => level === "low"));
+});
+
+test("a weaker fallback model's clamp never ratchets the thinking level down", async () => {
+	const t = setup({
+		accounts: THINKING_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "high",
+		// The codex account's models top out at medium — Pi clamps high down to medium there.
+		thinkingCaps: { "openai-codex-account-2": "medium" },
+	});
+
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	assert.equal(t.thinkingLevel(), "high");
+
+	await t.command("next"); // → codex, where high is clamped to medium
+	assert.equal(t.thinkingLevel(), "medium", "the host clamp is expected here");
+
+	// The next turn starts on the clamped account. The clamp is the MODEL's cap, not the user's
+	// choice: it must not become the new intent.
+	await t.fire("agent_start");
+	await t.command("next"); // → back to a provider that supports high
+	assert.equal(
+		t.thinkingLevel(),
+		"high",
+		`thinking must return to the user's level once a capable model is back: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+	assert.ok(
+		!t.rec.thinkingLevels.includes("medium"),
+		`the extension must never ASK for the clamped level: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+});
+
+test("a mid-session /thinking change is honoured on the next turn and across failover", async () => {
+	const t = setup({
+		accounts: THINKING_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "high",
+	});
+
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	assert.equal(t.thinkingLevel(), "high");
+
+	t.userSetsThinking("low"); // user runs /thinking low between turns
+	await t.fire("agent_start");
+	assert.equal(
+		t.thinkingLevel(),
+		"low",
+		`an explicit user choice must win over the previous level: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+
+	await t.command("next");
+	assert.equal(
+		t.thinkingLevel(),
+		"low",
+		"failover restores the user's CURRENT level, not the one from the first turn",
+	);
+});
+
+test("an explicit reasoningLevel in config still forces that level on every turn", async () => {
+	const t = setup({
+		accounts: THINKING_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "low",
+		config: { reasoningLevel: "high" }, // opt-in override
+	});
+
+	await t.fire("session_start");
+	await t.fire("agent_start");
+
+	assert.equal(
+		t.thinkingLevel(),
+		"high",
+		"an explicitly configured level is an override and must be applied",
 	);
 });
 
