@@ -603,7 +603,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.14.2";
+const VERSION = "1.14.3";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
