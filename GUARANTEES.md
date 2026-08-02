@@ -1,7 +1,7 @@
 # What "working" means — and what locks it
 
 This file is the contract. Each row is a promise the extension makes, written in plain language,
-next to the automated test that will FAIL the moment that promise breaks. `pnpm test` (130 tests)
+next to the automated test that will FAIL the moment that promise breaks. `pnpm test` (134 tests)
 runs them all; CI blocks any change that violates a promise. If you hit a behaviour that feels
 broken and it is **not** on this list, that is a missing guarantee — it should become a new row +
 test, not a one-off patch.
@@ -32,6 +32,7 @@ test, not a one-off patch.
 | 20 | **Optional providers stay invisible until you install them.** With Cursor support enabled by default but the Cursor provider not cloned, no `cursor-account-*` login slot is offered and no startup warning appears; asking for it explicitly (`/multi-account add cursor`) is what surfaces the install instructions. | `includeCursor default-on never registers a phantom cursor slot nor warns while the Cursor provider is not installed` · `cloning the Cursor provider is enough: the spare cursor slot appears on the next rediscover` · `add cursor guides the user through subscription login, not API-key setup` · `no Cursor provider installed stays completely silent` |
 | 21 | **An optional provider that is installed but broken cannot damage anything else.** A Cursor clone incompatible with your Node version never escapes as an unhandled rejection, never aborts session start, and never lets a previous session's paused work leak into a new one. It is reported once and everything else keeps working. | `a Cursor provider that fails to load cannot abort session_start` · `a Cursor provider that fails to load never escapes as an unhandled rejection` · `a Cursor provider that fails to load is reported once, not silently swallowed` |
 | 22 | **Your thinking level is yours.** The extension never overrides it: a delegated agent configured `--thinking low` stays `low`, a mid-session `/thinking` change wins on the next turn, and a weaker fallback model's clamp is restored (never adopted) so the level cannot ratchet downward. Setting `reasoningLevel` explicitly still forces a level for people who want that. | `a per-agent thinking level (--thinking low) is never clobbered to the global default` · `a weaker fallback model's clamp never ratchets the thinking level down` · `a mid-session /thinking change is honoured on the next turn and across failover` · `an explicit reasoningLevel in config still forces that level on every turn` |
+| 23 | **Maintenance automation lands or shouts — it never fails quietly.** The weekly `CLAUDE_CODE_VERSION` check (the constant inside the Anthropic OAuth billing header) pushes the bump to `main` itself instead of asking GitHub Actions to open a PR it is not permitted to open, opens an issue if that push is refused, and sweeps up any orphan `chore/claude-code-version-*` branch. Renaming or reformatting the constant breaks CI, not a silent Monday cron. | `the version-check workflow can still find the constant it is supposed to edit` · `the workflow's sed actually rewrites the constant` · `the bumped constant is the one that ships in the OAuth billing header` · `the version check never again depends on GitHub Actions opening a pull request` |
 
 ## How to keep this honest
 

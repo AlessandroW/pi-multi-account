@@ -1,8 +1,19 @@
 name: Claude Code version check
 
-# Keeps CLAUDE_CODE_VERSION (used for the Anthropic OAuth billing header) in sync
-# with the latest Claude Code release, so nobody has to track it by hand. When it
-# drifts, this opens a PR bumping the constant — review and merge, then cut a release.
+# Keeps CLAUDE_CODE_VERSION (used for the Anthropic OAuth billing header) in sync with the latest
+# Claude Code release, so nobody has to track it by hand.
+#
+# This used to open a PR. It cannot: this repo has "Allow GitHub Actions to create and approve
+# pull requests" turned off, so `gh pr create` failed with
+#   GitHub Actions is not permitted to create or approve pull requests (createPullRequest)
+# every single week — while the branch it had already pushed stayed behind. Three orphan
+# `chore/claude-code-version-*` branches piled up over a month and the constant drifted 48
+# releases behind, silently, because a failed scheduled run is easy to miss.
+#
+# So: no branch, no PR. The job type-checks and tests the bump itself and pushes it straight to
+# main (the change is a single string constant, and CI re-runs on the push anyway). If the push is
+# ever rejected — branch protection, a race with a human commit — it opens an ISSUE instead of
+# dying quietly, and it sweeps up any orphan branches the old flow left behind.
 
 on:
   schedule:
@@ -11,38 +22,90 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
+  issues: write
+
+concurrency:
+  group: claude-code-version-check
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Open PR if CLAUDE_CODE_VERSION drifted
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # native TypeScript stripping for `node --test test/*.test.ts`
+          cache: npm
+
+      - name: Sweep orphan branches left by the old PR-based flow
+        run: |
+          set -euo pipefail
+          orphans="$(git ls-remote --heads origin 'refs/heads/chore/claude-code-version-*' | sed -E 's|^.*refs/heads/||')"
+          if [ -z "$orphans" ]; then
+            echo "No leftover chore/claude-code-version-* branches."
+            exit 0
+          fi
+          echo "$orphans" | while read -r branch; do
+            [ -n "$branch" ] || continue
+            echo "Deleting orphan branch $branch"
+            git push origin --delete "$branch" || echo "  (could not delete $branch — continuing)"
+          done
+
+      - name: Bump CLAUDE_CODE_VERSION if it drifted
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
           latest="$(npm view @anthropic-ai/claude-code version)"
           current="$(grep -oE 'CLAUDE_CODE_VERSION = "[^"]+"' index.ts | sed -E 's/.*"([^"]+)".*/\1/')"
+
+          # Fail LOUDLY rather than no-op: an empty `current` means the constant was renamed or
+          # reformatted and this job has been quietly editing nothing. The same coupling is locked
+          # by test/claude-code-version.test.ts, so CI catches it before this schedule ever runs.
+          if [ -z "$current" ]; then
+            echo "::error::Could not find CLAUDE_CODE_VERSION in index.ts — the constant moved or was reformatted."
+            exit 1
+          fi
+          if ! printf '%s' "$latest" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::npm returned an implausible version: '$latest'"
+            exit 1
+          fi
+
           echo "latest=$latest current=$current"
           if [ "$latest" = "$current" ]; then
             echo "Up to date — nothing to do."
             exit 0
           fi
-          branch="chore/claude-code-version-$latest"
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-            echo "Branch $branch already exists — PR likely open."
-            exit 0
+
+          sed -i -E "s/CLAUDE_CODE_VERSION = \"[^\"]+\"/CLAUDE_CODE_VERSION = \"$latest\"/" index.ts
+          if git diff --quiet -- index.ts; then
+            echo "::error::sed matched nothing — index.ts is unchanged despite a version drift."
+            exit 1
           fi
+
+          npm ci
+          npm run check
+          npm test
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
-          sed -i -E "s/CLAUDE_CODE_VERSION = \"[^\"]+\"/CLAUDE_CODE_VERSION = \"$latest\"/" index.ts
           git add index.ts
           git commit -m "chore: bump CLAUDE_CODE_VERSION to $latest"
-          git push origin "$branch"
-          gh pr create \
-            --base main --head "$branch" \
-            --title "Bump CLAUDE_CODE_VERSION to $latest" \
-            --body "Automated check: Claude Code released \`$latest\` (current constant: \`$current\`). This keeps the Anthropic OAuth billing header in sync so requests keep being accepted/counted correctly. Review, merge, then publish a new release."
+
+          if git push origin HEAD:main; then
+            echo "Pushed CLAUDE_CODE_VERSION $current -> $latest to main."
+            exit 0
+          fi
+
+          # Push refused (branch protection, or someone pushed to main mid-run). Never fail
+          # silently: tell the maintainer, with the exact one-line change to apply.
+          echo "::warning::Could not push to main — opening an issue instead."
+          body="The weekly check could not push the bump to \`main\`."
+          body="$body"$'\n\n'"Apply by hand in \`index.ts\`: replace \`CLAUDE_CODE_VERSION = \"$current\"\` with \`CLAUDE_CODE_VERSION = \"$latest\"\`."
+          body="$body"$'\n\n'"This constant goes into the Anthropic OAuth billing header. If it drifts too far, Anthropic may reject or miscount OAuth requests."
+          gh issue create --title "CLAUDE_CODE_VERSION is $current, Claude Code is $latest" --body "$body"
+          exit 1

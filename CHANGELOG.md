@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The Anthropic OAuth billing header stopped drifting.** `CLAUDE_CODE_VERSION` had been stuck at
+  `2.1.172` while Claude Code shipped `2.1.220` — 48 releases of drift on a constant Anthropic reads
+  to accept and count OAuth requests. The weekly automation that is supposed to prevent exactly this
+  had been failing every Monday since mid-June: it pushed a `chore/claude-code-version-*` branch and
+  then died on `gh pr create`, because this repository does not permit GitHub Actions to open pull
+  requests. No PR ever appeared, so nobody noticed; three orphan branches accumulated instead.
+
+  The constant is now at `2.1.220`, the three orphan branches are gone, and the workflow no longer
+  asks for a permission it does not have: it type-checks and tests the bump itself, pushes it
+  straight to `main`, opens an **issue** if that push is ever refused, and sweeps up any leftover
+  `chore/claude-code-version-*` branch on the way. A renamed or reformatted constant now fails CI
+  instead of silently turning the weekly job into a no-op.
+
+- **An automated bump can no longer break CI on arrival.** The billing-header test hardcoded
+  `2.1.172`, so the very bump the automation exists to make would have turned the suite red. It now
+  reads the constant from `index.ts`.
+
 ## [1.14.2] - 2026-07-30
 
 ### Fixed

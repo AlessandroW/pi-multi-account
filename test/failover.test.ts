@@ -2168,7 +2168,16 @@ test("OAuth-marked Anthropic payload gets one billing header", () => {
 	};
 	const once = t.beforeReq(payload) as any;
 	assert.match(once.system[0].text, /^x-anthropic-billing-header:/);
-	assert.match(once.system[0].text, /cc_version=2\.1\.172\./);
+	// Pinned to the constant in index.ts, never a literal: the weekly version-check workflow bumps
+	// that constant, and a hardcoded copy here would turn every automated bump into a red CI run.
+	const expectedCcVersion = readFileSync(
+		new URL("../index.ts", import.meta.url),
+		"utf8",
+	).match(/CLAUDE_CODE_VERSION = "([^"]+)"/)![1]!;
+	assert.ok(
+		once.system[0].text.includes(`cc_version=${expectedCcVersion}.`),
+		`billing header must carry CLAUDE_CODE_VERSION (${expectedCcVersion}), got: ${once.system[0].text}`,
+	);
 	const billingCount = (system: any[]) =>
 		system.filter((block) => /x-anthropic-billing-header:/.test(block.text))
 			.length;
