@@ -39,13 +39,17 @@ const LEGACY_OAUTH_ENTRY = `export function loginAnthropic(callbacks) {
 	callbacks.onAuth({ url: "https://claude.ai/oauth/authorize?era=legacy" });
 	return Promise.resolve({ type: "oauth", access: "legacy-access", refresh: "legacy-refresh" });
 }
-export function refreshAnthropicToken(refreshToken) {
+export function refreshAnthropicToken(refreshToken, signal) {
+	if (!(signal instanceof AbortSignal)) throw new TypeError("legacy Anthropic refresh requires AbortSignal");
 	return Promise.resolve({ access: "legacy-refreshed:" + refreshToken, refresh: refreshToken });
 }
 export const openaiCodexOAuthProvider = {
 	usesCallbackServer: true,
 	login: () => Promise.resolve({ type: "oauth", access: "codex-access" }),
-	refreshToken: (credentials) => Promise.resolve({ ...credentials, access: "codex-refreshed" }),
+	refreshToken: (credentials, signal) => {
+		if (!(signal instanceof AbortSignal)) throw new TypeError("legacy Codex refresh requires AbortSignal");
+		return Promise.resolve({ ...credentials, access: "codex-refreshed" });
+	},
 	getApiKey: (credentials) => credentials.access,
 };
 `;
@@ -64,7 +68,8 @@ const MODERN_ANTHROPIC_PROVIDER = `export function anthropicProvider() {
 					interaction.notify({ type: "info", message: "waiting for browser" });
 					return { type: "oauth", access: "modern-access", refresh: "modern-refresh" };
 				},
-				async refresh(credential) {
+				async refresh(credential, signal) {
+					if (!(signal instanceof AbortSignal)) throw new TypeError("modern Anthropic refresh requires AbortSignal");
 					return { ...credential, access: "modern-refreshed:" + credential.refresh };
 				},
 				async toAuth(credential) {
@@ -84,7 +89,8 @@ const MODERN_CODEX_PROVIDER = `export function openaiCodexProvider() {
 				async login() {
 					return { type: "oauth", access: "codex-access" };
 				},
-				async refresh(credential) {
+				async refresh(credential, signal) {
+					if (!(signal instanceof AbortSignal)) throw new TypeError("modern Codex refresh requires AbortSignal");
 					return { ...credential, access: "codex-refreshed" };
 				},
 				async toAuth(credential) {
@@ -163,6 +169,7 @@ const result = {
 	usesCallbackServer: codex?.cfg?.oauth?.usesCallbackServer,
 	authUrl: undefined,
 	refreshed: undefined,
+	codexRefreshed: undefined,
 	loginError: undefined,
 };
 // Login/refresh may legitimately fail when there is no usable pi-ai — the contract is that
@@ -186,6 +193,15 @@ if (typeof refresh === "function") {
 	try {
 		const out = await refresh({ type: "oauth", access: "old", refresh: "the-refresh-token" });
 		result.refreshed = out?.access;
+	} catch {
+		// Same contract as login.
+	}
+}
+const codexRefresh = codex?.cfg?.oauth?.refreshToken;
+if (typeof codexRefresh === "function") {
+	try {
+		const out = await codexRefresh({ type: "oauth", access: "old", refresh: "codex-refresh" });
+		result.codexRefreshed = out?.access;
 	} catch {
 		// Same contract as login.
 	}
@@ -233,6 +249,7 @@ test("hoisted install with a pre-0.80 pi-ai: extension loads and OAuth works", (
 		assert.equal(result.authUrl, "https://claude.ai/oauth/authorize?era=legacy");
 		// This era exchanges the bare refresh token, not the whole credential.
 		assert.equal(result.refreshed, "legacy-refreshed:the-refresh-token");
+		assert.equal(result.codexRefreshed, "codex-refreshed");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -250,6 +267,7 @@ test("hoisted install with pi-ai >= 0.80 (types-only dist/oauth.js): extension l
 		// rather than the extension silently degrading to "OAuth unavailable".
 		assert.equal(result.authUrl, "https://claude.ai/oauth/authorize?era=modern");
 		assert.equal(result.refreshed, "modern-refreshed:the-refresh-token");
+		assert.equal(result.codexRefreshed, "codex-refreshed");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.5] - 2026-08-15
+
+### Fixed
+
+- **Saved scoped models for numbered Codex accounts now survive restart.** Persisted, credential-free model catalogs seed each numbered alias synchronously before Pi resolves saved model scopes. Empty caches and disabled discovery retain the static/host fallback. Contributed by @carlosorch in PR #8; fixes #7.
+- **Anthropic and Codex OAuth refresh always receive an `AbortSignal`.** Both legacy and provider-factory pi-ai bridges now forward the host signal, with a bounded fallback for internal refreshes, preventing `AbortSignal.any()` from rejecting `undefined`. Fixes #9.
+
+### Tests
+
+- Added startup-catalog regression coverage and made both legacy and modern OAuth bridge fixtures reject refresh calls that omit an `AbortSignal`.
+
 ## [1.14.4] - 2026-08-15
 
 ### Security

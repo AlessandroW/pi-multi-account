@@ -77,12 +77,12 @@ type PiAiOauthBridge = {
 	era: "legacy-oauth-entry" | "provider-factories";
 	anthropic: {
 		login: (callbacks: any) => Promise<any>;
-		refresh: (credentials: any) => Promise<any>;
+		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
 	};
 	codex: {
 		usesCallbackServer: boolean;
 		login: (callbacks: any) => Promise<any>;
-		refresh: (credentials: any) => Promise<any>;
+		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
 		getApiKey: (credentials: any) => string;
 	};
 };
@@ -203,12 +203,13 @@ function adaptLegacyOauthEntry(mod: any): PiAiOauthBridge | undefined {
 		anthropic: {
 			login: (callbacks) => mod.loginAnthropic(callbacks),
 			// This era exchanges the bare refresh token, not the whole credential.
-			refresh: (credentials) => mod.refreshAnthropicToken(credentials.refresh),
+			refresh: (credentials, signal) =>
+				mod.refreshAnthropicToken(credentials.refresh, signal),
 		},
 		codex: {
 			usesCallbackServer: codex.usesCallbackServer ?? true,
 			login: (callbacks) => codex.login(callbacks),
-			refresh: (credentials) => codex.refreshToken(credentials),
+			refresh: (credentials, signal) => codex.refreshToken(credentials, signal),
 			getApiKey: (credentials) =>
 				typeof codex.getApiKey === "function"
 					? codex.getApiKey(credentials)
@@ -236,14 +237,14 @@ function adaptProviderFactories(
 		era: "provider-factories",
 		anthropic: {
 			login: (callbacks) => anthropicOauth.login(toAuthInteraction(callbacks)),
-			refresh: (credentials) => anthropicOauth.refresh(credentials),
+			refresh: (credentials, signal) => anthropicOauth.refresh(credentials, signal),
 		},
 		codex: {
 			// The flag is gone from the new shape; both eras of pi-ai's Codex flow use a
 			// local callback server, and Pi only reads this to decide how to present login.
 			usesCallbackServer: true,
 			login: (callbacks) => codexOauth.login(toAuthInteraction(callbacks)),
-			refresh: (credentials) => codexOauth.refresh(credentials),
+			refresh: (credentials, signal) => codexOauth.refresh(credentials, signal),
 			// Identical to what pi-ai <= 0.79's getApiKey did (verified in its source).
 			getApiKey: (credentials) => credentials.access,
 		},
@@ -1516,10 +1517,20 @@ export function mergeRefreshedCredentials(credentials: any, refreshed: any) {
 }
 
 /** Single source of truth for Anthropic OAuth refresh — used by BOTH the base provider and aliases. */
-async function refreshAnthropicCredentials(credentials: any) {
+function oauthRefreshSignal(signal?: AbortSignal): AbortSignal {
+	return signal instanceof AbortSignal ? signal : AbortSignal.timeout(30_000);
+}
+
+async function refreshAnthropicCredentials(
+	credentials: any,
+	signal?: AbortSignal,
+) {
 	return mergeRefreshedCredentials(
 		credentials,
-		await requirePiAiOauth().anthropic.refresh(credentials),
+		await requirePiAiOauth().anthropic.refresh(
+			credentials,
+			oauthRefreshSignal(signal),
+		),
 	);
 }
 
@@ -1563,8 +1574,8 @@ function codexOAuthOverride(providerId: string, name: string) {
 		async login(callbacks: any) {
 			return rejectDuplicateLogin(providerId, await getProvider().login(callbacks));
 		},
-		async refreshToken(credentials: any) {
-			return getProvider().refresh(credentials);
+		async refreshToken(credentials: any, signal?: AbortSignal) {
+			return getProvider().refresh(credentials, oauthRefreshSignal(signal));
 		},
 		getApiKey(credentials: any) {
 			return getProvider().getApiKey(credentials);
@@ -2601,7 +2612,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			} else if (family === "openai-codex") {
 				refreshed = mergeRefreshedCredentials(
 					entry,
-					await requirePiAiOauth().codex.refresh(entry as any),
+					await requirePiAiOauth().codex.refresh(
+						entry as any,
+						AbortSignal.timeout(30_000),
+					),
 				);
 			} else if (family === "cursor") {
 				const authMod = await import(
@@ -2742,7 +2756,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// authoritative for that specific account.
 		for (const provider of registeredSlots) {
 			if (classifyProvider(provider, config.qwenProvider) !== "openai-codex") continue;
-			if (codexModelCatalogByProvider.has(provider)) continue;
+			if (
+				config.autoDiscoverModels &&
+				codexModelCatalogByProvider.get(provider)?.models.length
+			)
+				continue;
 			registerCodexCatalog(pi, provider, merged as Array<Record<string, unknown>>);
 		}
 	}
@@ -2830,7 +2848,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		discoveredCodexModelOrder = allKnown.map((model) => model.id);
 
 		for (const provider of providers) {
-			const models = codexModelCatalogByProvider.get(provider)?.models ?? registryFallback;
+			const cached = codexModelCatalogByProvider.get(provider)?.models;
+			const models = cached?.length ? cached : registryFallback;
 			registerCodexCatalog(pi, provider, models as Array<Record<string, unknown>>);
 		}
 		// Also keep unauthenticated spare login slots current so a newly logged-in account can select
@@ -3594,8 +3613,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (index <= 1) continue; // base provider is native
 				if (registeredSlots.has(id)) continue;
 				if (family === "anthropic") registerAnthropicSlot(pi, id);
-				else if (family === "openai-codex") registerCodexSlot(pi, id);
-				else if (family === "ollama") registerApiKeySlot(pi, id, "ollama");
+				else if (family === "openai-codex") {
+					const cached = codexModelCatalogByProvider.get(id)?.models;
+					registerCodexSlot(
+						pi,
+						id,
+						config.autoDiscoverModels && cached?.length
+							? (cached as Array<Record<string, unknown>>)
+							: undefined,
+					);
+				} else if (family === "ollama") registerApiKeySlot(pi, id, "ollama");
 				else if (family === "qwen") registerApiKeySlot(pi, id, "qwen");
 				registeredSlots.add(id);
 			}
@@ -5154,9 +5181,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 
 		if (command === "reload") {
+			const previousAutoDiscoverModels = config.autoDiscoverModels;
 			config = loadConfig();
 			debugLogEnabled = config.debugLog;
 			configuredFallbacks = config.fallbacks.slice();
+			if (config.autoDiscoverModels !== previousAutoDiscoverModels) {
+				registryCodexModelOrder = [];
+				if (!config.autoDiscoverModels) discoveredCodexModelOrder = [];
+			}
 			refreshDiscovery(true, ctx);
 			startUsageStatusTimer(ctx);
 			runBackground("reload account metadata refresh", ctx, async () => {
