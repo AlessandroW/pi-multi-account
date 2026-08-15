@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.4] - 2026-08-15
+
+### Security
+
+- Updated the Pi development/runtime dependency graph and pinned transitive `protobufjs` to a patched release; production `npm audit` now reports zero vulnerabilities.
+
+### Changed
+
+- Added a release gate that runs type checks, the hermetic test suite, and a package allowlist/secret-marker check before publication.
+
 ## [1.14.3] - 2026-08-02
 
 ### Fixed

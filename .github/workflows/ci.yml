@@ -19,7 +19,7 @@ jobs:
         with:
           node-version: 24 # native TypeScript stripping for `node --test test/*.test.ts`
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm test
-      - run: npm pack --dry-run
+      - run: npm run pack:check

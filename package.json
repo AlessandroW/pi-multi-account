@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-account",
-  "version": "1.14.3",
+  "version": "1.14.4",
   "description": "Automatic multi-account failover & rotation for Pi Agent across Anthropic (Claude), OpenAI/ChatGPT Codex, Qwen/Alibaba, and Ollama. Auto-discovers authenticated accounts, grows the rotation on login, and drops accounts on logout, expiry, or quota/rate-limit errors",
   "type": "module",
   "license": "MIT",
@@ -44,13 +44,16 @@
     "cursor-bridge.ts",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md"
   ],
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
-    "pack:check": "npm pack --dry-run",
-    "prepublishOnly": "npm run check"
+    "pack:check": "node scripts/check-package.mjs",
+    "release:check": "npm run check && npm test && npm run pack:check",
+    "prepublishOnly": "npm run release:check"
   },
   "engines": {
     "node": ">=22"
@@ -58,14 +61,11 @@
   "publishConfig": {
     "access": "public"
   },
-  "dependencies": {
-    "@earendil-works/pi-ai": ">=0.78"
-  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
     "@types/node": "^22.15.3",
     "typescript": "^6.0.3"
   },
@@ -73,5 +73,11 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.84.2"
+  },
+  "overrides": {
+    "protobufjs": "7.6.5"
   }
 }
