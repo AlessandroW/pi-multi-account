@@ -12,6 +12,15 @@ export type UsageSnapshot = {
 	fetchedAt: number;
 	credentialHash?: string;
 	plan?: string;
+	/**
+	 * The provider's OWN verdict on whether this account can be used right now.
+	 *
+	 * Everything else in this snapshot is arithmetic we do on quota windows — a forecast about
+	 * one window, which cannot see session limits, plan limits or an early reset. This field is
+	 * not that: it is the account answering the question directly. `undefined` means the response
+	 * stated no verdict, and only then is the forecast the best information available.
+	 */
+	serviceable?: boolean;
 	primary?: UsageWindow;
 	secondary?: UsageWindow;
 	credits?: {
@@ -104,6 +113,14 @@ export function parseCodexUsageBody(
 		fetchedAt,
 		credentialHash,
 		plan: typeof source.plan_type === "string" ? source.plan_type : undefined,
+		// `limit_reached` is the negative statement and `allowed` the positive one; either alone
+		// is enough. Read both so a response that carries only one of them still answers.
+		serviceable:
+			typeof rateLimit.limit_reached === "boolean"
+				? !rateLimit.limit_reached
+				: typeof rateLimit.allowed === "boolean"
+					? rateLimit.allowed
+					: undefined,
 		primary,
 		secondary,
 		credits: {

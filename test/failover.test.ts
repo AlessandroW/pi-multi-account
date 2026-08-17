@@ -129,6 +129,8 @@ function setup(opts: {
 	omitSendUserMessage?: boolean;
 	/** Models the HOST (Pi) itself publishes for the base Codex provider. */
 	hostCodexModels?: string[];
+	/** Accounts Pi does NOT know any model for — logged in, but unusable until configured. */
+	unknownProviders?: string[];
 	/** The level the SESSION runs at (what `--thinking` / `/thinking` produced). */
 	thinkingLevel?: string;
 	/** Highest thinking level a provider's models support — Pi clamps anything above it. */
@@ -171,7 +173,9 @@ function setup(opts: {
 		rmSync(STATE, { force: true });
 	}
 
-	const known = new Set<string>(Object.keys(accounts));
+	const known = new Set<string>(
+		Object.keys(accounts).filter((id) => !opts.unknownProviders?.includes(id)),
+	);
 	const registeredModels = new Map<string, any[]>();
 	const mkModel = (provider: string, id: string) => ({ provider, id });
 	const rec = {
@@ -4303,5 +4307,847 @@ test("max survives a switch through a weaker model, exactly like every other lev
 	assert.ok(
 		!t.rec.thinkingLevels.includes("high"),
 		`the extension must never ASK for the clamped level: ${JSON.stringify(t.rec.thinkingLevels)}`,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// A refusal outranks the quota meter (issue: bounced back onto a spent account)
+// ---------------------------------------------------------------------------
+
+test("the FIRST refusal already benches an account whose usage meter claims headroom", async () => {
+	// Real report: seven Codex accounts, six at 100% and one reading 98%. The 98% account was
+	// picked, greeted the user, then refused the first real request with "You have hit your
+	// ChatGPT usage limit (free plan)". It was benched — and the very next usage refresh saw
+	// 98% (< 100%), decided the account was free, wiped the cooldown, and rotation walked
+	// straight back onto it. The loop only broke on the SECOND refusal.
+	//
+	// One refusal is already proof. A used-percentage is a forecast about a quota window that
+	// cannot see this account's real (session/plan) limit; a refusal is an observation that just
+	// happened. The observation must win the first time, not the second.
+	const now = Date.now();
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 40 },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				anthropic: {
+					provider: "anthropic",
+					family: "anthropic",
+					fetchedAt: now,
+					// The exact shape that caused it: just short of the cap, so the meter says "free".
+					primary: { usedPercent: 98, resetAt: now + 5 * 60 * 60 * 1000 },
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"You have hit your ChatGPT usage limit (free plan). Try again in ~41615 min.",
+	);
+	// Let the usage reconciliation run: this is where the 98% reading used to clear the bench.
+	await wait(260);
+
+	const until = t.readState().exhaustedUntilByProvider?.anthropic;
+	assert.ok(
+		typeof until === "number" && until > Date.now() + 60_000,
+		`one refusal must bench the account for a real interval, got ${JSON.stringify(until)}`,
+	);
+});
+
+test("a distrusted usage meter survives a restart instead of re-opening the loop", async () => {
+	// The distrust flag lived only in memory. Every new Pi session started believing the meter
+	// again, so a spent account was re-selected once per session — which is why this kept
+	// recurring all day rather than settling after the first two refusals.
+	const now = Date.now();
+	const seedState = {
+		stateVersion: 5,
+		exhaustedUntilByProvider: {},
+		exhaustedUntilByModel: {},
+		lastProbeAtByProvider: {},
+		invalidatedByProvider: {},
+		usageByProvider: {
+			anthropic: {
+				provider: "anthropic",
+				family: "anthropic",
+				fetchedAt: now,
+				primary: { usedPercent: 98, resetAt: now + 5 * 60 * 60 * 1000 },
+			},
+		},
+		lastSwitches: [],
+	};
+
+	const first = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 40 },
+		seedState,
+	});
+	await first.fire("session_start");
+	await finishError(
+		first,
+		"anthropic",
+		"claude-opus-4-8",
+		"You have hit your ChatGPT usage limit (free plan). Try again in ~41615 min.",
+	);
+	await wait(120);
+
+	const carried = first.readState();
+	assert.ok(
+		carried.usageUntrustedUntilByProvider?.anthropic > Date.now(),
+		"the proof that this account's meter lies must be written down, not held in memory",
+	);
+
+	// A brand-new session reads that state back.
+	const second = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 40 },
+		seedState: carried,
+	});
+	await second.fire("session_start");
+	await wait(260);
+
+	const until = second.readState().exhaustedUntilByProvider?.anthropic;
+	assert.ok(
+		typeof until === "number" && until > Date.now() + 60_000,
+		`a restart must not re-trust a meter already proven wrong, got ${JSON.stringify(until)}`,
+	);
+});
+
+test("a real success re-trusts the meter and clears the bench", async () => {
+	// The distrust must not be permanent: the account genuinely recovering has to be able to
+	// undo it, otherwise a spent account would never come back.
+	const now = Date.now();
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 40 },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageUntrustedUntilByProvider: { anthropic: now + 30 * 60 * 1000 },
+			usageByProvider: {
+				anthropic: {
+					provider: "anthropic",
+					family: "anthropic",
+					fetchedAt: now,
+					primary: { usedPercent: 98, resetAt: now + 5 * 60 * 60 * 1000 },
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	const ok = {
+		role: "assistant",
+		content: [{ type: "text", text: "done" }],
+		provider: "anthropic",
+		model: "claude-opus-4-8",
+		stopReason: "end_turn",
+		timestamp: messageTimestamp++,
+	};
+	await t.fire("message_end", { message: ok });
+	t.setIdle(true);
+	await t.fire("agent_end", { messages: [ok] });
+	await wait(80);
+
+	const state = t.readState();
+	assert.ok(
+		!(state.usageUntrustedUntilByProvider?.anthropic > Date.now()),
+		"a successful response proves the account works and must restore trust",
+	);
+	assert.ok(
+		state.exhaustedUntilByProvider?.anthropic === undefined,
+		"and it must not stay benched",
+	);
+});
+
+test("a bare throttle with no stated horizon still defers to the usage meter", async () => {
+	// The narrow half of the same rule. When the provider says only "429 rate limit" it has made
+	// no claim about when the account returns, so the meter remains the better evidence and an
+	// account whose window is genuinely empty must not be benched.
+	const now = Date.now();
+	const t = setup({
+		accounts: ONE_ACCOUNT,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 40 },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				anthropic: {
+					provider: "anthropic",
+					family: "anthropic",
+					fetchedAt: now,
+					primary: { usedPercent: 0, resetAt: now - 1_000 },
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
+	await wait(120);
+
+	assert.ok(
+		!(t.readState().usageUntrustedUntilByProvider?.anthropic > Date.now()),
+		"a horizon-free throttle is not evidence that the meter is lying",
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Manual selection: it must hold, and it must say where it put you
+// ---------------------------------------------------------------------------
+
+test("a manually chosen account survives the preflight for one attempt", async () => {
+	// `next` deliberately ignores cooldowns, because the quota bookkeeping is a guess and trying
+	// the account is the only way to prove the guess wrong. But the preflight that runs on the
+	// user's very next message re-applied that same bookkeeping and moved them off — so the
+	// override held only until it was used, which is exactly when it mattered. One attempt must
+	// go where the user asked; ordinary failover takes over from there.
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+	});
+	await t.command("next");
+	assert.deepEqual(t.rec.setModels, ["openai-codex-account-2/gpt-5.5"]);
+
+	const before = t.rec.setModels.length;
+	await t.input("do the thing");
+
+	assert.equal(
+		t.rec.setModels.length,
+		before,
+		`the preflight must not undo an explicit choice; it moved to ${t.rec.setModels.slice(before).join(", ")}`,
+	);
+});
+
+test("the manual reprieve is spent after one attempt", async () => {
+	// It is one attempt, not a permanent pin: once the chosen account has had its chance, normal
+	// routing resumes, otherwise a user could strand themselves on a genuinely dead account.
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+	});
+	await t.command("next");
+	await t.input("first");
+	const before = t.rec.setModels.length;
+	await t.input("second");
+
+	assert.ok(
+		t.rec.setModels.length > before,
+		"the second attempt must fall back to normal routing",
+	);
+});
+
+test("next says where it landed and whether that account is believed spent", async () => {
+	// It used to switch silently onto a cooled account and then be silently moved off it, so the
+	// user saw two switches and ended up somewhere they never chose. Saying it plainly costs
+	// nothing and removes the whole confusion.
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+	});
+	await t.command("next");
+
+	const said = t.rec.notifies.join("\n");
+	assert.match(said, /openai-codex-account-2/, "it must name the account it chose");
+	assert.match(
+		said,
+		/spent|cooling|cooldown/i,
+		`and admit that account is believed spent; said: ${said}`,
+	);
+});
+
+test("status shows how to switch to a specific account, not just next", async () => {
+	// The direct switch existed all along but was buried mid-way through one dense pipe-separated
+	// line of eighteen commands, so the only discoverable way to reach a chosen account was
+	// pressing `next` repeatedly until it came round.
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await t.command("status");
+
+	const said = t.rec.notifies.join("\n");
+	assert.match(
+		said,
+		/switch <provider>.*openai-codex-account-2|switch openai-codex-account-2/,
+		`status must show a usable switch example; said: ${said}`,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Providers outside the five specially-managed families
+// ---------------------------------------------------------------------------
+
+const MIXED_ACCOUNTS: Account = {
+	anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+	zai: { type: "api_key", key: "zai-key" },
+	"kimi-coding": { type: "api_key", key: "kimi-key" },
+};
+
+test("a provider outside the known families still joins the rotation", async () => {
+	// Rotation membership required a provider to be recognised as one of five families by name,
+	// and everything else was dropped by a single `continue` — silently, with no mention in
+	// status. On a real machine that meant six of fourteen logged-in accounts, and roughly four
+	// hundred models, sat unused while the managed accounts burned out one by one.
+	const t = setup({
+		accounts: MIXED_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"You have hit your usage limit. Try again in ~600 min.",
+	);
+
+	assert.ok(
+		t.rec.setModels.some((target: string) => target.startsWith("zai/") || target.startsWith("kimi-coding/")),
+		`an unmanaged account must be a usable destination; switches were ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("an unmanaged provider can be selected by name", async () => {
+	const t = setup({
+		accounts: MIXED_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await t.command("switch zai");
+
+	assert.ok(
+		t.rec.setModels.some((target: string) => target.startsWith("zai/")),
+		`switch must reach an unmanaged provider; switches were ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("status names the unmanaged providers instead of hiding them", async () => {
+	// The silent drop was the worst part: nothing anywhere said these accounts existed but were
+	// not being used, so there was no way to notice from inside the tool.
+	const t = setup({
+		accounts: MIXED_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await t.command("status");
+
+	const said = t.rec.notifies.join("\n");
+	assert.match(said, /zai/, `status must list unmanaged rotation members; said: ${said}`);
+	assert.match(
+		said,
+		/no quota tracking|without quota|no usage/i,
+		`and be honest that their quota is not tracked; said: ${said}`,
+	);
+});
+
+test("unmanaged providers can be switched off", async () => {
+	// Someone paying per token on a plain API key may deliberately not want background failover
+	// spending it, so the new behaviour has an off switch.
+	const t = setup({
+		accounts: MIXED_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { includeOtherProviders: false },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"You have hit your usage limit. Try again in ~600 min.",
+	);
+
+	assert.ok(
+		!t.rec.setModels.some((target: string) => target.startsWith("zai/") || target.startsWith("kimi-coding/")),
+		`opting out must keep unmanaged accounts unused; switches were ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("a specially-managed family is still preferred over an unmanaged provider", async () => {
+	// Managed accounts have quota telemetry, OAuth refresh and live catalogs; unmanaged ones are
+	// a blind spend. They belong at the end of the ring, not ahead of an account we can measure.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			zai: { type: "api_key", key: "zai-key" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"You have hit your usage limit. Try again in ~600 min.",
+	);
+
+	assert.ok(
+		t.rec.setModels[0]?.startsWith("openai-codex-account-2/"),
+		`a measurable account must win; went to ${t.rec.setModels[0]}`,
+	);
+});
+
+test("registering the Ollama base provider must not narrow the user's own model list", async () => {
+	// The base registration exists because a placeholder apiKey in models.json can stop Pi
+	// exposing the provider at all. But it called registerProvider with only the one built-in tag,
+	// which REPLACED a models.json that configured six — so a user running six Ollama cloud models
+	// could reach exactly the one written into this extension. Ollama and Qwen are the only two
+	// families whose model list still comes from an array in this file; Anthropic and Codex were
+	// taught to learn from the host precisely so a new generation needs no release.
+	writeFileSync(
+		join(AGENT_DIR, "models.json"),
+		JSON.stringify({
+			providers: {
+				ollama: {
+					api: "openai-completions",
+					models: [
+						{ id: "glm-5.2:cloud" },
+						{ id: "qwen3.5:cloud" },
+						{ id: "deepseek-v4-flash:cloud" },
+					],
+				},
+			},
+		}),
+		{ mode: 0o600 },
+	);
+	try {
+		const t = setup({
+			accounts: {
+				anthropic: { type: "oauth", access: "a", refresh: "r" },
+				ollama: { type: "api_key", key: "ollama-base-key" },
+			},
+			config: { includeOllama: true },
+		});
+		await t.fire("session_start");
+
+		const models = t.ctx.modelRegistry
+			.getAll()
+			.filter((model: any) => model.provider === "ollama")
+			.map((model: any) => model.id);
+		for (const expected of ["glm-5.2:cloud", "qwen3.5:cloud", "deepseek-v4-flash:cloud"]) {
+			assert.ok(
+				models.includes(expected),
+				`a configured model must survive registration; got ${JSON.stringify(models)}`,
+			);
+		}
+	} finally {
+		rmSync(join(AGENT_DIR, "models.json"), { force: true });
+	}
+});
+
+test("a provider Pi has no models for is marked unconfigured instead of looking healthy", async () => {
+	// Joining the rotation is not the same as being usable. An account whose models Pi does not
+	// know contributes no candidate at selection time, so it can never be chosen — but it was
+	// listed in `Rotation` exactly like a working one, which reads as an account in service and
+	// is really dead weight. It has to be named as needing configuration.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+			zai: { type: "api_key", key: "z" },
+		},
+		unknownProviders: ["zai"],
+	});
+	await t.fire("session_start");
+	await t.command("status");
+
+	const said = t.rec.notifies.join("\n");
+	assert.match(
+		said,
+		/needs? (a )?model|unconfigured|no models/i,
+		`an unusable account must say why; said: ${said}`,
+	);
+	assert.match(said, /zai/, "and name it");
+});
+
+// ---------------------------------------------------------------------------
+// A provider that cannot serve the request at all
+// ---------------------------------------------------------------------------
+
+const OPENROUTER_402 =
+	'402: {"message":"Prompt tokens limit exceeded: 38075 > 16958. To increase, visit ' +
+	"https://openrouter.ai/settings/credits and upgrade to a paid account\",\"code\":402," +
+	'"metadata":{"limit_source":"openrouter_credits","remedy_hint":"Add credits at ' +
+	"https://openrouter.ai/settings/credits, or lower max_tokens / prompt size to fit your " +
+	'remaining balance.","provider_name":null}}';
+
+test("a 402 'out of credits' refusal is actionable, not unhandled", async () => {
+	// The real-world dead end: an account whose free allowance no longer covers the request
+	// refuses with 402. Nothing in the vocabulary matched it, so it classified as `unhandled` —
+	// no cooldown, no failover, no message. The session sat on that provider and every single
+	// user prompt produced the same 402 forever, while live accounts waited in the rotation.
+	rmSync(DEBUG_LOG, { force: true });
+	const t = setup({
+		current: { provider: "openrouter", id: "ai21/jamba-large-1.7" },
+	});
+	const before = t.rec.setModels.length;
+	await finishError(t, "openrouter", "ai21/jamba-large-1.7", OPENROUTER_402);
+
+	const classified = readDebugLog()
+		.filter(
+			(entry) =>
+				entry.kind === "assistant_error" && entry.provider === "openrouter",
+		)
+		.at(-1)?.classified;
+	assert.equal(
+		classified,
+		"limit",
+		"a provider stating it cannot serve the request must be understood, not shrugged at",
+	);
+	assert.ok(
+		t.rec.setModels.length > before,
+		`must move off a provider that refuses every request, got: ${t.rec.setModels.slice(before).join(", ") || "none"}`,
+	);
+});
+
+test("a provider that is out of credits is benched, so failover cannot land back on it", async () => {
+	// Failing over once is not enough: openrouter was also the configured fallback target, so the
+	// next switch chose it again, it refused again, and the loop closed. It has to carry a
+	// cooldown like any other refusing account.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			openrouter: { type: "api_key", key: "or-key" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openrouter", id: "ai21/jamba-large-1.7" },
+	});
+	await t.fire("session_start");
+	await finishError(t, "openrouter", "ai21/jamba-large-1.7", OPENROUTER_402);
+
+	const cooldown = t.readState().exhaustedUntilByProvider?.openrouter ?? 0;
+	assert.ok(
+		cooldown > Date.now(),
+		"the refusing account must be benched so the rotation stops returning to it",
+	);
+	assert.ok(
+		!t.rec.setModels.some((target: string) => target.startsWith("openrouter/")),
+		`and must never be chosen as the failover target; switches were ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("a manually chosen account survives BOTH preflights of the same message", async () => {
+	// Pi runs the readiness preflight twice for one user message: once on `input`, then again in
+	// `before_agent_start`. The one-attempt reprieve was consumed by the first, so the second saw
+	// no reprieve and moved the user off the account they had just picked by hand — the switch
+	// notice read `last-moment preflight: selected account unavailable`. The reprieve covers the
+	// attempt, not the first function call that happens to ask about it.
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+	});
+	await t.command("next");
+	assert.deepEqual(t.rec.setModels, ["openai-codex-account-2/gpt-5.5"]);
+
+	const before = t.rec.setModels.length;
+	await t.input("do the thing");
+	await t.fire("before_agent_start", {});
+
+	assert.equal(
+		t.rec.setModels.length,
+		before,
+		`the explicit choice must reach the provider; it was moved to ${t.rec.setModels.slice(before).join(", ")}`,
+	);
+	assert.equal(
+		t.ctx.model.provider,
+		"openai-codex-account-2",
+		"the user must still be on the account they chose",
+	);
+});
+
+test("the reprieve is still spent after that one attempt", async () => {
+	// The double-preflight fix must not turn the reprieve into a permanent pin: once the attempt
+	// has happened, normal routing resumes so nobody is stranded on a dead account.
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+	});
+	await t.command("next");
+	await t.input("first");
+	await t.fire("before_agent_start", {});
+	const before = t.rec.setModels.length;
+	await t.input("second");
+
+	assert.ok(
+		t.rec.setModels.length > before,
+		"the second message must go back to normal routing",
+	);
+});
+
+test("'no account' is only said when there is no account — otherwise it says what is wrong", async () => {
+	// The message claimed nothing was logged in whenever selection came up empty, which is a
+	// different fact from the one that was true: accounts existed, had credentials, and even had
+	// quota left — their authorization had expired. Being told "no authenticated account exists"
+	// while `status` lists two accounts with quota is what makes the extension look broken rather
+	// than the accounts, and it hides the one action that actually fixes it.
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	// Both accounts lose their authorization for real, exactly as an expired refresh token does.
+	await finishError(t, "anthropic", "claude-opus-4-8", "invalid_grant");
+	await finishError(t, "openai-codex-account-2", "gpt-5.5", "invalid_grant");
+	assert.ok(
+		t.readState().invalidatedByProvider?.anthropic &&
+			t.readState().invalidatedByProvider?.["openai-codex-account-2"],
+		"precondition: both accounts are logged in but no longer authorized",
+	);
+
+	t.rec.notifies.length = 0;
+	await t.input("continue please");
+
+	const said = t.rec.notifies.join("\n");
+	assert.doesNotMatch(
+		said,
+		/no usable authenticated account exists/,
+		`two logged-in accounts must not be reported as none; said: ${said}`,
+	);
+	assert.match(
+		said,
+		/anthropic/,
+		`the accounts that need attention must be named; said: ${said}`,
+	);
+	assert.match(
+		said,
+		/openai-codex-account-2/,
+		`including the one the user never switched to; said: ${said}`,
+	);
+	assert.match(
+		said,
+		/log ?in|re-?login|authoriz/i,
+		`and the message must say what to do about them; said: ${said}`,
+	);
+});
+
+test("a month-long 'believed spent' notice admits it is a forecast, not a month-long lockout", async () => {
+	// The notice quoted the RAW forecast — "cooling down, ~678h 28m left" — while the extension's
+	// own rule is to re-ask any account at least every `maxRecheckIntervalMs`. Reading that an
+	// account is locked for 28 days, when it is really re-probed within hours, is what convinced
+	// a user that freed-up accounts were never being picked up again.
+	const now = Date.now();
+	const provider = "openai-codex-account-2";
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				[provider]: {
+					provider,
+					family: "codex",
+					fetchedAt: now,
+					plan: "free",
+					primary: {
+						usedPercent: 100,
+						resetAt: now + 28 * 24 * 60 * 60 * 1000,
+						windowSeconds: 2592000,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.command("next");
+
+	const said = t.rec.notifies.join("\n");
+	assert.match(said, new RegExp(provider), "it must still name the account");
+	assert.match(
+		said,
+		/forecast|re-?check|re-?tr(y|ied)/i,
+		`and must not present a quota forecast as a settled lockout; said: ${said}`,
+	);
+});
+
+test("an account the provider says is usable right now is used, whatever our bookkeeping predicted", async () => {
+	// The exact shape of the real complaint: accounts had recovered — ChatGPT itself answered
+	// `rate_limit.allowed: true, limit_reached: false` — and the extension kept skipping them,
+	// because it had benched them earlier and was consulting only its own recorded cooldown and a
+	// used-percentage that still read 98%. A cooldown is a guess about the future; the account
+	// saying "yes" right now is not, and it has to win.
+	const now = Date.now();
+	const revived = "openai-codex-account-2";
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			// Benched by an earlier refusal, and its meter distrusted because of it.
+			exhaustedUntilByProvider: { [revived]: now + 6 * 60 * 60 * 1000 },
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageUntrustedUntilByProvider: { [revived]: now + 6 * 60 * 60 * 1000 },
+			usageByProvider: {
+				[revived]: {
+					provider: revived,
+					family: "codex",
+					fetchedAt: now,
+					plan: "free",
+					serviceable: true,
+					primary: {
+						usedPercent: 98,
+						resetAt: now + 27 * 24 * 60 * 60 * 1000,
+						windowSeconds: 2592000,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"429 usage limit reached",
+	);
+
+	assert.ok(
+		t.rec.setModels.some((target: string) => target.startsWith(`${revived}/`)),
+		`the recovered account must be picked up; switches were ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("an account the provider says is blocked is not tried, even while its meter shows headroom", async () => {
+	// The mirror image, and the reason this must read the verdict rather than just ignore
+	// cooldowns: a free-plan account can be refused outright while its monthly window still shows
+	// room. Believing the percentage there is what sent turn after turn into an account that had
+	// already said no.
+	const now = Date.now();
+	const blocked = "openai-codex-account-2";
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			[blocked]: {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: "c-tok-3",
+				refresh: "c-ref-3",
+				accountId: "codex-3",
+			},
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				[blocked]: {
+					provider: blocked,
+					family: "codex",
+					fetchedAt: now,
+					plan: "free",
+					serviceable: false,
+					primary: {
+						usedPercent: 40,
+						resetAt: now + 27 * 24 * 60 * 60 * 1000,
+						windowSeconds: 2592000,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"429 usage limit reached",
+	);
+
+	assert.ok(
+		!t.rec.setModels.some((target: string) => target.startsWith(`${blocked}/`)),
+		`an account that already said no must be skipped; switches were ${JSON.stringify(t.rec.setModels)}`,
+	);
+	assert.ok(
+		t.rec.setModels.some((target: string) =>
+			target.startsWith("openai-codex-account-3/"),
+		),
+		`and the turn must land on an account that has not; switches were ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("a provider verdict of 'usable' clears the recorded bench, it does not merely bypass it", async () => {
+	// Bypassing the cooldown at selection time is not enough: the record stays on disk, keeps the
+	// account looking spent in `status`, and is what the pending-resume timer waits on. When the
+	// account itself says it is usable again, the bench is wrong and has to go — including the
+	// distrust flag that was set when it refused, since that distrust was about the METER, and
+	// the account has now spoken for itself.
+	const now = Date.now();
+	const revived = "openai-codex-account-2";
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { showUsage: false },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: { [revived]: now + 6 * 60 * 60 * 1000 },
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageUntrustedUntilByProvider: { [revived]: now + 6 * 60 * 60 * 1000 },
+			usageByProvider: {
+				[revived]: {
+					provider: revived,
+					family: "codex",
+					fetchedAt: now,
+					plan: "free",
+					serviceable: true,
+					primary: {
+						usedPercent: 98,
+						resetAt: now + 27 * 24 * 60 * 60 * 1000,
+						windowSeconds: 2592000,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	await t.command("status");
+
+	const state = t.readState();
+	assert.ok(
+		!(state.exhaustedUntilByProvider?.[revived] > Date.now()),
+		`the bench must be lifted, not just ignored; state was ${JSON.stringify(state.exhaustedUntilByProvider)}`,
+	);
+	assert.ok(
+		!(state.usageUntrustedUntilByProvider?.[revived] > Date.now()),
+		`and the meter regains trust once the account itself confirms it; state was ${JSON.stringify(state.usageUntrustedUntilByProvider)}`,
 	);
 });

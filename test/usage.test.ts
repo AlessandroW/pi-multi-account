@@ -130,3 +130,56 @@ test("Codex usage fetch sends the account id and never exposes the token in the 
 	assert.equal(snapshot.credentialHash, "safe-hash");
 	assert.ok(!JSON.stringify(snapshot).includes("secret-access-token"));
 });
+
+test("the provider's own allowed/limit_reached verdict is carried, not just the percentages", () => {
+	// The Codex usage response answers the question directly — `rate_limit.allowed` /
+	// `limit_reached` — and that answer was being dropped on the floor in favour of deriving an
+	// opinion from `used_percent`. On a real machine two accounts answered `allowed: true` while
+	// reading 98%, and the extension kept them benched: the account said "yes", the percentage
+	// said "nearly out", and only the percentage was ever read.
+	const free = parseCodexUsageBody("openai-codex-account-2", {
+		plan_type: "free",
+		rate_limit: {
+			allowed: true,
+			limit_reached: false,
+			primary_window: {
+				used_percent: 98,
+				limit_window_seconds: 2592000,
+				reset_at: Math.floor(Date.now() / 1000) + 2_387_570,
+			},
+			secondary_window: null,
+		},
+	});
+	assert.equal(free?.serviceable, true, "an account the provider allows must be marked usable");
+
+	const spent = parseCodexUsageBody("openai-codex-account-3", {
+		plan_type: "free",
+		rate_limit: {
+			allowed: false,
+			limit_reached: true,
+			primary_window: {
+				used_percent: 100,
+				limit_window_seconds: 2592000,
+				reset_at: Math.floor(Date.now() / 1000) + 2_397_006,
+			},
+			secondary_window: null,
+		},
+	});
+	assert.equal(spent?.serviceable, false, "and one it refuses must be marked blocked");
+
+	const silent = parseCodexUsageBody("openai-codex", {
+		plan_type: "plus",
+		rate_limit: {
+			primary_window: {
+				used_percent: 50,
+				limit_window_seconds: 18000,
+				reset_at: Math.floor(Date.now() / 1000) + 3600,
+			},
+		},
+	});
+	assert.equal(
+		silent?.serviceable,
+		undefined,
+		"a response that states no verdict must not have one invented for it",
+	);
+});
