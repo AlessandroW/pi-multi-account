@@ -6349,10 +6349,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				);
 				return;
 			}
-			const parsed = parseTarget(target);
+			const parsed = resolveSwitchTarget(target, ctx);
 			if (!parsed) {
 				ctx.ui.notify(
 					`pi-multi-account: unknown provider "${target}". Rotation: ${rotation.join(", ") || "none"}`,
+					"warning",
+				);
+				return;
+			}
+			if ("ambiguous" in parsed) {
+				ctx.ui.notify(
+					`pi-multi-account: "${target}" matches ${parsed.ambiguous.join(", ")} — name one of them.`,
 					"warning",
 				);
 				return;
@@ -6382,7 +6389,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			persist();
 			refreshDiscovery(true, ctx);
-			const candidates = resolveTargets(ctx, target, ctx.model, true).filter(
+			// Use the RESOLVED slot id, not the raw text: a short name that resolved above would
+			// otherwise be handed on verbatim and find nothing.
+			const resolvedTarget = parsed.modelId
+				? `${parsed.provider}/${parsed.modelId}`
+				: parsed.provider;
+			const candidates = resolveTargets(ctx, resolvedTarget, ctx.model, true).filter(
 				(model: any) => providerHasUsableAuth(ctx, model.provider),
 			);
 			if (candidates.length === 0) {
@@ -6419,6 +6431,38 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			return;
 		}
+		/**
+		 * Resolve what the user typed to a real slot.
+		 *
+		 * The slot ids are internal (`kimi-coding`, `openai-codex-account-6`) and `switch` demanded
+		 * one exactly, so the only command that reaches a chosen account directly answered
+		 * `unknown provider "kimi"` to the name a person would actually type — leaving `next` and
+		 * its walk through every spent account as the only way there. An exact id always wins; a
+		 * short name resolves only when it is unambiguous, because guessing between two Codex slots
+		 * would silently spend the wrong account's quota.
+		 */
+		function resolveSwitchTarget(
+			target: string,
+			ctx: any,
+		):
+			| { provider: string; modelId?: string }
+			| { ambiguous: string[] }
+			| undefined {
+			const parsed = parseTarget(target);
+			if (!parsed) return undefined;
+			const known = new Set([...rotation, ...Object.keys(readAuthFile())]);
+			if (known.has(parsed.provider)) return parsed;
+			if (providerHasUsableAuth(ctx, parsed.provider)) return parsed;
+			const needle = parsed.provider.toLowerCase();
+			const matches = [...known].filter(
+				(id) =>
+					id.toLowerCase().startsWith(needle) || id.toLowerCase().includes(needle),
+			);
+			if (matches.length === 1) return { ...parsed, provider: matches[0] };
+			if (matches.length > 1) return { ambiguous: matches.sort() };
+			return parsed;
+		}
+
 		if (command === "best" || command === "live") {
 			// `next` walks the ring a step at a time and `switch` needs an exact name, so on a
 			// machine with a dozen accounts — most of them spent — reaching a working one meant

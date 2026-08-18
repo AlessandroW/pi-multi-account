@@ -5537,3 +5537,72 @@ test("an account with a usage endpoint still honours the recheck ceiling", async
 		`a cheaply re-probed account must still come back at the ceiling; got ${minutes}m`,
 	);
 });
+
+test("switch accepts the name people actually type", async () => {
+	// `switch kimi` answered `unknown provider "kimi"`, because the slot is called kimi-coding —
+	// so the one command that reaches a chosen account directly required knowing the exact id,
+	// and `next` was the only fallback. A short, unambiguous name is what a person types.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+			"kimi-coding": { type: "api_key", key: "kimi-key" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	t.rec.setModels.length = 0;
+	await t.command("switch kimi");
+
+	assert.ok(
+		t.rec.setModels.some((target: string) => target.startsWith("kimi-coding/")),
+		`a short name must resolve; switches: ${JSON.stringify(t.rec.setModels)}, said: ${t.rec.notifies.join(" | ")}`,
+	);
+});
+
+test("an ambiguous short name is refused with the options, not guessed", async () => {
+	// Guessing between two Codex slots would silently spend the wrong account's quota.
+	const t = setup({
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c2",
+				refresh: "r2",
+				accountId: "codex-2",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: "c3",
+				refresh: "r3",
+				accountId: "codex-3",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+	});
+	await t.fire("session_start");
+	t.rec.notifies.length = 0;
+	await t.command("switch codex");
+
+	const said = t.rec.notifies.join("\n");
+	assert.match(said, /openai-codex-account-2/, `it must list the candidates; said: ${said}`);
+	assert.match(said, /openai-codex-account-3/, `both of them; said: ${said}`);
+});
+
+test("an exact id still wins over any prefix match", async () => {
+	// `ollama` must never resolve to `ollama-account-2` just because both start the same way.
+	const t = setup({
+		accounts: {
+			ollama: { type: "api_key", key: "k1" },
+			"ollama-account-2": { type: "api_key", key: "k2" },
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	t.rec.setModels.length = 0;
+	await t.command("switch ollama");
+
+	assert.ok(
+		t.rec.setModels.some((target: string) => target.startsWith("ollama/")),
+		`the exact id must win; switches: ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
