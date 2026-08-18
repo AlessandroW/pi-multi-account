@@ -5606,3 +5606,86 @@ test("an exact id still wins over any prefix match", async () => {
 		`the exact id must win; switches: ${JSON.stringify(t.rec.setModels)}`,
 	);
 });
+
+test("a confirmed-available account outranks one whose state is merely unknown", async () => {
+	// `best` promised "an account that can work right now" and landed on Kimi, which was out of
+	// quota. Ranking treated "the provider told us allowed:true" and "we have no idea" as the same
+	// thing, so an unmeasurable account sitting earlier in the ring beat a measured, confirmed one.
+	// Confirmation is evidence; absence of a cooldown is not.
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+			"kimi-coding": { type: "api_key", key: "kimi-key" },
+			"openai-codex-account-7": {
+				type: "oauth",
+				access: "c7",
+				refresh: "r7",
+				accountId: "codex-7",
+			},
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		// Kimi sits EARLIER in the ring than the codex slot, so only ranking can save this.
+		config: { providerOrder: ["anthropic", "kimi-coding", "openai-codex"] },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-7": {
+					provider: "openai-codex-account-7",
+					family: "codex",
+					fetchedAt: now,
+					plan: "free",
+					serviceable: true,
+					primary: { usedPercent: 90, resetAt: now + 86_400_000 },
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	t.setCurrent("anthropic", "claude-opus-4-8");
+	t.rec.setModels.length = 0;
+	await t.command("best");
+
+	assert.ok(
+		t.rec.setModels.some((m: string) => m.startsWith("openai-codex-account-7/")),
+		`the confirmed account must win; switches: ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("when nothing is confirmed, best says the choice is a guess", async () => {
+	// With every measurable account spent, the only candidates left are ones we cannot check.
+	// Switching there silently reads as "it threw me somewhere random again" — which is exactly
+	// how it looked. Saying it is an unverified guess makes the same action honest.
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+			"kimi-coding": { type: "api_key", key: "kimi-key" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: { anthropic: now + 3_600_000 },
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	t.setCurrent("anthropic", "claude-opus-4-8");
+	t.rec.notifies.length = 0;
+	await t.command("best");
+
+	const said = t.rec.notifies.join("\n");
+	assert.match(
+		said,
+		/not confirmed|cannot be checked|unverified|no quota/i,
+		`it must not present a guess as a verified choice; said: ${said}`,
+	);
+});

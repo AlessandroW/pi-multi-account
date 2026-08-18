@@ -671,7 +671,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.19.1";
+const VERSION = "1.19.2";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -3833,6 +3833,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		persist();
 	}
 
+	/** True when a fresh snapshot carries the provider's own "usable right now" verdict. */
+	function isConfirmedAvailable(provider: string, now = Date.now()): boolean {
+		const cached = usageByProvider.get(provider);
+		return (
+			!!cached &&
+			cached.serviceable === true &&
+			now - cached.fetchedAt < usageCacheTtl(provider)
+		);
+	}
+
 	function providerRecoveryAt(
 		provider: string,
 		now = Date.now(),
@@ -4632,6 +4642,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			 * its forecast went stale.
 			 */
 			predictedBusy: boolean;
+			/**
+			 * The provider itself said this account is usable, recently enough to believe.
+			 *
+			 * Distinct from "we hold no cooldown for it": that is absence of evidence, which is what
+			 * an account with no usage endpoint at all always looks like. Treating the two as equal
+			 * let an unmeasurable, out-of-quota account beat a measured, confirmed one.
+			 */
+			confirmed: boolean;
 		};
 		// When preferLatestModel is on, the newest model wins ACROSS accounts — not just
 		// within one account. Without this, failing over from gpt-5.5 could land on the
@@ -4689,6 +4707,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				rotIndex: i,
 				rank: modelRecencyRank(pick),
 				lastRefusalAt: limitStreakByProvider.get(pick.provider)?.lastAt ?? 0,
+				confirmed: isConfirmedAvailable(pick.provider, now),
 				predictedBusy:
 					providerRecoveryAt(pick.provider, now, { ignoreCeiling: true }) >
 					now,
@@ -4732,6 +4751,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// the rotation order alone could send us straight back to the account we just left, get the
 		// same refusal, and loop between two spent accounts while a live one sat further down.
 		const byRefusalAgeThenRank = (a: Scored, b: Scored) =>
+			// An account the provider has CONFIRMED usable outranks one we simply know nothing
+			// about. Both look identical to a cooldown check — neither is benched — but only one
+			// carries evidence, and preferring the guess is how a switch billed as "an account
+			// that can work right now" landed on an out-of-quota account.
+			Number(b.confirmed) - Number(a.confirmed) ||
 			// An account nothing predicts as spent always outranks one we are only re-probing
 			// because its forecast went stale — a maxed usage window is still the best hint we
 			// have about which account to ask FIRST. It just may not veto asking at all.
@@ -6499,6 +6523,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				return;
 			}
 			currentPromptSwitch = undefined;
+			const verified = isConfirmedAvailable(candidates[0].provider);
 			const switched = await activateFallback(
 				ctx,
 				ctx.model,
@@ -6507,7 +6532,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				{ armContinuation: false },
 			);
 			currentPromptSwitch = undefined;
-			if (switched) announceManualChoice(ctx);
+			if (switched) {
+				announceManualChoice(ctx);
+				// Saying "best" of an account nobody can measure overstates what was done. When no
+				// account confirms availability, this is the least-bad guess, and calling it that
+				// is the difference between a considered choice and looking random.
+				if (!verified)
+					ctx.ui.notify(
+						`pi-multi-account: no account confirmed availability — ${ctx.model?.provider} has no quota endpoint to check, so this is an unverified guess. Everything measurable is spent.`,
+						"warning",
+					);
+			}
 			else
 				ctx.ui.notify(
 					"pi-multi-account: could not switch to the best available account",
