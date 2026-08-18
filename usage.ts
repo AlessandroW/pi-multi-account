@@ -473,6 +473,28 @@ export function shortAccount(account: string | undefined): string | undefined {
 	return local.length > 18 ? `${local.slice(0, 17)}…` : local;
 }
 
+/**
+ * Name a quota window by how long it actually is.
+ *
+ * The label used to be positional — whatever sat in the "primary" slot was called `5h` — but a
+ * Codex free plan meters a THIRTY-DAY window there. A number that resets next month then read as
+ * one resetting this afternoon, which is a materially different decision about whether to wait.
+ */
+export function windowLabel(
+	window: UsageWindow,
+	family: UsageFamily,
+	position: "primary" | "secondary",
+): string {
+	if (family === "cursor") return position === "primary" ? "auth" : "7d";
+	if (family === "ollama") return position === "primary" ? "cloud" : "weekly";
+	const seconds = window.windowSeconds;
+	if (!seconds) return position === "primary" ? "5h" : "7d";
+	if (seconds >= 20 * 86_400) return "30d";
+	if (seconds >= 6 * 86_400) return "7d";
+	if (seconds >= 20 * 3_600) return "24h";
+	return `${Math.max(1, Math.round(seconds / 3_600))}h`;
+}
+
 export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): string {
 	const who = shortAccount(snapshot.account);
 	const parts = [
@@ -483,21 +505,19 @@ export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): s
 	// The plan is what decides how much quota those percentages are a percentage OF — a free slot
 	// at 60% left and a Plus slot at 60% left are not comparable amounts of work.
 	if (snapshot.plan && (snapshot.primary || snapshot.secondary)) parts.push(snapshot.plan);
+	// The account's own answer, when it gave one. A percentage is arithmetic on one window and can
+	// disagree with reality in both directions — an account reading 0% left was answering
+	// `allowed: true`, and showing only the 0% is what makes a working account look dead.
+	if (snapshot.serviceable === true) parts.push("ok");
+	else if (snapshot.serviceable === false) parts.push("spent");
 	if (snapshot.primary) {
-		const label =
-			snapshot.family === "cursor"
-				? "auth"
-				: snapshot.family === "ollama"
-					? "cloud"
-					: "5h";
 		parts.push(
-			`${label} ${remainingPercent(snapshot.primary)}% left/${formatResetDuration(snapshot.primary.resetAt, now)}`,
+			`${windowLabel(snapshot.primary, snapshot.family, "primary")} ${remainingPercent(snapshot.primary)}% left/${formatResetDuration(snapshot.primary.resetAt, now)}`,
 		);
 	}
 	if (snapshot.secondary) {
-		const weeklyLabel = snapshot.family === "ollama" ? "weekly" : "7d";
 		parts.push(
-			`${weeklyLabel} ${remainingPercent(snapshot.secondary)}% left/${formatResetDuration(snapshot.secondary.resetAt, now)}`,
+			`${windowLabel(snapshot.secondary, snapshot.family, "secondary")} ${remainingPercent(snapshot.secondary)}% left/${formatResetDuration(snapshot.secondary.resetAt, now)}`,
 		);
 	}
 	if (!snapshot.primary && !snapshot.secondary && snapshot.plan) {
@@ -511,7 +531,15 @@ export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): s
 }
 
 export function formatUsageDetails(snapshot: UsageSnapshot, now = Date.now()): string {
-	const lines = [`Limits for ${providerUsageLabel(snapshot.provider)}${snapshot.plan ? ` (${snapshot.plan})` : ""}`];
+	const lines = [
+		`Limits for ${providerUsageLabel(snapshot.provider)}${snapshot.account ? ` — ${snapshot.account}` : ""}${snapshot.plan ? ` (${snapshot.plan})` : ""}`,
+	];
+	if (snapshot.serviceable !== undefined)
+		lines.push(
+			snapshot.serviceable
+				? "The account reports it can be used right now."
+				: "The account reports it is currently blocked, whatever the percentages below say.",
+		);
 	if (!snapshot.primary && !snapshot.secondary && snapshot.plan) {
 		if (snapshot.family === "ollama") {
 			lines.push(
@@ -521,18 +549,15 @@ export function formatUsageDetails(snapshot: UsageSnapshot, now = Date.now()): s
 			lines.push(`Status: ${snapshot.plan}`);
 		}
 	}
-	for (const [label, window] of [
-		[
-			snapshot.family === "cursor"
-				? "auth"
-				: snapshot.family === "ollama"
-					? "session"
-					: "5h",
-			snapshot.primary,
-		],
-		[snapshot.family === "ollama" ? "weekly" : "7d", snapshot.secondary],
+	for (const [position, window] of [
+		["primary", snapshot.primary],
+		["secondary", snapshot.secondary],
 	] as const) {
 		if (!window) continue;
+		const label =
+			snapshot.family === "ollama" && position === "primary"
+				? "session"
+				: windowLabel(window, snapshot.family, position);
 		lines.push(
 			`${label}: ${remainingPercent(window)}% left (${Math.round(window.usedPercent)}% used), resets in ${formatResetDuration(window.resetAt, now)} at ${new Date(window.resetAt).toLocaleString()}`,
 		);

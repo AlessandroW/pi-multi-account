@@ -252,3 +252,63 @@ test("a Kimi Coding slot reports itself instead of throwing", async () => {
 		"and the key must never travel in the snapshot",
 	);
 });
+
+test("a window is labelled by its real length, and the provider's verdict beats the percentage", () => {
+	// Two ways the footer misled at once. A Codex free plan meters a THIRTY-DAY window, and it was
+	// labelled "5h" because that is the slot the field sits in — so a number that resets next month
+	// read as one that resets this afternoon. And the account this was shown for was answering
+	// `allowed: true`: it could serve work while the footer said `0% left`, which is exactly the
+	// reading that convinces someone their working accounts are being ignored.
+	const now = Date.now();
+	const snapshot = parseCodexUsageBody(
+		"openai-codex-account-6",
+		{
+			plan_type: "free",
+			email: "jrnldrive2@gmail.com",
+			rate_limit: {
+				allowed: true,
+				limit_reached: false,
+				primary_window: {
+					used_percent: 100,
+					limit_window_seconds: 2592000,
+					reset_at: Math.floor(now / 1000) + 27 * 86400,
+				},
+				secondary_window: null,
+			},
+		},
+		now,
+	);
+	const footer = formatUsageCompact(snapshot!, now);
+	assert.doesNotMatch(footer, /5h/, `a 30-day window must not be labelled 5h; footer: ${footer}`);
+	assert.match(footer, /30d/, `it must carry its real length; footer: ${footer}`);
+	assert.match(
+		footer,
+		/ok|usable|✓/i,
+		`and an account the provider allows must not read as spent; footer: ${footer}`,
+	);
+});
+
+test("a blocked account still reads as blocked", () => {
+	const now = Date.now();
+	const snapshot = parseCodexUsageBody(
+		"openai-codex-account-3",
+		{
+			plan_type: "free",
+			rate_limit: {
+				allowed: false,
+				limit_reached: true,
+				primary_window: {
+					used_percent: 100,
+					limit_window_seconds: 2592000,
+					reset_at: Math.floor(now / 1000) + 27 * 86400,
+				},
+			},
+		},
+		now,
+	);
+	assert.match(
+		formatUsageCompact(snapshot!, now),
+		/spent|blocked|✗/i,
+		"the negative verdict must be just as visible",
+	);
+});
