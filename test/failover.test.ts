@@ -433,7 +433,7 @@ test("usage footer countdown refreshes while the session is idle", async () => {
 	await t.fire("session_start");
 	const readCountdown = () => {
 		const value = t.rec.statuses.at(-1)?.value ?? "";
-		const match = /^Codex A2 \| 5h 99% left\/(\d+)m$/.exec(value);
+		const match = /^Codex A2 \| 5h 99% left\/(\d+)m \| (?:\+\d+ ready|no spare)$/.exec(value);
 		assert.ok(match, `unexpected footer value: ${JSON.stringify(value)}`);
 		return Number(match[1]);
 	};
@@ -4673,8 +4673,10 @@ test("unmanaged providers can be switched off", async () => {
 		"You have hit your usage limit. Try again in ~600 min.",
 	);
 
+	// kimi-coding is a specially-managed family now, so it is NOT what this switch governs —
+	// only the accounts we cannot measure are.
 	assert.ok(
-		!t.rec.setModels.some((target: string) => target.startsWith("zai/") || target.startsWith("kimi-coding/")),
+		!t.rec.setModels.some((target: string) => target.startsWith("zai/")),
 		`opting out must keep unmanaged accounts unused; switches were ${JSON.stringify(t.rec.setModels)}`,
 	);
 });
@@ -5149,5 +5151,316 @@ test("a provider verdict of 'usable' clears the recorded bench, it does not mere
 	assert.ok(
 		!(state.usageUntrustedUntilByProvider?.[revived] > Date.now()),
 		`and the meter regains trust once the account itself confirms it; state was ${JSON.stringify(state.usageUntrustedUntilByProvider)}`,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// A newly managed family must not fall out of an existing config
+// ---------------------------------------------------------------------------
+
+test("a managed family missing from a saved providerOrder still joins the rotation", async () => {
+	// `/multi-account` writes the whole config to disk, `providerOrder` included, so every
+	// installed config pins the family list as it stood that day. When a provider is promoted to a
+	// managed family in a later release, an existing config lists neither it (the order predates
+	// it) nor lets it in as an "other" provider (it is managed now) — so an account that worked
+	// yesterday silently vanishes from the ring, and `rediscover` cannot bring it back because
+	// nothing is broken from discovery's point of view. Exactly what happened to kimi-coding.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			"kimi-coding": { type: "api_key", key: "kimi-key" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			// A config written before kimi-coding became a managed family.
+			providerOrder: ["anthropic", "openai-codex", "cursor", "qwen", "ollama"],
+		},
+	});
+	await t.fire("session_start");
+	await t.command("status");
+
+	const said = t.rec.notifies.join("\n");
+	const rotation = /Rotation \(\d+\): ([^\n]*)/.exec(said)?.[1] ?? "";
+	assert.match(
+		rotation,
+		/kimi-coding/,
+		`a managed account must never be dropped by an older saved order; rotation was: ${rotation}`,
+	);
+	assert.match(
+		rotation,
+		/anthropic/,
+		"and the user's own ordering is still respected",
+	);
+});
+
+test("an account of a family missing from providerOrder is reachable by failover", async () => {
+	// Being listed is not enough — it has to actually be selectable, which is the difference
+	// between a cosmetic fix and the account carrying work when everything else is spent.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			"kimi-coding": { type: "api_key", key: "kimi-key" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			providerOrder: ["anthropic", "openai-codex", "cursor", "qwen", "ollama"],
+		},
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		"429 usage limit reached",
+	);
+
+	assert.ok(
+		t.rec.setModels.some((target: string) => target.startsWith("kimi-coding/")),
+		`the work must reach it; switches were ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("the footer says how many other accounts are ready, so 'switch to what?' has an answer", async () => {
+	// The footer described the current account and stopped there. The question a person actually
+	// has when an account runs dry — is there anywhere to go, and how many — had no answer
+	// anywhere short of running `status` and reading fifteen lines.
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: "c-tok-3",
+				refresh: "c-ref-3",
+				accountId: "codex-3",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { showUsage: true },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-2": {
+					provider: "openai-codex-account-2",
+					family: "codex",
+					fetchedAt: now,
+					plan: "free",
+					account: "someone@example.com",
+					primary: { usedPercent: 40, resetAt: now + 3_600_000 },
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+
+	const footer = t.rec.statuses.at(-1)?.value ?? "";
+	assert.match(footer, /someone/, `the footer must name the account in use; got: ${footer}`);
+	assert.match(
+		footer,
+		/\+\d+ ready|\d+ ready|no spare/i,
+		`and say whether anywhere else can take over; got: ${footer}`,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// OAuth refresh: losing a race must not be reported as a dead account
+// ---------------------------------------------------------------------------
+
+const { refreshWithDiskRetry } = (await import("../index.ts")) as {
+	refreshWithDiskRetry: (opts: {
+		credentials: any;
+		refresh: (credentials: any) => Promise<any>;
+		storedRefresh: () => string | undefined;
+	}) => Promise<any>;
+};
+
+test("an invalid_grant is retried with the token another process just wrote", async () => {
+	// Anthropic rotates the refresh token on every use and invalidates the old one immediately.
+	// Any second holder of that credential — another Pi window, a usage probe that raced the
+	// request — therefore presents a token that was valid when it was read and is dead by the time
+	// it is sent. That is a lost race, not a dead account, and the fresh token is already sitting
+	// on disk. Retrying with it is the difference between a working account and one that gets
+	// dropped and demands a re-login it does not need.
+	const attempts: string[] = [];
+	const result = await refreshWithDiskRetry({
+		credentials: { type: "oauth", access: "old-access", refresh: "stale-refresh" },
+		refresh: async (credentials: any) => {
+			attempts.push(credentials.refresh);
+			if (credentials.refresh === "stale-refresh")
+				throw new Error(
+					'HTTP request failed. status=400; body={"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}',
+				);
+			return { access: "new-access", refresh: "newer-refresh", expires: 123 };
+		},
+		storedRefresh: () => "fresh-refresh-from-disk",
+	});
+
+	assert.deepEqual(
+		attempts,
+		["stale-refresh", "fresh-refresh-from-disk"],
+		"the retry must use what is on disk now, not the credential it was handed",
+	);
+	assert.equal(result.access, "new-access", "and the refreshed token is what comes back");
+});
+
+test("a genuinely revoked token is not retried in a loop", async () => {
+	// When disk holds the same token that just failed, nothing has changed and there is nothing to
+	// retry — the account really is revoked and must fail fast so the rotation moves on.
+	let calls = 0;
+	await assert.rejects(
+		refreshWithDiskRetry({
+			credentials: { type: "oauth", access: "a", refresh: "same-refresh" },
+			refresh: async () => {
+				calls++;
+				throw new Error('status=400; body={"error": "invalid_grant"}');
+			},
+			storedRefresh: () => "same-refresh",
+		}),
+		/invalid_grant/,
+	);
+	assert.equal(calls, 1, "one attempt, because a second would send the identical token");
+});
+
+test("a network failure is not mistaken for a revoked token", async () => {
+	// Only invalid_grant means "this token is dead". A timeout must surface as itself, or a blip
+	// would drop a perfectly good account out of the rotation.
+	let calls = 0;
+	await assert.rejects(
+		refreshWithDiskRetry({
+			credentials: { type: "oauth", access: "a", refresh: "r" },
+			refresh: async () => {
+				calls++;
+				throw new Error("fetch failed: ETIMEDOUT");
+			},
+			storedRefresh: () => "different-token-on-disk",
+		}),
+		/ETIMEDOUT/,
+	);
+	assert.equal(calls, 1, "a transient error is not a reason to burn the disk token");
+});
+
+test("a revoked Claude login explains what revoked it, not just 'run /login'", async () => {
+	// Re-logging in and being kicked out again hours later, repeatedly, with the tool saying only
+	// "authorization is invalid, run /login", gives a person no way to break the cycle. Claude
+	// Pro/Max logins from every CLI share ONE client id, and Anthropic keeps one live refresh
+	// token per account for it — so signing the same account into a second tool, a second machine,
+	// or a second slot here silently kills the first. That is the fact that ends the loop.
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		'OAuth refresh failed: status=400; body={"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}',
+	);
+
+	const said = t.rec.notifies.join("\n");
+	assert.match(said, /anthropic/, "it must name the slot");
+	assert.match(
+		said,
+		/same account|another (tool|app|client)|signed in|elsewhere/i,
+		`and name the cause, so re-logging in is not the only idea on offer; said: ${said}`,
+	);
+});
+
+test("'best' switches straight to an account that can work right now", async () => {
+	// `next` walks the ring one step at a time and `switch` needs a name typed exactly, so with
+	// fourteen accounts — most of them spent — reaching a working one meant pressing next until
+	// something answered. There was no way to say "just put me somewhere that works".
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+			"kimi-coding": { type: "api_key", key: "kimi-key" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {
+				anthropic: now + 6 * 60 * 60 * 1000,
+				"openai-codex-account-2": now + 6 * 60 * 60 * 1000,
+			},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-2": {
+					provider: "openai-codex-account-2",
+					family: "codex",
+					fetchedAt: now,
+					plan: "free",
+					serviceable: false,
+					primary: { usedPercent: 100, resetAt: now + 27 * 86_400_000 },
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	// Pin the starting point so the assertion can only be satisfied by `best` itself.
+	t.setCurrent("anthropic", "claude-opus-4-8");
+	t.rec.setModels.length = 0;
+	await t.command("best");
+
+	assert.equal(
+		t.rec.setModels.length,
+		1,
+		`one decisive switch, not a walk through the ring; switches: ${JSON.stringify(t.rec.setModels)}`,
+	);
+	assert.ok(
+		t.rec.setModels[0].startsWith("kimi-coding/"),
+		`it must land on the one account that can serve work; switches: ${JSON.stringify(t.rec.setModels)}`,
+	);
+	assert.equal(t.ctx.model.provider, "kimi-coding");
+});
+
+test("'best' says so plainly when nothing can work", async () => {
+	// Silence here would read as "it ignored me". If every account is spent, that is the answer.
+	const now = Date.now();
+	const t = setup({
+		accounts: { anthropic: { type: "oauth", access: "a", refresh: "r" } },
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: { anthropic: now + 6 * 60 * 60 * 1000 },
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	t.rec.notifies.length = 0;
+	await t.command("best");
+
+	const said = t.rec.notifies.join("\n");
+	assert.match(
+		said,
+		/pi-multi-account:.*(no account|nothing|none)/i,
+		`it must answer rather than do nothing silently; said: ${said}`,
+	);
+	assert.doesNotMatch(
+		said,
+		/unknown command|usage:/i,
+		`and the command must exist; said: ${said}`,
 	);
 });

@@ -13,6 +13,14 @@ export type UsageSnapshot = {
 	credentialHash?: string;
 	plan?: string;
 	/**
+	 * Which real account this is — the email the provider reports, when it reports one.
+	 *
+	 * Slot ids (`openai-codex-account-5`) are positions in a config file, not identities. With
+	 * several slots the position says nothing about whose quota is being spent, which is the fact
+	 * a person actually needs when deciding where to switch.
+	 */
+	account?: string;
+	/**
 	 * The provider's OWN verdict on whether this account can be used right now.
 	 *
 	 * Everything else in this snapshot is arithmetic we do on quota windows — a forecast about
@@ -113,6 +121,7 @@ export function parseCodexUsageBody(
 		fetchedAt,
 		credentialHash,
 		plan: typeof source.plan_type === "string" ? source.plan_type : undefined,
+		account: typeof source.email === "string" && source.email.trim() ? source.email : undefined,
 		// `limit_reached` is the negative statement and `allowed` the positive one; either alone
 		// is enough. Read both so a response that carries only one of them still answers.
 		serviceable:
@@ -362,6 +371,19 @@ export async function fetchUsageSnapshot(
 			options.credentialHash,
 		);
 	}
+	if (family === "kimi-coding") {
+		// Kimi For Coding is a subscription behind an API key, and it publishes no quota endpoint —
+		// /usage, /quota, /me, /subscription and the Moonshot balance path all 404 against
+		// api.kimi.com/coding. Falling through to the OAuth branch made every probe throw
+		// "has no OAuth access token" for a healthy key, blanking the footer and filling the log.
+		return {
+			provider,
+			family: "kimi-coding",
+			fetchedAt: Date.now(),
+			credentialHash: options.credentialHash,
+			plan: "subscription · no usage endpoint",
+		};
+	}
 	if (family === "qwen") {
 		// Qwen/Alibaba exposes no usage/quota endpoint over its API-key plans, so we
 		// report the plan honestly instead of attempting (and failing) an OAuth usage
@@ -424,6 +446,7 @@ export function providerUsageLabel(provider: string): string {
 	if (provider.startsWith("anthropic")) return index ? `Claude A${index}` : "Claude";
 	if (provider.startsWith("ollama")) return index ? `Ollama A${index}` : "Ollama";
 	if (provider.startsWith("cursor")) return index ? `Cursor A${index}` : "Cursor";
+	if (provider.startsWith("kimi-coding")) return index ? `Kimi A${index}` : "Kimi";
 	if (provider.startsWith("alibaba") || /^qwen/i.test(provider)) return index ? `Qwen A${index}` : "Qwen/Alibaba";
 	return provider;
 }
@@ -443,8 +466,23 @@ export function formatResetDuration(resetAt: number, now = Date.now()): string {
 	return restHours ? `${days}d${restHours}h` : `${days}d`;
 }
 
+/** Keep an email readable in a one-line footer without letting it dominate the line. */
+export function shortAccount(account: string | undefined): string | undefined {
+	if (!account) return undefined;
+	const local = account.includes("@") ? account.slice(0, account.indexOf("@")) : account;
+	return local.length > 18 ? `${local.slice(0, 17)}…` : local;
+}
+
 export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): string {
-	const parts = [providerUsageLabel(snapshot.provider)];
+	const who = shortAccount(snapshot.account);
+	const parts = [
+		who
+			? `${providerUsageLabel(snapshot.provider)} · ${who}`
+			: providerUsageLabel(snapshot.provider),
+	];
+	// The plan is what decides how much quota those percentages are a percentage OF — a free slot
+	// at 60% left and a Plus slot at 60% left are not comparable amounts of work.
+	if (snapshot.plan && (snapshot.primary || snapshot.secondary)) parts.push(snapshot.plan);
 	if (snapshot.primary) {
 		const label =
 			snapshot.family === "cursor"

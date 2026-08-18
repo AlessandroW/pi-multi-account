@@ -37,7 +37,10 @@ test("parses Codex 5h and weekly usage response", () => {
 	assert.equal(snapshot.plan, "plus");
 	assert.equal(snapshot.primary?.usedPercent, 100);
 	assert.equal(snapshot.secondary?.usedPercent, 58);
-	assert.equal(formatUsageCompact(snapshot, NOW), "Codex A2 | 5h 0% left/1h | 7d 42% left/2d");
+	assert.equal(
+		formatUsageCompact(snapshot, NOW),
+		"Codex A2 | plus | 5h 0% left/1h | 7d 42% left/2d",
+	);
 });
 
 test("Ollama /api/me surfaces plan tier, renewal date, and suspended status", () => {
@@ -181,5 +184,71 @@ test("the provider's own allowed/limit_reached verdict is carried, not just the 
 		silent?.serviceable,
 		undefined,
 		"a response that states no verdict must not have one invented for it",
+	);
+});
+
+test("the account's identity travels with its usage, and shows in the footer", () => {
+	// With seven Codex slots called A2…A7, the footer named the SLOT and nothing else, so there
+	// was no way to tell which real account was in use — the one piece of information needed to
+	// know whose quota is burning. The usage response carries the email; it was thrown away.
+	const snapshot = parseCodexUsageBody("openai-codex-account-2", {
+		plan_type: "free",
+		email: "dev.vitalii.shymko@gmail.com",
+		rate_limit: {
+			allowed: true,
+			limit_reached: false,
+			primary_window: {
+				used_percent: 40,
+				limit_window_seconds: 18000,
+				reset_at: Math.floor(Date.now() / 1000) + 3600,
+			},
+		},
+	});
+	assert.equal(snapshot?.account, "dev.vitalii.shymko@gmail.com");
+
+	const footer = formatUsageCompact(snapshot!, Date.now());
+	assert.match(footer, /Codex A2/, "the slot is still named");
+	assert.match(footer, /dev\.vitalii/, `and the real account with it; footer: ${footer}`);
+	assert.match(footer, /free/, `along with the plan; footer: ${footer}`);
+	assert.match(footer, /60% left/, `without losing the quota; footer: ${footer}`);
+});
+
+test("a footer for an account with no email is unchanged", () => {
+	// Nothing may become noisier for providers that expose no identity.
+	const snapshot = parseCodexUsageBody("openai-codex", {
+		plan_type: "plus",
+		rate_limit: {
+			primary_window: {
+				used_percent: 10,
+				limit_window_seconds: 18000,
+				reset_at: Math.floor(Date.now() / 1000) + 3600,
+			},
+		},
+	});
+	assert.equal(snapshot?.account, undefined);
+	assert.doesNotMatch(formatUsageCompact(snapshot!, Date.now()), /·\s*\|/);
+});
+
+test("a Kimi Coding slot reports itself instead of throwing", async () => {
+	// kimi-coding became a managed family, but nothing taught the usage layer about it — so every
+	// probe fell through to the OAuth branch and threw "has no OAuth access token" for a perfectly
+	// healthy API key. That turns the footer blank and fills the log with failures for an account
+	// that is working. Kimi exposes no quota endpoint at all (every documented path 404s), so the
+	// honest answer is the plan, not an invented number.
+	const snapshot = await fetchUsageSnapshot("kimi-coding", {
+		type: "api_key",
+		key: "sk-kimi-test",
+	});
+	assert.equal(snapshot.family, "kimi-coding");
+	assert.equal(snapshot.primary, undefined, "no window may be invented");
+	assert.match(
+		snapshot.plan ?? "",
+		/subscription|no usage endpoint/i,
+		`the plan line must say what is known; got: ${snapshot.plan}`,
+	);
+	assert.doesNotMatch(
+		JSON.stringify(snapshot),
+		/sk-kimi-test/,
+		"and the key must never travel in the snapshot",
 	);
 });

@@ -671,7 +671,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.18.0";
+const VERSION = "1.19.0";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -1253,10 +1253,21 @@ function patternsWithDefaults(value: unknown, defaults: string[]): string[] {
 }
 
 function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
-	const order =
+	// A saved `providerOrder` states a PREFERENCE about sequence, never a whitelist of which
+	// families may exist. `/multi-account` writes the whole config out, so every installed config
+	// froze the family list as it stood the day it was written — and a family promoted to managed
+	// later then fell through both doors at once: too new for the saved order, no longer eligible
+	// as an "other" provider because it is managed now. The account simply disappeared from the
+	// ring, with `rediscover` unable to help because discovery was working exactly as written.
+	// Families the user never ranked are appended in their default order, after the ones they did.
+	const configured =
 		Array.isArray(raw.providerOrder) && raw.providerOrder.length > 0
 			? raw.providerOrder
 			: DEFAULT_PROVIDER_ORDER;
+	const order = [
+		...configured,
+		...DEFAULT_PROVIDER_ORDER.filter((family) => !configured.includes(family)),
+	];
 	return {
 		enabled: raw.enabled ?? true,
 		autoContinue: raw.autoContinue ?? true,
@@ -1848,6 +1859,48 @@ export function mergeRefreshedCredentials(credentials: any, refreshed: any) {
 	};
 }
 
+/**
+ * Refresh an OAuth credential, and survive losing a race for it.
+ *
+ * Anthropic rotates the refresh token on every use and kills the old one the moment the new one
+ * is issued. So any second holder of that credential — another Pi window, a background usage
+ * probe that read the file a second earlier, a `/login` in a neighbouring session — presents a
+ * token that was valid when it was read and is already dead when it arrives. The server answers
+ * `invalid_grant`, which reads identically to a genuinely revoked account, and the slot was
+ * dropped from the rotation with a demand to re-login that fixed nothing: the working token had
+ * been on disk the whole time, written by whoever won the race.
+ *
+ * So on `invalid_grant` — and only on `invalid_grant` — we re-read what is stored now and try
+ * once more. If disk holds the same token that just failed there is nothing new to send, and the
+ * account really is revoked: fail immediately so rotation moves on. Any other error (a timeout, a
+ * 5xx) is not a statement about the token and is never retried, since burning the disk token on a
+ * network blip would turn an outage into a lost account.
+ *
+ * Exported for tests: this is the one piece of logic that decides whether an account survives.
+ */
+export async function refreshWithDiskRetry(opts: {
+	credentials: any;
+	refresh: (credentials: any) => Promise<any>;
+	storedRefresh: () => string | undefined;
+}): Promise<any> {
+	try {
+		return await opts.refresh(opts.credentials);
+	} catch (error) {
+		if (!/invalid_grant/i.test(String((error as any)?.message ?? error))) throw error;
+		const stored = opts.storedRefresh();
+		if (!stored || stored === opts.credentials?.refresh) throw error;
+		return await opts.refresh({ ...opts.credentials, refresh: stored });
+	}
+}
+
+/** The refresh token currently stored on disk for a slot — whoever wrote it last wins. */
+function storedRefreshToken(providerId: string): string | undefined {
+	const stored = readAuthFile()[providerId] as any;
+	return typeof stored?.refresh === "string" && stored.refresh.trim()
+		? stored.refresh
+		: undefined;
+}
+
 /** Single source of truth for Anthropic OAuth refresh — used by BOTH the base provider and aliases. */
 function oauthRefreshSignal(signal?: AbortSignal): AbortSignal {
 	return signal instanceof AbortSignal ? signal : AbortSignal.timeout(30_000);
@@ -1856,14 +1909,25 @@ function oauthRefreshSignal(signal?: AbortSignal): AbortSignal {
 async function refreshAnthropicCredentials(
 	credentials: any,
 	signal?: AbortSignal,
+	providerId?: string,
 ) {
-	return mergeRefreshedCredentials(
+	const attempt = (creds: any) =>
+		requirePiAiOauth().anthropic.refresh(creds, oauthRefreshSignal(signal));
+	// Without a slot id there is nothing on disk to consult, so this degrades to a plain refresh.
+	if (!providerId)
+		return mergeRefreshedCredentials(credentials, await attempt(credentials));
+	const refreshed = await refreshWithDiskRetry({
 		credentials,
-		await requirePiAiOauth().anthropic.refresh(
-			credentials,
-			oauthRefreshSignal(signal),
-		),
-	);
+		refresh: attempt,
+		storedRefresh: () => storedRefreshToken(providerId),
+	});
+	return mergeRefreshedCredentials(credentials, refreshed);
+}
+
+/** Bind the refresher to the slot it belongs to, so a lost race can be recovered from disk. */
+function anthropicRefresherFor(providerId: string) {
+	return (credentials: any, signal?: AbortSignal) =>
+		refreshAnthropicCredentials(credentials, signal, providerId);
 }
 
 function registerAnthropicSlot(
@@ -1885,7 +1949,7 @@ function registerAnthropicSlot(
 					await requirePiAiOauth().anthropic.login(callbacks),
 				);
 			},
-			refreshToken: refreshAnthropicCredentials,
+			refreshToken: anthropicRefresherFor(id),
 			getApiKey: (credentials: any) => credentials.access,
 		},
 		models: models as any,
@@ -2620,7 +2684,7 @@ function anthropicOAuthOverride(providerId: string, name: string) {
 				await requirePiAiOauth().anthropic.login(callbacks),
 			);
 		},
-		refreshToken: refreshAnthropicCredentials,
+		refreshToken: anthropicRefresherFor(providerId),
 		getApiKey: (credentials: any) => credentials.access,
 	};
 }
@@ -3072,7 +3136,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		try {
 			let refreshed: AuthEntry | undefined;
 			if (family === "anthropic") {
-				refreshed = await refreshAnthropicCredentials(entry);
+				refreshed = await refreshAnthropicCredentials(
+					entry,
+					undefined,
+					provider,
+				);
 			} else if (family === "openai-codex") {
 				refreshed = mergeRefreshedCredentials(
 					entry,
@@ -3367,6 +3435,24 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			: snapshot;
 	}
 
+	/**
+	 * How many OTHER accounts could take over right now.
+	 *
+	 * "This account is nearly out" is only half the information; the half that decides what to do
+	 * is whether anywhere else is ready. Counted from bookkeeping already in memory — no probes,
+	 * no reconciliation — because this runs on a footer timer, not on a decision.
+	 */
+	function readyElsewhereCount(ctx: any, current: string | undefined): number {
+		const now = Date.now();
+		return rotation.filter(
+			(provider) =>
+				provider !== current &&
+				!isInvalidated(provider) &&
+				providerHasUsableAuth(ctx, provider) &&
+				providerRecoveryAt(provider, now) <= now,
+		).length;
+	}
+
 	function updateUsageStatus(ctx: any, provider = ctx?.model?.provider) {
 		if (typeof ctx?.ui?.setStatus !== "function") return;
 		// Footer rendering touches host UI + formatting helpers; never let a render hiccup
@@ -3397,7 +3483,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				return;
 			}
 			const display = displayUsageSnapshot(snapshot);
-			const text = formatUsageCompact(display);
+			const spare = readyElsewhereCount(ctx, provider);
+			const text = `${formatUsageCompact(display)} | ${
+				spare > 0 ? `+${spare} ready` : "no spare"
+			}`;
 			const color =
 				snapshot.family === "qwen"
 					? isInvalidated(provider)
@@ -6303,6 +6392,58 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			return;
 		}
+		if (command === "best" || command === "live") {
+			// `next` walks the ring a step at a time and `switch` needs an exact name, so on a
+			// machine with a dozen accounts — most of them spent — reaching a working one meant
+			// pressing next until something answered, landing on and being bounced off each dead
+			// account on the way. This asks the one question a person actually has: put me
+			// somewhere that can work right now.
+			if (!ctx.model) {
+				ctx.ui.notify(
+					"pi-multi-account: no active model to switch from",
+					"warning",
+				);
+				return;
+			}
+			const candidates = findFallbackModels(ctx, ctx.model, {
+				availableNowOnly: true,
+				includeCurrent: true,
+			});
+			if (candidates.length === 0) {
+				const wait = nextRecoveryStatus(ctx);
+				ctx.ui.notify(
+					`pi-multi-account: no account can serve work right now. ${wait}`,
+					"warning",
+				);
+				return;
+			}
+			if (
+				candidates[0].provider === ctx.model.provider &&
+				candidates[0].id === ctx.model.id
+			) {
+				ctx.ui.notify(
+					`pi-multi-account: already on the best available account (${ctx.model.provider}/${ctx.model.id})`,
+					"info",
+				);
+				return;
+			}
+			currentPromptSwitch = undefined;
+			const switched = await activateFallback(
+				ctx,
+				ctx.model,
+				candidates,
+				"manual /multi-account best",
+				{ armContinuation: false },
+			);
+			currentPromptSwitch = undefined;
+			if (switched) announceManualChoice(ctx);
+			else
+				ctx.ui.notify(
+					"pi-multi-account: could not switch to the best available account",
+					"warning",
+				);
+			return;
+		}
 		if (command === "next") {
 			if (ctx.model) {
 				currentPromptSwitch = undefined;
@@ -6393,8 +6534,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// line with a real account name filled in. Buried mid-way through the pipe-separated
 				// list below, `switch` was effectively undiscoverable and `next` pressed repeatedly
 				// was the only way anyone found to reach a chosen account.
-				`Switch accounts: /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · or /multi-account next to step through the rotation in order`,
-				`Other commands: status | limits [refresh] | models | log [N|on|off] | rediscover | add [anthropic|codex|cursor|ollama|qwen] | remove [anthropic|codex|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
+				`Other commands: status | best | limits [refresh] | models | log [N|on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
@@ -6979,8 +7120,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				killed = markAuthFailure(provider, errorText);
 			}
 			if (killed) {
+				// For a Claude login, "run /login" alone sends people round a loop they have often
+				// already been round: log in, work for a few hours, get kicked out, log in again.
+				// The reason is not in the error text and cannot be guessed from it — every CLI that
+				// signs into Claude Pro/Max uses the SAME client id, and Anthropic keeps one live
+				// refresh token per account for that client. So signing the same account into another
+				// tool, another machine, or a second slot here revokes this one, quietly, hours later.
+				// Naming that is the difference between a fix and a ritual.
+				const sharedClientHint =
+					classifyProvider(provider, config.qwenProvider) === "anthropic" &&
+					/invalid_grant|revoked/i.test(reason)
+						? ' Its refresh token was revoked server-side. Claude Pro/Max logins from every CLI share one client id and Anthropic keeps a single live refresh token per account, so signing this same account into another tool (Claude Code, another machine, or a second slot here) revokes this one. Use a different Claude account per slot, and keep the account another tool is signed into out of this rotation.'
+						: "";
 				ctx.ui.notify(
-					`Provider failover: ${provider} authorization is invalid. Run /login, choose "Use a subscription", then select ${provider}.`,
+					`Provider failover: ${provider} authorization is invalid. Run /login, choose "Use a subscription", then select ${provider}.${sharedClientHint}`,
 					"warning",
 				);
 			}
