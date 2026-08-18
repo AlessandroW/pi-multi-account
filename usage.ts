@@ -1,4 +1,4 @@
-export type UsageFamily = "codex" | "anthropic" | "ollama" | "cursor" | "qwen";
+export type UsageFamily = "codex" | "anthropic" | "ollama" | "cursor" | "qwen" | "kimi-coding";
 
 export type UsageWindow = {
 	usedPercent: number;
@@ -82,6 +82,7 @@ export function usageFamily(provider: string): UsageFamily | undefined {
 	if (provider === "ollama" || /^ollama-account-\d+$/.test(provider)) return "ollama";
 	if (provider === "cursor" || /^cursor-account-\d+$/.test(provider)) return "cursor";
 	if (provider === "alibaba" || /^alibaba-account-\d+$/.test(provider) || /^qwen/i.test(provider)) return "qwen";
+	if (provider === "kimi-coding" || /^kimi-coding-account-\d+$/.test(provider)) return "kimi-coding";
 	return undefined;
 }
 

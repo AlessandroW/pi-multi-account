@@ -378,6 +378,7 @@ type ModelRef = `${string}/${string}`;
 type ProviderFamily =
 	| "anthropic"
 	| "openai-codex"
+	| "kimi-coding"
 	| "qwen"
 	| "ollama"
 	| "cursor";
@@ -1022,6 +1023,7 @@ export function preserveInterruptedTurns(messages: any[]): any[] {
 const DEFAULT_PROVIDER_ORDER: ProviderFamily[] = [
 	"anthropic",
 	"openai-codex",
+	"kimi-coding",
 	"cursor",
 	"qwen",
 	"ollama",
@@ -1199,6 +1201,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 			(f): f is ProviderFamily =>
 				f === "anthropic" ||
 				f === "openai-codex" ||
+				f === "kimi-coding" ||
 				f === "cursor" ||
 				f === "qwen" ||
 				f === "ollama",
@@ -1597,6 +1600,7 @@ function parseFamilyArg(raw: string | undefined): ProviderFamily | undefined {
 	if (familyRaw === "ollama") return "ollama";
 	if (familyRaw === "qwen" || familyRaw === "alibaba") return "qwen";
 	if (familyRaw === "cursor") return "cursor";
+	if (familyRaw === "kimi" || familyRaw === "kimi-coding") return "kimi-coding";
 	return undefined;
 }
 
@@ -1662,6 +1666,8 @@ function classifyProvider(
 	)
 		return "ollama";
 	if (isCursorProviderId(id)) return "cursor";
+	if (id === "kimi-coding" || /^kimi-coding-account-\d+$/.test(id))
+		return "kimi-coding";
 	return undefined;
 }
 
@@ -1684,11 +1690,13 @@ function slotId(
 			? ANTHROPIC_BASE
 			: family === "openai-codex"
 				? CODEX_BASE
-				: family === "qwen"
-					? qwenProvider
-					: family === "cursor"
-						? CURSOR_BASE
-						: OLLAMA_BASE;
+				: family === "kimi-coding"
+					? "kimi-coding"
+					: family === "qwen"
+						? qwenProvider
+						: family === "cursor"
+							? CURSOR_BASE
+							: OLLAMA_BASE;
 	return index <= 1 ? base : `${base}-account-${index}`;
 }
 
@@ -3743,6 +3751,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const byFamily: Record<ProviderFamily, string[]> = {
 			anthropic: [],
 			"openai-codex": [],
+			"kimi-coding": [],
 			cursor: [],
 			qwen: [],
 			ollama: [],
@@ -5585,7 +5594,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const family = parseFamilyArg(arg1);
 			if (!family) {
 				ctx.ui.notify(
-					"pi-multi-account: usage: /multi-account add <anthropic|codex|cursor|ollama|qwen>",
+					"pi-multi-account: usage: /multi-account add <anthropic|codex|kimi|cursor|ollama|qwen>",
 					"warning",
 				);
 				return;
