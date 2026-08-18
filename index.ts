@@ -671,7 +671,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.19.0";
+const VERSION = "1.19.1";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -4019,6 +4019,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return shared.length > 0 ? shared : [provider];
 	}
 
+	/**
+	 * Whether this account's availability can be checked WITHOUT spending a user turn.
+	 *
+	 * Codex, Anthropic, Ollama and Cursor all publish something we can poll in the background.
+	 * Kimi and Qwen publish nothing, so their only "probe" is a real request that costs the user
+	 * the turn it lands on.
+	 */
+	function hasCheapAvailabilityProbe(provider: string): boolean {
+		const family = usageFamily(provider);
+		return (
+			family === "codex" ||
+			family === "anthropic" ||
+			family === "ollama" ||
+			family === "cursor"
+		);
+	}
+
 	function markExhausted(provider: string, cooldownMs: number) {
 		if (cooldownMs <= 0) return; // killed accounts are in invalidatedByProvider, not cooldowns
 		// This is the moment the account was last actually asked, and it is what the recheck
@@ -4029,11 +4046,21 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// and unannounced and resize the windows themselves — so it may order the queue but must
 		// never bench an account for hours or weeks. At the ceiling we simply ask again; a refusal
 		// costs no tokens, and only the account itself can prove it is still spent.
+		//
+		// "Costs no tokens" is true only where asking is a background usage probe. For an account
+		// with NO usage endpoint — Kimi answers 404 on every documented path, Qwen exposes none —
+		// the only way to ask is to spend a real user turn: the message lands on the spent account,
+		// is refused, and is bounced onward. Re-asking that way every ten minutes, of an account
+		// that has just said its quota returns in the next billing cycle, is precisely the
+		// thrashing the ceiling exists to prevent. So the ceiling applies where re-probing is
+		// cheap, and the recorded cooldown stands where it is not.
 		const until =
 			Date.now() +
 			Math.min(
 				Math.max(cooldownMs, 1000),
-				config.maxRecheckIntervalMs,
+				hasCheapAvailabilityProbe(provider)
+					? config.maxRecheckIntervalMs
+					: Number.POSITIVE_INFINITY,
 				MAX_LIVE_COOLDOWN_MS,
 			);
 		for (const candidate of providersSharingAccount(provider)) {

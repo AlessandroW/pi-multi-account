@@ -5464,3 +5464,76 @@ test("'best' says so plainly when nothing can work", async () => {
 		`and the command must exist; said: ${said}`,
 	);
 });
+
+test("an account we cannot cheaply re-probe is not re-tried every ten minutes", async () => {
+	// The recheck ceiling exists because a quota forecast is a guess and asking again is nearly
+	// free — for accounts with a usage endpoint, where "asking" is a background probe that costs
+	// the user nothing. Kimi publishes no such endpoint (every path 404s), so the only way to ask
+	// is to spend a real turn: the user sends a message, it lands on the spent account, refuses,
+	// and gets bounced. Doing that every ten minutes to an account that just said its quota
+	// returns "in the next billing cycle" is exactly the thrashing this ceiling was meant to stop.
+	const t = setup({
+		accounts: {
+			"kimi-coding": { type: "api_key", key: "kimi-key" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "kimi-coding", id: "k3" },
+		config: { maxRecheckIntervalMs: 600_000, cooldownMs: 21_600_000 },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"kimi-coding",
+		"k3",
+		'403 {"error":{"message":"You\'ve reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle.","type":"access_terminated_error"}}',
+	);
+
+	const until = t.readState().exhaustedUntilByProvider?.["kimi-coding"] ?? 0;
+	const minutes = Math.round((until - Date.now()) / 60_000);
+	assert.ok(
+		minutes > 30,
+		`an account that can only be re-probed by spending a user turn must rest longer than the ceiling; got ${minutes}m`,
+	);
+});
+
+test("an account with a usage endpoint still honours the recheck ceiling", async () => {
+	// The ceiling must stay exactly as it was wherever asking is genuinely cheap — that is the
+	// behaviour that stops a month-long forecast from parking a Codex account for weeks.
+	const t = setup({
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: "c-tok-3",
+				refresh: "c-ref-3",
+				accountId: "codex-3",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { maxRecheckIntervalMs: 600_000, cooldownMs: 21_600_000 },
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"You have hit your ChatGPT usage limit. Try again in ~40000 min.",
+	);
+
+	const until = t.readState().exhaustedUntilByProvider?.["openai-codex-account-2"] ?? 0;
+	const minutes = Math.round((until - Date.now()) / 60_000);
+	assert.ok(
+		minutes <= 11,
+		`a cheaply re-probed account must still come back at the ceiling; got ${minutes}m`,
+	);
+});
