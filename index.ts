@@ -1572,6 +1572,45 @@ function hash12(input: string) {
 	return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
 
+type AccountIdentity = {
+	key: string;
+	planHash?: string;
+	emailHash?: string;
+};
+
+/** Keep Codex workspace claims hashed and compare them only when both exist. */
+function codexIdentityClaims(
+	entry: AuthEntry,
+): Pick<AccountIdentity, "planHash" | "emailHash"> {
+	if (!entry.access) return {};
+	const payload = decodeJwtPayload(entry.access);
+	const plan = payload?.["https://api.openai.com/auth"]?.chatgpt_plan_type;
+	const email = payload?.["https://api.openai.com/profile"]?.email;
+	return {
+		planHash:
+			typeof plan === "string" && plan.trim()
+				? hash12(plan.trim().toLowerCase())
+				: undefined,
+		emailHash:
+			typeof email === "string" && email.trim().includes("@")
+				? hash12(email.trim().toLowerCase())
+				: undefined,
+	};
+}
+
+function sameAccountIdentity(
+	left: AccountIdentity | undefined,
+	right: AccountIdentity | undefined,
+): boolean {
+	return (
+		!!left &&
+		!!right &&
+		left.key === right.key &&
+		(!left.planHash || !right.planHash || left.planHash === right.planHash) &&
+		(!left.emailHash || !right.emailHash || left.emailHash === right.emailHash)
+	);
+}
+
 /** A stable fingerprint of the current credential, used to detect re-login. */
 function credentialHash(entry: AuthEntry): string | undefined {
 	const secret = entry.access ?? entry.key;
@@ -1588,17 +1627,18 @@ function credentialHash(entry: AuthEntry): string | undefined {
  *     so this only catches the literal same-token case. Two separate logins of the same Anthropic
  *     account are not deterministically identifiable from auth.json alone.
  */
-function accountIdentity(entry: AuthEntry): string | undefined {
+function accountIdentity(entry: AuthEntry): AccountIdentity | undefined {
 	if (typeof entry.accountId === "string" && entry.accountId.length > 0)
-		return `acct:${hash12(entry.accountId)}`;
+		return { key: `acct:${hash12(entry.accountId)}`, ...codexIdentityClaims(entry) };
 	if (entry.access) {
 		const codexId = getCodexAccountIdFromAccessToken(entry.access);
-		if (codexId) return `codex:${hash12(codexId)}`;
+		if (codexId)
+			return { key: `codex:${hash12(codexId)}`, ...codexIdentityClaims(entry) };
 		const cursorSub = getCursorSubFromAccessToken(entry.access);
-		if (cursorSub) return `cursor:${hash12(cursorSub)}`;
-		return `tok:${hash12(entry.access)}`;
+		if (cursorSub) return { key: `cursor:${hash12(cursorSub)}` };
+		return { key: `tok:${hash12(entry.access)}` };
 	}
-	if (entry.key) return `key:${hash12(entry.key)}`;
+	if (entry.key) return { key: `key:${hash12(entry.key)}` };
 	return undefined;
 }
 
@@ -1610,14 +1650,15 @@ function accountIdentity(entry: AuthEntry): string | undefined {
  * e.g. Anthropic) it returns undefined, so we keep the cooldown. A server-side rate limit is not
  * lifted by rotating a token anyway, so erring toward "keep the cooldown" is correct.
  */
-function stableAccountFingerprint(entry: AuthEntry): string | undefined {
+function stableAccountFingerprint(entry: AuthEntry): AccountIdentity | undefined {
 	if (typeof entry.accountId === "string" && entry.accountId.length > 0)
-		return `acct:${hash12(entry.accountId)}`;
+		return { key: `acct:${hash12(entry.accountId)}`, ...codexIdentityClaims(entry) };
 	if (entry.access) {
 		const codexId = getCodexAccountIdFromAccessToken(entry.access);
-		if (codexId) return `codex:${hash12(codexId)}`;
+		if (codexId)
+			return { key: `codex:${hash12(codexId)}`, ...codexIdentityClaims(entry) };
 	}
-	if (entry.key) return `key:${hash12(entry.key)}`;
+	if (entry.key) return { key: `key:${hash12(entry.key)}` };
 	return undefined;
 }
 
@@ -1629,7 +1670,7 @@ function rejectDuplicateLogin<T extends AuthEntry>(
 	if (!identity) return credentials;
 	const duplicate = Object.entries(readAuthFile()).find(
 		([existingId, entry]) =>
-			existingId !== providerId && accountIdentity(entry) === identity,
+			existingId !== providerId && sameAccountIdentity(accountIdentity(entry), identity),
 	);
 	if (duplicate) {
 		throw new Error(
@@ -2825,7 +2866,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const credentialHashes = new Map<string, string>();
 	// Stable per-slot account fingerprints (survive token refresh). A change means the slot was
 	// re-logged into a DIFFERENT real account, which is the only reason to drop its cooldown.
-	const credentialIdentities = new Map<string, string>();
+	const credentialIdentities = new Map<string, AccountIdentity>();
 
 	let currentPromptSwitch: SwitchRecord | undefined;
 	// Number of auto-continuations issued for the CURRENT task. Crucially this is NOT
@@ -4024,7 +4065,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!identity) return [provider];
 		const shared = Object.keys(auth).filter((p) => {
 			const e = auth[p];
-			return e && accountIdentity(e) === identity;
+			return e && sameAccountIdentity(accountIdentity(e), identity);
 		});
 		return shared.length > 0 ? shared : [provider];
 	}
@@ -4182,14 +4223,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const order = config.providerOrder.length
 			? config.providerOrder
 			: DEFAULT_PROVIDER_ORDER;
-		const seenIdentity = new Set<string>();
+		const seenIdentity: AccountIdentity[] = [];
 		const result: string[] = [];
 		for (const family of order) {
 			const ids = byFamily[family].sort((a, b) => slotIndex(a) - slotIndex(b));
 			for (const id of ids) {
 				const identity = accountIdentity(auth[id]);
-				if (identity && seenIdentity.has(identity)) continue; // same account in two slots
-				if (identity) seenIdentity.add(identity);
+				if (identity && seenIdentity.some((seen) => sameAccountIdentity(seen, identity)))
+					continue; // same account in two slots
+				if (identity) seenIdentity.push(identity);
 				result.push(id);
 			}
 		}
@@ -4207,8 +4249,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (classifyProvider(id, config.qwenProvider)) continue;
 				if (!isEntryUsable(entry) || isInvalidated(id)) continue;
 				const identity = accountIdentity(entry);
-				if (identity && seenIdentity.has(identity)) continue;
-				if (identity) seenIdentity.add(identity);
+				if (identity && seenIdentity.some((seen) => sameAccountIdentity(seen, identity)))
+					continue;
+				if (identity) seenIdentity.push(identity);
 				result.push(id);
 			}
 		}
@@ -4243,7 +4286,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function discoverDuplicateSlots(auth: Record<string, AuthEntry>) {
-		const primaryByIdentity = new Map<string, string>();
+		const primaryByIdentity: Array<{ identity: AccountIdentity; provider: string }> = [];
 		const duplicates: Array<{ duplicate: string; primary: string }> = [];
 		for (const id of Object.keys(auth).sort(
 			(a, b) => slotIndex(a) - slotIndex(b),
@@ -4252,9 +4295,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (!family || !isEntryUsable(auth[id])) continue;
 			const identity = accountIdentity(auth[id]);
 			if (!identity) continue;
-			const primary = primaryByIdentity.get(identity);
-			if (primary) duplicates.push({ duplicate: id, primary });
-			else primaryByIdentity.set(identity, id);
+			const primary = primaryByIdentity.find(({ identity: primaryIdentity }) =>
+				sameAccountIdentity(primaryIdentity, identity),
+			);
+			if (primary) duplicates.push({ duplicate: id, primary: primary.provider });
+			else primaryByIdentity.push({ identity, provider: id });
 		}
 		return duplicates;
 	}
@@ -4422,7 +4467,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (
 				previousIdentity &&
 				nextIdentity &&
-				nextIdentity !== previousIdentity
+				!sameAccountIdentity(previousIdentity, nextIdentity)
 			) {
 				if (exhaustedUntilByProvider.delete(provider)) cooldownsCleared = true;
 				// Model availability is account/plan-specific. Never let a newly logged-in account
@@ -4483,7 +4528,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				: rotation;
 		const result: string[] = [];
 		const seenTargets = new Set<string>();
-		const seenAccounts = new Set<string>();
+		const seenAccounts: AccountIdentity[] = [];
 		for (const target of source) {
 			const parsed = parseTarget(target);
 			if (!parsed) continue;
@@ -4493,9 +4538,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (seenTargets.has(normalized)) continue;
 			const entry = auth[parsed.provider];
 			const identity = entry ? accountIdentity(entry) : undefined;
-			if (identity && seenAccounts.has(identity)) continue;
+			if (identity && seenAccounts.some((seen) => sameAccountIdentity(seen, identity)))
+				continue;
 			seenTargets.add(normalized);
-			if (identity) seenAccounts.add(identity);
+			if (identity) seenAccounts.push(identity);
 			result.push(normalized);
 		}
 		return result;

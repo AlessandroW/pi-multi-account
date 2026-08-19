@@ -95,6 +95,23 @@ const ONE_ACCOUNT: Account = {
 	anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
 };
 
+function fakeCodexAccessToken(
+	plan: string | undefined,
+	accountId = "same-account",
+	email?: string,
+): string {
+	const payload = Buffer.from(
+		JSON.stringify({
+			"https://api.openai.com/auth": {
+				chatgpt_account_id: accountId,
+				...(plan ? { chatgpt_plan_type: plan } : {}),
+			},
+			...(email ? { "https://api.openai.com/profile": { email } } : {}),
+		}),
+	).toString("base64url");
+	return `header.${payload}.signature`;
+}
+
 let messageTimestamp = 1;
 
 function setup(opts: {
@@ -853,6 +870,158 @@ test("same Codex accountId in two slots is one rotation account and shares coold
 		state.exhaustedUntilByProvider?.["openai-codex-account-3"],
 		"all slots for the real account share cooldown",
 	);
+});
+
+test("same Codex accountId dedupes when one plan claim is missing", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex": {
+				type: "oauth",
+				access: fakeCodexAccessToken("plus"),
+				refresh: "base-r",
+				accountId: "same-account",
+			},
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "other",
+				refresh: "other-r",
+				accountId: "other-account",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: fakeCodexAccessToken(undefined),
+				refresh: "duplicate-r",
+				accountId: "same-account",
+			},
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: {
+			fallbacks: [
+				"openai-codex",
+				"openai-codex-account-3",
+				"openai-codex-account-2",
+				"anthropic",
+			],
+			autoContinue: false,
+		},
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+	assert.equal(t.rec.setModels[0], "openai-codex-account-2/gpt-5.5");
+});
+
+test("same Codex accountId and plan remains one rotation account", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex": {
+				type: "oauth",
+				access: fakeCodexAccessToken("plus"),
+				refresh: "base-r",
+				accountId: "same-account",
+			},
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "other",
+				refresh: "other-r",
+				accountId: "other-account",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: fakeCodexAccessToken("plus"),
+				refresh: "duplicate-r",
+				accountId: "same-account",
+			},
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: {
+			fallbacks: [
+				"openai-codex",
+				"openai-codex-account-3",
+				"openai-codex-account-2",
+				"anthropic",
+			],
+			autoContinue: false,
+		},
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+	assert.equal(t.rec.setModels[0], "openai-codex-account-2/gpt-5.5");
+});
+
+test("distinct Codex workspace plans remain separate", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex": {
+				type: "oauth",
+				access: fakeCodexAccessToken("plus"),
+				refresh: "base-r",
+				accountId: "same-account",
+			},
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "other",
+				refresh: "other-r",
+				accountId: "other-account",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: fakeCodexAccessToken("team"),
+				refresh: "business-r",
+				accountId: "same-account",
+			},
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: {
+			fallbacks: [
+				"openai-codex",
+				"openai-codex-account-3",
+				"openai-codex-account-2",
+				"anthropic",
+			],
+			autoContinue: false,
+		},
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+	assert.equal(t.rec.setModels[0], "openai-codex-account-3/gpt-5.5");
+});
+
+test("distinct Codex profile emails remain separate", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex": {
+				type: "oauth",
+				access: fakeCodexAccessToken("plus", "same-account", "personal@example.com"),
+				refresh: "base-r",
+				accountId: "same-account",
+			},
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "other",
+				refresh: "other-r",
+				accountId: "other-account",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: fakeCodexAccessToken("plus", "same-account", "business@example.com"),
+				refresh: "business-r",
+				accountId: "same-account",
+			},
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: {
+			fallbacks: [
+				"openai-codex",
+				"openai-codex-account-3",
+				"openai-codex-account-2",
+				"anthropic",
+			],
+			autoContinue: false,
+		},
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 usage_limit_reached");
+	assert.equal(t.rec.setModels[0], "openai-codex-account-3/gpt-5.5");
 });
 
 test("session start reports deterministic duplicate account slots", async () => {
