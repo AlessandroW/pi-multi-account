@@ -29,6 +29,8 @@ process.env.PI_CODING_AGENT_DIR = agentDir;
 process.env.PI_CURSOR_PROVIDER_ROOT = cursorRoot;
 
 const rejections = [];
+const registeredProviders = [];
+const modelCounts = {};
 process.on("unhandledRejection", (reason) => {
 	rejections.push(String(reason && reason.message ? reason.message : reason));
 });
@@ -38,7 +40,7 @@ const mod = await import(process.argv[4]);
 const events = {};
 const notifies = [];
 const pi = {
-	registerProvider: () => {},
+	registerProvider: (id, cfg) => { registeredProviders.push(id); modelCounts[id] = (cfg?.models ?? []).length; },
 	registerCommand: () => {},
 	on: (name, handler) => { events[name] = handler; },
 	setModel: async () => true,
@@ -67,6 +69,19 @@ mod.default(pi);
 await events.session_start?.({}, ctx);
 await new Promise((r) => setTimeout(r, 400));
 
+// Optional second phase: the user fixes (or finally clones) the provider mid-session.
+// A failed load must not be cached forever — the next discovery pass has to retry it.
+const repairSource = process.argv[5];
+if (repairSource) {
+	const { writeFileSync: writeRepair, mkdirSync: mkdirRepair } = await import("node:fs");
+	const { join: joinRepair } = await import("node:path");
+	mkdirRepair(cursorRoot, { recursive: true });
+	writeRepair(joinRepair(cursorRoot, "cursor-shared.ts"), repairSource);
+	registeredProviders.length = 0;
+	await events.session_start?.({}, ctx);
+	await new Promise((r) => setTimeout(r, 400));
+}
+
 const { readFileSync } = await import("node:fs");
 const { join } = await import("node:path");
 let state = {};
@@ -78,15 +93,21 @@ try {
 } catch {}
 
 console.log("__RESULT__" + JSON.stringify({
+	registeredProviders,
+	modelCounts,
 	sessionStartCompleted: notifies.some((m) => m.includes("loaded")),
 	pendingFromAfter: state.pendingFrom,
-	cursorNotices: notifies.filter((m) => m.includes("Cursor provider at")).length,
+	cursorNotices: notifies.filter((m) => /Cursor/.test(m) && /failed to load/.test(m)).length,
 	loggedFailure: log.some((e) => e.kind === "cursor_setup_failed"),
 	rejections,
 }));
 `;
 
-function runSession(cursorProviderSource: string | undefined) {
+function runSession(
+	cursorProviderSource: string | undefined,
+	repairSource?: string,
+	extraAuth: Record<string, unknown> = {},
+) {
 	const agentDir = mkdtempSync(join(tmpdir(), "cursor-opt-"));
 	const cursorRoot = join(agentDir, "cursor-provider");
 	if (cursorProviderSource !== undefined) {
@@ -95,7 +116,10 @@ function runSession(cursorProviderSource: string | undefined) {
 	}
 	writeFileSync(
 		join(agentDir, "auth.json"),
-		JSON.stringify({ anthropic: { type: "oauth", access: "a", refresh: "r" } }),
+		JSON.stringify({
+			anthropic: { type: "oauth", access: "a", refresh: "r" },
+			...extraAuth,
+		}),
 	);
 	writeFileSync(
 		join(agentDir, "provider-failover.json"),
@@ -128,7 +152,13 @@ function runSession(cursorProviderSource: string | undefined) {
 	try {
 		const stdout = execFileSync(
 			process.execPath,
-			[driver, agentDir, cursorRoot, EXTENSION_ENTRY],
+			[
+				driver,
+				agentDir,
+				cursorRoot,
+				EXTENSION_ENTRY,
+				...(repairSource ? [repairSource] : []),
+			],
 			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
 		);
 		const line = stdout.split("\n").find((l) => l.startsWith("__RESULT__"));
@@ -176,4 +206,70 @@ test("no Cursor provider installed stays completely silent", () => {
 	assert.equal(result.cursorNotices, 0);
 	assert.equal(result.loggedFailure, false);
 	assert.deepEqual(result.rejections, []);
+});
+
+// A working provider: the minimum surface the bridge drives.
+const WORKING_PROVIDER = `export const FALLBACK_MODELS = [{ id: "cursor-model", name: "Cursor Model" }];
+export async function ensureCursorProxy() { return 45678; }
+export function registerCursorProvider(pi, id, port, models) {
+	pi.registerProvider(id, { name: "Cursor (" + id + ")", baseUrl: "http://127.0.0.1:" + port + "/v1", models });
+}
+`;
+
+test("a Cursor provider that loads registers every account slot", () => {
+	const result = runSession(WORKING_PROVIDER);
+	assert.deepEqual(result.rejections, []);
+	assert.equal(result.loggedFailure, false);
+	assert.ok(
+		result.registeredProviders.includes("cursor"),
+		`the base Cursor account must be registered, got: ${result.registeredProviders.join(", ")}`,
+	);
+	assert.ok(
+		result.registeredProviders.includes("cursor-account-2"),
+		"the next free Cursor slot must exist so /login can offer it",
+	);
+});
+
+test("a Cursor provider repaired mid-session is picked up without a restart", () => {
+	// The first load fails, so the module cache must NOT keep the failure: cloning or fixing
+	// the provider has to take effect on the next discovery pass, not on the next Pi launch.
+	const result = runSession(BROKEN_PROVIDER, WORKING_PROVIDER);
+	assert.deepEqual(result.rejections, []);
+	assert.ok(
+		result.registeredProviders.includes("cursor"),
+		`a repaired provider must register its accounts, got: ${result.registeredProviders.join(", ")}`,
+	);
+});
+
+const DISCOVERING_PROVIDER = `export const FALLBACK_MODELS = [{ id: "fallback-only", name: "Fallback" }];
+export async function ensureCursorProxy() { return 45679; }
+export async function discoverCursorModels() { return [{ id: "cursor-grok-4.6" }, { id: "claude-4.6-opus-high" }]; }
+export function registerCursorProvider(pi, id, port, models) {
+	pi.registerProvider(id, { name: "Cursor (" + id + ")", baseUrl: "http://127.0.0.1:" + port + "/v1", models });
+}
+`;
+
+test("a logged-in Cursor account gets its real catalog at startup, not the fallback list", () => {
+	// Login-time discovery used to be the ONLY discovery: restart Pi and the account was back
+	// to FALLBACK_MODELS until the next token refresh. Startup must re-read the catalog from
+	// the first slot whose stored token answers.
+	const result = runSession(DISCOVERING_PROVIDER, undefined, {
+		cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+	});
+	assert.deepEqual(result.rejections, []);
+	assert.equal(
+		result.modelCounts["cursor"],
+		2,
+		`the fallback list (1 model) must be replaced by the discovered catalog, got ${result.modelCounts["cursor"]}`,
+	);
+});
+
+test("startup without a logged-in Cursor account keeps the fallback list and stays quiet", () => {
+	const result = runSession(DISCOVERING_PROVIDER);
+	assert.deepEqual(result.rejections, []);
+	assert.equal(
+		result.modelCounts["cursor"],
+		1,
+		"no token to discover with — the fallback list stays, and nothing may throw",
+	);
 });

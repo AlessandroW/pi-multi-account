@@ -232,6 +232,70 @@ export class CodexCatalogFetchError extends Error {
 	}
 }
 
+export class OllamaCatalogFetchError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "OllamaCatalogFetchError";
+	}
+}
+
+/**
+ * Pull the live Ollama Cloud model catalog (`GET https://ollama.com/v1/models`).
+ * Unlike Codex, Ollama Cloud publishes a single account-agnostic catalog keyed by an
+ * API key, so one fetch covers the base provider and every cloned `ollama-account-N` slot.
+ * Returns the canonical model ids Ollama Cloud expects in chat requests (e.g. `kimi-k3`,
+ * `glm-5.2`) — no `:cloud` suffix. The extension registers them verbatim; Ollama Cloud
+ * accepts both the bare and the `:cloud`-suffixed form, so legacy configured ids keep working.
+ */
+export async function fetchOllamaCloudCatalog(
+	apiKey: string,
+	options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+): Promise<string[]> {
+	if (!apiKey) throw new OllamaCatalogFetchError("Ollama Cloud has no stored API key");
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 8_000);
+	try {
+		const response = await (options.fetchImpl ?? fetch)(
+			"https://ollama.com/v1/models",
+			{
+				method: "GET",
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+					Accept: "application/json",
+					"User-Agent": "pi-multi-account",
+				},
+				signal: controller.signal,
+			},
+		);
+		if (!response.ok) {
+			throw new OllamaCatalogFetchError(
+				`Ollama Cloud catalog returned HTTP ${response.status}`,
+			);
+		}
+		const body = record(await response.json());
+		const data = Array.isArray(body.data) ? body.data : [];
+		const ids: string[] = [];
+		for (const raw of data) {
+			const id = record(raw).id;
+			if (typeof id === "string" && id.trim()) ids.push(id.trim());
+		}
+		if (ids.length === 0) {
+			throw new OllamaCatalogFetchError("Ollama Cloud catalog returned no models");
+		}
+		return ids;
+	} catch (error) {
+		if (error instanceof OllamaCatalogFetchError) throw error;
+		if ((error as any)?.name === "AbortError") {
+			throw new OllamaCatalogFetchError("Ollama Cloud catalog request timed out");
+		}
+		throw new OllamaCatalogFetchError(
+			`Ollama Cloud catalog request failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 export async function fetchCodexModelCatalog(
 	credential: CodexCatalogCredential,
 	options: {

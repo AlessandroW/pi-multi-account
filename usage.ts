@@ -225,9 +225,9 @@ export function parseOllamaMeBody(
 			: typeof source.plan === "string"
 				? source.plan
 				: undefined;
-	// Ollama's /api/me exposes NO session/weekly token counters, but it DOES carry the plan tier,
-	// the billing-period end (when the monthly allowance renews) and a suspended flag — all worth
-	// surfacing. Fold them into the plan string since UsageSnapshot has no dedicated field.
+	// Ollama's /api/me carries the plan tier, billing-period end and suspended flag. Current cloud
+	// quota windows come from /api/usage, but retain support for windows here in case Ollama folds
+	// them into the documented account response later.
 	const nullableTime = (value: unknown): string | undefined => {
 		if (!value || typeof value !== "object") return undefined;
 		const v = value as { Time?: unknown; Valid?: unknown };
@@ -261,6 +261,63 @@ export function parseOllamaMeBody(
 		fetchedAt,
 		credentialHash,
 		plan,
+		primary,
+		secondary,
+	};
+}
+
+const OLLAMA_SESSION_SECONDS = 5 * 60 * 60;
+const OLLAMA_WEEK_SECONDS = 7 * 24 * 60 * 60;
+const OLLAMA_WEEK_ANCHOR_MS = 4 * 24 * 60 * 60_000; // Monday 00:00 UTC after Unix epoch.
+
+function nextBoundary(now: number, windowMs: number, anchorMs = 0): number {
+	return anchorMs + (Math.floor((now - anchorMs) / windowMs) + 1) * windowMs;
+}
+
+function ollamaFractionWindow(
+	value: unknown,
+	fetchedAt: number,
+	windowSeconds: number,
+	anchorMs = 0,
+): UsageWindow | undefined {
+	const rawUsage = record(value).usage;
+	if (rawUsage === null || rawUsage === undefined || rawUsage === "") return undefined;
+	const usage = finiteNumber(rawUsage);
+	// Ollama documents this only through its live response today. Be strict about the observed
+	// fractional shape so a future percentage-valued response cannot silently turn 50% into 100%.
+	if (usage === undefined || usage < 0 || usage > 1) return undefined;
+	return {
+		usedPercent: usage * 100,
+		resetAt: nextBoundary(fetchedAt, windowSeconds * 1000, anchorMs),
+		windowSeconds,
+	};
+}
+
+/** Parse Ollama Cloud's best-effort /api/usage session and weekly quota fractions. */
+export function parseOllamaUsageBody(
+	provider: string,
+	body: unknown,
+	fetchedAt = Date.now(),
+	credentialHash?: string,
+): UsageSnapshot | undefined {
+	const limits = record(record(body).limits);
+	const primary = ollamaFractionWindow(
+		limits.session,
+		fetchedAt,
+		OLLAMA_SESSION_SECONDS,
+	);
+	const secondary = ollamaFractionWindow(
+		limits.weekly,
+		fetchedAt,
+		OLLAMA_WEEK_SECONDS,
+		OLLAMA_WEEK_ANCHOR_MS,
+	);
+	if (!primary && !secondary) return undefined;
+	return {
+		provider,
+		family: "ollama",
+		fetchedAt,
+		credentialHash,
 		primary,
 		secondary,
 	};
@@ -308,12 +365,40 @@ async function fetchOllamaUsageSnapshot(
 			);
 		}
 		const body = await response.json();
-		return parseOllamaMeBody(
+		const account = parseOllamaMeBody(
 			provider,
 			body,
 			Date.now(),
 			options.credentialHash,
 		);
+		// /api/usage is not yet a stable documented contract. Its failure must never erase the
+		// useful /api/me account status or make a healthy Ollama key look invalid.
+		try {
+			const usageResponse = await fetchImpl("https://ollama.com/api/usage", {
+				method: "GET",
+				headers,
+				signal: controller.signal,
+			});
+			if (usageResponse.ok) {
+				const usage = parseOllamaUsageBody(
+					provider,
+					await usageResponse.json(),
+					Date.now(),
+					options.credentialHash,
+				);
+				if (usage) {
+					return {
+						...account,
+						fetchedAt: usage.fetchedAt,
+						primary: usage.primary ?? account.primary,
+						secondary: usage.secondary ?? account.secondary,
+					};
+				}
+			}
+		} catch {
+			// Best-effort endpoint: preserve the plan-only account snapshot.
+		}
+		return account;
 	} catch (error) {
 		if (error instanceof UsageFetchError) throw error;
 		if ((error as any)?.name === "AbortError") {
@@ -486,7 +571,7 @@ export function windowLabel(
 	position: "primary" | "secondary",
 ): string {
 	if (family === "cursor") return position === "primary" ? "auth" : "7d";
-	if (family === "ollama") return position === "primary" ? "cloud" : "weekly";
+	if (family === "ollama") return position === "primary" ? "session" : "weekly";
 	const seconds = window.windowSeconds;
 	if (!seconds) return position === "primary" ? "5h" : "7d";
 	if (seconds >= 20 * 86_400) return "30d";
@@ -522,7 +607,7 @@ export function formatUsageCompact(snapshot: UsageSnapshot, now = Date.now()): s
 	}
 	if (!snapshot.primary && !snapshot.secondary && snapshot.plan) {
 		if (snapshot.family === "ollama") {
-			parts.push(`${snapshot.plan} · no session/weekly API`);
+			parts.push(`${snapshot.plan} · quota unavailable`);
 		} else {
 			parts.push(snapshot.plan);
 		}
@@ -543,7 +628,7 @@ export function formatUsageDetails(snapshot: UsageSnapshot, now = Date.now()): s
 	if (!snapshot.primary && !snapshot.secondary && snapshot.plan) {
 		if (snapshot.family === "ollama") {
 			lines.push(
-				`Plan: ${snapshot.plan}. Session/weekly limits are not exposed via Ollama's API yet — check https://ollama.com/settings`,
+				`Plan: ${snapshot.plan}. Session/weekly quota is currently unavailable — check https://ollama.com/settings`,
 			);
 		} else {
 			lines.push(`Status: ${snapshot.plan}`);

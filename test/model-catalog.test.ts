@@ -175,3 +175,52 @@ test("a model that advertises max gets max — and one that does not, does not",
 	// And a model that never claimed `medium` does not acquire it either.
 	assert.equal(withMax?.thinkingLevelMap?.medium, undefined);
 });
+
+test("fetchOllamaCloudCatalog parses the /v1/models data array into canonical ids", async () => {
+	const { fetchOllamaCloudCatalog } = await import("../model-catalog.ts");
+	const calls: string[] = [];
+	const fakeFetch = (async (url: any, init: any) => {
+		calls.push(String(url));
+		return {
+			ok: true,
+			status: 200,
+			json: async () => ({
+				object: "list",
+				data: [
+					{ id: "kimi-k3", object: "model", owned_by: "ollama" },
+					{ id: "glm-5.2", object: "model", owned_by: "ollama" },
+					{ id: "kimi-k2.7-code", object: "model", owned_by: "ollama" },
+				],
+			}),
+		} as any;
+	}) as any;
+	const ids = await fetchOllamaCloudCatalog("test-key", { fetchImpl: fakeFetch });
+	assert.deepEqual(ids, ["kimi-k3", "glm-5.2", "kimi-k2.7-code"]);
+	assert.equal(calls[0], "https://ollama.com/v1/models");
+});
+
+test("fetchOllamaCloudCatalog throws on HTTP error", async () => {
+	const { fetchOllamaCloudCatalog } = await import("../model-catalog.ts");
+	const fakeFetch = (async () => ({
+		ok: false,
+		status: 401,
+		json: async () => ({}),
+	}) as any);
+	await assert.rejects(
+		() => fetchOllamaCloudCatalog("test-key", { fetchImpl: fakeFetch }),
+		/HTTP 401/,
+	);
+});
+
+test("fetchOllamaCloudCatalog throws on empty catalog", async () => {
+	const { fetchOllamaCloudCatalog } = await import("../model-catalog.ts");
+	const fakeFetch = (async () => ({
+		ok: true,
+		status: 200,
+		json: async () => ({ object: "list", data: [] }),
+	}) as any);
+	await assert.rejects(
+		() => fetchOllamaCloudCatalog("test-key", { fetchImpl: fakeFetch }),
+		/no models/,
+	);
+});

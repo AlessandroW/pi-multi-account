@@ -7,6 +7,7 @@ import {
 	parseCodexUsageBody,
 	parseCodexUsageHeaders,
 	parseOllamaMeBody,
+	parseOllamaUsageBody,
 } from "../usage.ts";
 
 const NOW = Date.UTC(2026, 5, 13, 12, 0, 0);
@@ -44,8 +45,8 @@ test("parses Codex 5h and weekly usage response", () => {
 });
 
 test("Ollama /api/me surfaces plan tier, renewal date, and suspended status", () => {
-	// Ollama exposes no token counters, but /api/me carries the plan, billing-period end, and a
-	// suspended flag — fold them into the plan line so the footer shows something real.
+	// /api/me carries account metadata while /api/usage carries the quota windows. Keep this useful
+	// fallback when the best-effort quota request is unavailable.
 	const active = parseOllamaMeBody(
 		"ollama",
 		{
@@ -59,7 +60,7 @@ test("Ollama /api/me surfaces plan tier, renewal date, and suspended status", ()
 	assert.equal(active.plan, "pro · renews 2026-07-16");
 	assert.equal(
 		formatUsageCompact(active, NOW),
-		"Ollama | pro · renews 2026-07-16 · no session/weekly API",
+		"Ollama | pro · renews 2026-07-16 · quota unavailable",
 	);
 
 	const suspended = parseOllamaMeBody(
@@ -72,6 +73,87 @@ test("Ollama /api/me surfaces plan tier, renewal date, and suspended status", ()
 		suspended.plan?.includes("SUSPENDED"),
 		`suspended plan should flag it, got ${suspended.plan}`,
 	);
+});
+
+test("parses Ollama session and weekly quota fractions with forecast reset boundaries", () => {
+	const snapshot = parseOllamaUsageBody(
+		"ollama-account-2",
+		{
+			limits: {
+				session: { usage: 0.046, models: [{ name: "glm-5", request_count: 3 }] },
+				weekly: { usage: 0.051, models: [] },
+			},
+		},
+		NOW,
+		"cred",
+	);
+	assert.ok(snapshot);
+	assert.equal(snapshot.primary?.usedPercent, 4.6);
+	assert.equal(snapshot.primary?.windowSeconds, 18_000);
+	// Session epochs are exact 18,000-second multiples from Unix epoch, so their UTC wall-clock
+	// hour moves across days rather than always landing on 00/05/10/15/20.
+	assert.equal(snapshot.primary?.resetAt, Date.UTC(2026, 5, 13, 17, 0, 0));
+	assert.equal(snapshot.secondary?.usedPercent, 5.1);
+	assert.equal(snapshot.secondary?.resetAt, Date.UTC(2026, 5, 15, 0, 0, 0));
+	assert.equal(
+		formatUsageCompact(snapshot, NOW),
+		"Ollama A2 | session 95% left/5h | weekly 95% left/1d12h",
+	);
+});
+
+test("Ollama null or non-fraction quota values do not invent windows", () => {
+	assert.equal(
+		parseOllamaUsageBody("ollama", {
+			limits: { session: { usage: null }, weekly: { usage: 52 } },
+		}),
+		undefined,
+	);
+});
+
+test("Ollama combines /api/me metadata with best-effort /api/usage windows", async () => {
+	const calls: Array<{ url: string; method: string }> = [];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		calls.push({ url, method: init?.method ?? "GET" });
+		if (url.endsWith("/api/me")) {
+			return new Response(JSON.stringify({ Plan: "pro" }), { status: 200 });
+		}
+		return new Response(
+			JSON.stringify({ limits: { session: { usage: 0.25 }, weekly: { usage: 0.5 } } }),
+			{ status: 200 },
+		);
+	}) as typeof fetch;
+
+	const snapshot = await fetchUsageSnapshot(
+		"ollama",
+		{ type: "api_key", key: "ollama-secret" },
+		{ fetchImpl, credentialHash: "safe-hash" },
+	);
+	assert.deepEqual(calls, [
+		{ url: "https://ollama.com/api/me", method: "POST" },
+		{ url: "https://ollama.com/api/usage", method: "GET" },
+	]);
+	assert.equal(snapshot.plan, "pro");
+	assert.equal(snapshot.primary?.usedPercent, 25);
+	assert.equal(snapshot.secondary?.usedPercent, 50);
+	assert.equal(snapshot.credentialHash, "safe-hash");
+	assert.ok(!JSON.stringify(snapshot).includes("ollama-secret"));
+});
+
+test("Ollama keeps the plan snapshot when the best-effort usage endpoint fails", async () => {
+	const fetchImpl = (async (input: string | URL | Request) => {
+		return String(input).endsWith("/api/me")
+			? new Response(JSON.stringify({ Plan: "pro" }), { status: 200 })
+			: new Response("unavailable", { status: 503 });
+	}) as typeof fetch;
+	const snapshot = await fetchUsageSnapshot(
+		"ollama",
+		{ type: "api_key", key: "ollama-secret" },
+		{ fetchImpl },
+	);
+	assert.equal(snapshot.plan, "pro");
+	assert.equal(snapshot.primary, undefined);
+	assert.match(formatUsageCompact(snapshot), /quota unavailable/);
 });
 
 test("parses case-insensitive Codex response headers", () => {
@@ -193,7 +275,7 @@ test("the account's identity travels with its usage, and shows in the footer", (
 	// know whose quota is burning. The usage response carries the email; it was thrown away.
 	const snapshot = parseCodexUsageBody("openai-codex-account-2", {
 		plan_type: "free",
-		email: "dev.vitalii.shymko@gmail.com",
+		email: "alice@example.com",
 		rate_limit: {
 			allowed: true,
 			limit_reached: false,
@@ -204,11 +286,11 @@ test("the account's identity travels with its usage, and shows in the footer", (
 			},
 		},
 	});
-	assert.equal(snapshot?.account, "dev.vitalii.shymko@gmail.com");
+	assert.equal(snapshot?.account, "alice@example.com");
 
 	const footer = formatUsageCompact(snapshot!, Date.now());
 	assert.match(footer, /Codex A2/, "the slot is still named");
-	assert.match(footer, /dev\.vitalii/, `and the real account with it; footer: ${footer}`);
+	assert.match(footer, /alice/, `and the account local-part with it; footer: ${footer}`);
 	assert.match(footer, /free/, `along with the plan; footer: ${footer}`);
 	assert.match(footer, /60% left/, `without losing the quota; footer: ${footer}`);
 });
@@ -264,7 +346,7 @@ test("a window is labelled by its real length, and the provider's verdict beats 
 		"openai-codex-account-6",
 		{
 			plan_type: "free",
-			email: "jrnldrive2@gmail.com",
+			email: "bob@example.com",
 			rate_limit: {
 				allowed: true,
 				limit_reached: false,

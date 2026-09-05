@@ -1,6 +1,13 @@
 name: Publish npm package
 
 on:
+  # A pushed release tag publishes on its own: the repo used to require someone to
+  # remember to press "Run workflow", and four releases' worth of fixes sat unpublished
+  # on main for a week because nobody did. The environment still requires an approval,
+  # so nothing reaches npm unattended.
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       dist_tag:
@@ -44,11 +51,18 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           test "${GITHUB_REF_TYPE}" = "tag"
           test "${GITHUB_REF_NAME}" = "v${version}"
+          # A tag that re-publishes an existing version can only fail at the registry;
+          # say so here instead, where the reason is readable.
+          if npm view "pi-multi-account@${version}" version >/dev/null 2>&1; then
+            echo "pi-multi-account@${version} is already published — bump the version first" >&2
+            exit 1
+          fi
       - name: Publish through npm trusted publishing
         shell: bash
         env:
-          DIST_TAG: ${{ inputs.dist_tag }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          # A tag push carries no inputs: publish for real, under the default dist-tag.
+          DIST_TAG: ${{ inputs.dist_tag || 'latest' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
           set -euo pipefail
           if [ "${DRY_RUN}" = "true" ]; then

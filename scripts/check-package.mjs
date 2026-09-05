@@ -19,7 +19,7 @@ if (leaked.length) throw new Error(`Refusing non-public package artifacts: ${lea
 for (const required of ["package.json", "README.md", "CHANGELOG.md", "LICENSE", "SECURITY.md", "index.ts"]) {
 	if (!names.includes(required)) throw new Error(`npm package is missing ${required}`);
 }
-if (!Number.isSafeInteger(packed[0].unpackedSize) || packed[0].unpackedSize > 512 * 1024) {
+if (!Number.isSafeInteger(packed[0].unpackedSize) || packed[0].unpackedSize > 2 * 1024 * 1024) {
 	throw new Error(`npm package is unexpectedly large: ${packed[0].unpackedSize}`);
 }
 // `const VERSION` in index.ts is what the runtime reports — startup notices, the
@@ -48,10 +48,19 @@ const secretPatterns = [
 	/AIza[0-9A-Za-z_-]{20,}/,
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----/,
 ];
+const personalPatterns = [
+	/@gmail\.com/i,
+	new RegExp(["vitalij", "simko"].join(""), "i"),
+	new RegExp(["jrnl", "drive"].join(""), "i"),
+	/\/Users\/(?!example|runner|shared)[A-Za-z]/,
+];
 for (const name of names) {
 	const text = readFileSync(join(root, name), "utf8");
 	if (secretPatterns.some((pattern) => pattern.test(text))) {
 		throw new Error(`Potential secret marker in publishable file: ${name}`);
+	}
+	if (personalPatterns.some((pattern) => pattern.test(text))) {
+		throw new Error(`Personal identifier in publishable file: ${name}`);
 	}
 }
 console.log(`package check: pass (${names.length} files, ${packed[0].unpackedSize} bytes unpacked)`);

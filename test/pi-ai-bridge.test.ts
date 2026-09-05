@@ -13,19 +13,19 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const EXTENSION_SOURCES = [
-	"index.ts",
-	"usage.ts",
-	"cursor-bridge.ts",
-	"model-catalog.ts",
-];
+// Derived from the published file list rather than hand-maintained: a new root module that
+// index.ts imports but this fixture does not copy fails these tests with a module-not-found
+// that says nothing about the real problem.
+const EXTENSION_SOURCES = (
+	JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).files as string[]
+).filter((file) => file.endsWith(".ts"));
 
 const { piAiRootCandidates } = (await import("../index.ts")) as {
 	piAiRootCandidates: (
