@@ -3161,6 +3161,45 @@ test("session_start restores lastUserModel after Pi falls back to anthropic/clau
 	uninstallCursorProvider();
 });
 
+test("startup restoration does not promote active Luna to stale remembered Fable", async () => {
+	const luna = {
+		provider: "openai-codex-account-3",
+		id: "gpt-5.6-luna",
+	};
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-3",
+			},
+		},
+		current: luna,
+		hostModelsByProvider: {
+			anthropic: ["claude-fable-5", "claude-opus-5"],
+		},
+		hostCodexModels: ["gpt-5.6-luna"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-fable-5" },
+			lastModelByFamily: { anthropic: "claude-fable-5" },
+			exhaustedUntilByProvider: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+
+	await t.fire("session_start", { reason: "startup" });
+
+	assert.deepEqual(t.ctx.model, luna);
+	assert.deepEqual(t.rec.setModels, []);
+	assert.ok(!t.rec.notifies.some((message) => message.includes("restored")));
+	await t.fire("session_shutdown");
+});
+
 test("explicit CLI model wins over remembered startup state and is not remembered on shutdown", async () => {
 	const t = setup({
 		accounts: {

@@ -7042,6 +7042,22 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			restoreDesiredThinking(ctx);
 			return true;
 		}
+		// A stale remembered preference must not replace the model Pi is already running. In
+		// particular, catalog discovery can make an old apex preference (Fable) resolvable while
+		// the session is on Luna. Restoring across quality bands is an automatic upgrade/downgrade,
+		// not restoration of the current session.
+		const currentBand = modelQualityBand(ctx.model?.id, ctx.model?.provider);
+		const intendedBand = modelQualityBand(intended.id, intended.provider);
+		if (currentBand && intendedBand && currentBand !== intendedBand) {
+			logEvent("remembered_model_skipped", {
+				reason: "quality band mismatch",
+				current: ref(ctx.model?.provider, ctx.model?.id),
+				intended: ref(intended.provider, intended.id),
+				currentBand,
+				intendedBand,
+			});
+			return false;
+		}
 		if (cursorReady) {
 			await cursorReady.catch(() => undefined);
 		}
