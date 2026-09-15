@@ -3243,6 +3243,47 @@ test("an explicit in-session model survives concurrent remembered-model changes"
 	assert.ok(!t.rec.notifies.some((message) => message.includes("restored")));
 });
 
+test("manual model control suppresses per-turn remembered restoration", async () => {
+	const selected = { provider: "anthropic", id: "claude-opus-5" };
+	const other = { provider: "anthropic", id: "claude-opus-5-1" };
+	const t = setup({
+		accounts: { anthropic: { type: "oauth", access: "a", refresh: "ar" } },
+		current: selected,
+		hostModelsByProvider: {
+			anthropic: [selected.id, other.id],
+		},
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: selected,
+			lastModelByFamily: { anthropic: selected.id },
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	await t.fire("model_select", { model: selected, source: "set" });
+
+	// The host (or another window) leaves a stale remembered model while the user-controlled
+	// session is temporarily on it. Per-turn restoration must not fight that route.
+	const changedByOtherWindow = t.readState();
+	changedByOtherWindow.lastUserModel = other;
+	writeFileSync(STATE, JSON.stringify(changedByOtherWindow));
+	t.setCurrent(other.provider, other.id);
+	const before = t.rec.setModels.length;
+	await t.fire("before_agent_start", { reason: "post-selection preflight" });
+
+	assert.deepEqual(t.ctx.model, other);
+	assert.equal(
+		t.rec.setModels.length,
+		before,
+		"explicit model control must suppress only the per-turn restore",
+	);
+	assert.ok(!t.rec.notifies.some((message) => message.includes("restored")));
+});
+
 test("a fresh session still restores its remembered model after Pi's fallback", async () => {
 	const remembered = { provider: "anthropic", id: "claude-opus-5-1" };
 	const t = setup({

@@ -4203,6 +4203,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// cross-window preferences until they make an explicit choice.
 	let sessionModelForRestore: { provider: string; id: string } | undefined;
 	let sessionFailoverModelForRestore: { provider: string; id: string } | undefined;
+	// Only a genuine model_select sets this; startup restoration and automatic failover do not.
+	let sessionHasManualModelChoice = false;
 	let rememberedRestoreTarget: ModelRef | undefined;
 	let lastObservedModelKey: string | undefined;
 	let lastObservedThinkingLevel: ReasoningLevel | undefined;
@@ -7145,9 +7147,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx.model?.provider === intended.provider &&
 			ctx.model?.id === intended.id;
 		// Pi's createAgentSession often parks us on kimi/anthropic because Cursor was not
-		// in the registry yet. That fallback is not the user's choice — restore first,
-		// otherwise startup preflight failovers *away* from the accidental model.
-		if (intended && !onIntended) {
+		// in the registry yet. That fallback is not the user's choice — restore it during startup,
+		// but once the user has explicitly picked a model, a stale preference must not fight them on
+		// every turn. Skip only this per-turn restore; readiness and rotation below remain active.
+		if (intended && !onIntended && !sessionHasManualModelChoice) {
 			await restoreRememberedModel(ctx);
 		}
 		if (isCurrentModelReady(ctx)) return true;
@@ -10603,6 +10606,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// session consult the shared preference until that session makes its own choice.
 		sessionModelForRestore = undefined;
 		sessionFailoverModelForRestore = undefined;
+		sessionHasManualModelChoice = false;
 		rememberedRestoreTarget = undefined;
 		manualRouteOwnsErrors = false;
 		lastObservedModelKey = thinkingModelKey(ctx);
@@ -11088,6 +11092,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		modelPreferenceChanged = true;
 		sessionModelForRestore = selectedForRestore;
 		sessionFailoverModelForRestore = undefined;
+		sessionHasManualModelChoice = true;
 		rememberUserModel(model);
 		// A manual model change is user control, not a permanent "never fail over" pin.
 		// Cancel stale pending work; if the selected model then returns a real limit, normal
