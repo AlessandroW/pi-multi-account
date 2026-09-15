@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.21.4] - 2026-09-15
+
+### Fixed
+
+- **A remembered model can no longer override the model you picked in this
+  session.** `lastUserModel` is a shared on-disk preference, so any window
+  writing it was re-pointing every other live session through the state-file
+  merge. The remembered target is now session-scoped once a session makes its
+  own choice, and a failover-driven selection is tracked separately so the
+  model a 429 just rotated away from is never restored back.
+- **Restoration no longer re-fires on every turn after a manual selection.**
+  Startup restoration still corrects the model Pi parks on before the Cursor,
+  Codex and Ollama catalogs are registered. Once the user selects a model
+  explicitly, the per-turn readiness preflight stops trying to restore, while
+  readiness, manual pins, cooldowns and rotation keep running unchanged so
+  rate-limit failover is unaffected.
+
 ## [1.21.3] — 2026-09-05
 
 - Provider-level payload shaping now covers independent Pi callers: Anthropic base/alias OAuth, Qwen base/alias role compatibility and Cursor session isolation. Native-wire fixtures and clean installed-Pi activation verify the boundary.
