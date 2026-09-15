@@ -3200,6 +3200,117 @@ test("startup restoration does not promote active Luna to stale remembered Fable
 	await t.fire("session_shutdown");
 });
 
+test("an explicit in-session model survives concurrent remembered-model changes", async () => {
+	const selected = { provider: "anthropic", id: "claude-opus-5" };
+	const t = setup({
+		accounts: { anthropic: { type: "oauth", access: "a", refresh: "ar" } },
+		current: selected,
+		hostModelsByProvider: {
+			anthropic: ["claude-opus-5", "claude-opus-5-1"],
+		},
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: selected,
+			lastModelByFamily: { anthropic: selected.id },
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	await t.fire("model_select", { model: selected, source: "set" });
+
+	// Another live Pi window changes the shared preference after this session's choice.
+	const changedByOtherWindow = t.readState();
+	changedByOtherWindow.lastUserModel = {
+		provider: "anthropic",
+		id: "claude-opus-5-1",
+	};
+	writeFileSync(STATE, JSON.stringify(changedByOtherWindow));
+
+	const before = t.rec.setModels.length;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		await t.fire("before_agent_start", { reason: `preflight ${attempt}` });
+	}
+	assert.deepEqual(t.ctx.model, selected);
+	assert.equal(
+		t.rec.setModels.length,
+		before,
+		"concurrent disk preference changes must not restore another model",
+	);
+	assert.ok(!t.rec.notifies.some((message) => message.includes("restored")));
+});
+
+test("a fresh session still restores its remembered model after Pi's fallback", async () => {
+	const remembered = { provider: "anthropic", id: "claude-opus-5-1" };
+	const t = setup({
+		accounts: { anthropic: { type: "oauth", access: "a", refresh: "ar" } },
+		current: { provider: "anthropic", id: "claude-opus-5" },
+		hostModelsByProvider: {
+			anthropic: ["claude-opus-5", "claude-opus-5-1"],
+		},
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: remembered,
+			lastModelByFamily: { anthropic: remembered.id },
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, remembered);
+	assert.deepEqual(t.rec.setModels, ["anthropic/claude-opus-5-1"]);
+});
+
+test("a 429 failover is not undone by the next readiness preflight", async () => {
+	const selected = { provider: "anthropic", id: "claude-opus-5" };
+	const fallback = {
+		provider: "openai-codex-account-2",
+		id: "gpt-5.5",
+	};
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: selected,
+		config: { fallbacks: ["anthropic", "openai-codex-account-2"] },
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: selected,
+			lastModelByFamily: { anthropic: selected.id },
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	await t.fire("model_select", { model: selected, source: "set" });
+	await finishError(t, selected.provider, selected.id, "429 rate_limit_error");
+	assert.deepEqual(t.ctx.model, fallback);
+
+	const afterFailover = t.rec.setModels.length;
+	await t.fire("before_agent_start", { reason: "post-failover preflight" });
+	assert.deepEqual(t.ctx.model, fallback);
+	assert.equal(
+		t.rec.setModels.length,
+		afterFailover,
+		"readiness must not restore the spent model after rotation",
+	);
+});
+
 test("explicit CLI model wins over remembered startup state and is not remembered on shutdown", async () => {
 	const t = setup({
 		accounts: {

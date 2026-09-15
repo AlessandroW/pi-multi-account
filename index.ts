@@ -4197,6 +4197,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		appliedLevel: ReasoningLevel;
 	};
 	let automaticModelTarget: ModelRef | undefined;
+	// A genuine model_select owns restoration for this session instead of the shared on-disk
+	// preference. A separate route marker is used for automatic failover: after rotation, the next
+	// readiness preflight must not restore the spent source model, while fresh sessions still follow
+	// cross-window preferences until they make an explicit choice.
+	let sessionModelForRestore: { provider: string; id: string } | undefined;
+	let sessionFailoverModelForRestore: { provider: string; id: string } | undefined;
+	let rememberedRestoreTarget: ModelRef | undefined;
 	let lastObservedModelKey: string | undefined;
 	let lastObservedThinkingLevel: ReasoningLevel | undefined;
 	let pendingModelThinkingChange: ThinkingChangeEvidence | undefined;
@@ -7012,6 +7019,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function intendedStartupModel(): { provider: string; id: string } | undefined {
+		// lastUserModel is shared by every live Pi window. Once this session has observed an explicit
+		// choice, keep restoration session-scoped so another window cannot yank it away later. After
+		// failover, use the live replacement until another explicit choice resets that route marker.
+		if (sessionFailoverModelForRestore) return sessionFailoverModelForRestore;
+		if (sessionModelForRestore) return sessionModelForRestore;
 		const remembered = persistedState.lastUserModel;
 		if (remembered?.provider && remembered?.id) return remembered;
 		return readHostDefaultModel();
@@ -7086,13 +7098,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (rememberedLevel) desiredThinkingLevel = rememberedLevel as ReasoningLevel;
 		}
 		automaticModelTarget = to;
+		rememberedRestoreTarget = to;
 		let ok = false;
 		try {
 			ok = await setModelEnsuringVisible(found, ctx);
 		} catch {
 			ok = false;
+		} finally {
+			if (automaticModelTarget === to) automaticModelTarget = undefined;
+			if (rememberedRestoreTarget === to) rememberedRestoreTarget = undefined;
 		}
-		if (automaticModelTarget === to) automaticModelTarget = undefined;
 		logEvent("remembered_model_restored", {
 			from,
 			to,
@@ -10584,6 +10599,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	safeOn("session_start", async (_event, ctx) => {
 		const startEpoch = ++chainEpoch;
 		sessionClosed = false;
+		// The model preference is session-scoped. A reused extension instance must let the new
+		// session consult the shared preference until that session makes its own choice.
+		sessionModelForRestore = undefined;
+		sessionFailoverModelForRestore = undefined;
+		rememberedRestoreTarget = undefined;
 		manualRouteOwnsErrors = false;
 		lastObservedModelKey = thinkingModelKey(ctx);
 		lastObservedThinkingLevel = readThinkingLevel();
@@ -11056,13 +11076,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		if (appliedThinkingLevel) lastObservedThinkingLevel = appliedThinkingLevel;
 		lastObservedModelKey = selected;
+		const selectedForRestore = { provider: model.provider, id: model.id };
 		if (automaticModelTarget === selected) {
 			automaticModelTarget = undefined;
+			if (rememberedRestoreTarget !== selected)
+				sessionFailoverModelForRestore = selectedForRestore;
 			rememberUserModel(model);
 			return;
 		}
 		if ((event as any).source === "restore") return;
 		modelPreferenceChanged = true;
+		sessionModelForRestore = selectedForRestore;
+		sessionFailoverModelForRestore = undefined;
 		rememberUserModel(model);
 		// A manual model change is user control, not a permanent "never fail over" pin.
 		// Cancel stale pending work; if the selected model then returns a real limit, normal
