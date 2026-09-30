@@ -35,6 +35,16 @@ const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 if (!manifest.dependencies?.["@earendil-works/pi-ai"]) {
 	throw new Error("OAuth requires @earendil-works/pi-ai as a runtime dependency; Pi does not install extension peers");
 }
+// A duplicate dev declaration can classify this required OAuth package as dev-only,
+// so npm install --omit=dev silently leaves it out of Pi-managed installations.
+if (manifest.devDependencies?.["@earendil-works/pi-ai"]) {
+	throw new Error("OAuth runtime dependency @earendil-works/pi-ai must not also be a devDependency");
+}
+const lock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
+const oauthPackage = lock.packages?.["node_modules/@earendil-works/pi-ai"];
+if (!oauthPackage || oauthPackage.dev === true || oauthPackage.devOptional === true) {
+	throw new Error("OAuth runtime dependency @earendil-works/pi-ai must be present as a production package in the lockfile");
+}
 const declaredVersion = /^const VERSION = "([^"]+)";$/m.exec(
 	readFileSync(join(root, "index.ts"), "utf8"),
 )?.[1];
