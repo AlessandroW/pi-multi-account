@@ -4391,6 +4391,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		appliedLevel: ReasoningLevel;
 	};
 	let automaticModelTarget: ModelRef | undefined;
+	let sessionModelForRestore: { provider: string; id: string } | undefined;
+	let sessionFailoverModelForRestore: { provider: string; id: string } | undefined;
+	let sessionHasManualModelChoice = false;
+	let modelSelectionRevision = 0;
+	let rememberedRestoreTarget: ModelRef | undefined;
 	let lastObservedModelKey: string | undefined;
 	let lastObservedThinkingLevel: ReasoningLevel | undefined;
 	let pendingModelThinkingChange: ThinkingChangeEvidence | undefined;
@@ -7286,6 +7291,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function intendedStartupModel(): { provider: string; id: string } | undefined {
 		if (hostOwnsSessionModel) return startupModel;
+		if (sessionFailoverModelForRestore) return sessionFailoverModelForRestore;
+		if (sessionModelForRestore) return sessionModelForRestore;
 		const remembered = persistedState.lastUserModel;
 		if (remembered?.provider && remembered?.id) return remembered;
 		return readHostDefaultModel();
@@ -7300,6 +7307,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			logEvent("remembered_model_skipped", { reason: "explicit CLI model" });
 			return false;
 		}
+		const restoreEpoch = chainEpoch;
+		const restoreSelectionRevision = modelSelectionRevision;
 		const cliThinkingLevel = explicitCli.thinking
 			? (explicitCliThinkingLevel ?? readThinkingLevel())
 			: undefined;
@@ -7316,9 +7325,27 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			restoreDesiredThinking(ctx);
 			return true;
 		}
+		if (!hostOwnsSessionModel) {
+			const currentBand = modelQualityBand(ctx.model?.id, ctx.model?.provider);
+			const intendedBand = modelQualityBand(intended.id, intended.provider);
+			if (currentBand && intendedBand && currentBand !== intendedBand) {
+				logEvent("remembered_model_skipped", {
+					reason: "quality band mismatch",
+					current: ref(ctx.model?.provider, ctx.model?.id),
+					intended: ref(intended.provider, intended.id),
+					currentBand,
+					intendedBand,
+				});
+				return false;
+			}
+		}
 		if (cursorReady) {
 			await cursorReady.catch(() => undefined);
 		}
+		// Catalog loading may yield to a manual selection or another session. Never apply
+		// a target chosen by the previous owner after either transition.
+		if (sessionClosed || chainEpoch !== restoreEpoch ||
+			modelSelectionRevision !== restoreSelectionRevision) return false;
 		let found = findModelIncludingHidden(
 			ctx,
 			intended.provider,
@@ -7344,13 +7371,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (rememberedLevel) desiredThinkingLevel = rememberedLevel as ReasoningLevel;
 		}
 		automaticModelTarget = to;
+		rememberedRestoreTarget = to;
 		let ok = false;
 		try {
 			ok = await setModelEnsuringVisible(found, ctx);
 		} catch {
 			ok = false;
+		} finally {
+			if (automaticModelTarget === to) automaticModelTarget = undefined;
+			if (rememberedRestoreTarget === to) rememberedRestoreTarget = undefined;
 		}
-		if (automaticModelTarget === to) automaticModelTarget = undefined;
 		logEvent("remembered_model_restored", {
 			from,
 			to,
@@ -7390,7 +7420,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Pi's createAgentSession often parks us on kimi/anthropic because Cursor was not
 		// in the registry yet. That fallback is not the user's choice — restore first,
 		// otherwise startup preflight failovers *away* from the accidental model.
-		if (!hostOwnsSessionModel && intended && !onIntended) {
+		if (!hostOwnsSessionModel && intended && !onIntended && !sessionHasManualModelChoice) {
 			await restoreRememberedModel(ctx);
 		}
 		// Restoration can change the provider on legacy hosts. Opt-out means pass the
@@ -11465,6 +11495,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	safeOn("session_start", async (_event, ctx) => {
 		const startEpoch = ++chainEpoch;
 		sessionClosed = false;
+		sessionModelForRestore = undefined;
+		sessionFailoverModelForRestore = undefined;
+		sessionHasManualModelChoice = false;
+		rememberedRestoreTarget = undefined;
 		hostOwnsSessionModel = typeof ctx?.sessionManager?.getBranch === "function";
 		const rawSessionId = ctx?.sessionManager?.getSessionId?.();
 		const sessionId = typeof rawSessionId === "string" && rawSessionId.length > 0
@@ -11987,15 +12021,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		lastObservedModelKey = selected;
 		if (automaticModelTarget === selected) {
 			automaticModelTarget = undefined;
+			if (!hostOwnsSessionModel && rememberedRestoreTarget !== selected)
+				sessionFailoverModelForRestore = { provider: model.provider, id: model.id };
 			rememberUserModel(model);
 			return;
 		}
 		if ((event as any).source === "restore") return;
+		modelSelectionRevision++;
 		if (config.reasoningLevel === "auto" && !explicitCli.thinking && appliedThinkingLevel) {
 			desiredThinkingLevel = appliedThinkingLevel;
 			thinkingClamp = undefined;
 		}
 		modelPreferenceChanged = true;
+		if (!hostOwnsSessionModel) {
+			sessionModelForRestore = { provider: model.provider, id: model.id };
+			sessionFailoverModelForRestore = undefined;
+			sessionHasManualModelChoice = true;
+		}
 		rememberUserModel(model);
 		// A manual model change is user control, not a permanent "never fail over" pin.
 		// Cancel stale pending work; if the selected model then returns a real limit, normal
